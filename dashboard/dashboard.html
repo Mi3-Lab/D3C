@@ -8,266 +8,98 @@
 </head>
 <body>
   <main class="dash-wrap">
-    <header class="row">
+    <header class="row top-header">
       <div>
         <h1>D3C Fleet Dashboard</h1>
         <p class="muted compact">Distributed Driving Data Collective</p>
       </div>
       <div class="row header-actions">
+        <button id="advancedLayoutBtn" class="btn btn-alt">Advanced Layout</button>
         <button id="themeToggleBtn" class="btn btn-alt">Switch Theme</button>
-        <div id="phoneConn" class="pill">Phone: disconnected</div>
-        <div id="recordingPill" class="pill">Recording: off</div>
       </div>
     </header>
-    <section class="health-strip card">
-      <div id="healthImu" class="mono">IMU Hz: 0.0</div>
-      <div id="healthCam" class="mono">Camera FPS: 0.0</div>
-      <div id="healthAudio" class="mono">Audio amp: -</div>
-      <div id="healthBattery" class="mono">Battery: -</div>
-      <div id="healthDrop" class="mono">Dropped: 0</div>
-      <div id="healthRtt" class="mono">RTT ms: -</div>
-      <div id="healthElapsed" class="mono">Rec Elapsed: 00:00</div>
-      <div id="healthLight" class="mono">Lighting: -</div>
-      <div id="healthFusion" class="mono">Fusion: -</div>
-      <div id="healthStorage" class="mono">Storage: -</div>
-    </section>
-    <p class="muted">
-      Local-only mode: no cloud upload. Camera can be disabled or set to preview-only for privacy.
-    </p>
 
-    <section class="grid">
-      <article class="card">
-        <h2>Devices</h2>
-        <label>Focused device
-          <select id="deviceSelect"></select>
-        </label>
-        <div id="deviceListMini" class="mono muted">No devices connected</div>
-      </article>
-
-      <article class="card">
-        <h2>Presets</h2>
-        <select id="presetSelect">
-          <option value="">Custom</option>
-          <option value="imu-only">IMU-only</option>
-          <option value="camera-only">Camera-only</option>
-          <option value="no-camera-privacy">No-camera privacy</option>
-          <option value="full-multimodal">Full-multimodal</option>
-        </select>
-        <div class="row">
-          <input id="presetName" type="text" placeholder="custom preset name" />
-          <button id="savePresetBtn" class="btn">Save Current</button>
-        </div>
-        <div class="row">
-          <button id="exportPresetBtn" class="btn btn-alt">Export JSON</button>
-          <input id="importPresetFile" type="file" accept="application/json" />
-        </div>
-      </article>
-
-      <article class="card">
-        <h2>Recording</h2>
-        <div class="row">
-          <button id="startRecFocusedBtn" class="btn">Start Recording (Focused Device)</button>
-          <button id="startRecAllBtn" class="btn btn-alt">Start Recording (All Devices)</button>
-          <button id="stopRecBtn" class="btn btn-alt">Stop Recording</button>
-        </div>
-        <p id="sessionDir" class="mono muted">session: none</p>
-        <p id="recordingStreams" class="mono muted">Recording: imu - | camera - | events - | net -</p>
-      </article>
+    <section class="recording-banner-wrap">
+      <div id="recordingBanner" class="recording-banner idle">IDLE</div>
     </section>
 
-    <section class="grid two">
-      <article class="card">
-        <h2>IMU</h2>
-        <label><input id="imuEnabled" type="checkbox" /> enabled</label>
-        <label>rate_hz
-          <select id="imuRate">
-            <option value="10">10</option>
-            <option value="30">30</option>
-            <option value="60">60</option>
-          </select>
-        </label>
-        <label><input id="imuRecord" type="checkbox" /> record</label>
-      </article>
-
-      <article class="card">
-        <h2>Camera</h2>
-        <label>mode
-          <select id="cameraMode">
-            <option value="off">off</option>
-            <option value="preview">preview</option>
-            <option value="stream">stream</option>
-          </select>
-        </label>
-        <label>fps
-          <select id="cameraFps">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="15">15</option>
-          </select>
-        </label>
-        <label>jpeg_quality
-          <input id="cameraJpegQ" type="range" min="0.4" max="0.8" step="0.05" />
-          <span id="jpegQLabel"></span>
-        </label>
-        <label><input id="cameraRecord" type="checkbox" /> record</label>
-        <label>record_mode
-          <select id="cameraRecordMode">
-            <option value="jpg">jpg sequence</option>
-            <option value="video">video only</option>
-            <option value="both">both</option>
-          </select>
-        </label>
-        <label>encode_timing
-          <select id="cameraEncodeTiming">
-            <option value="post_session">post_session</option>
-            <option value="manual">manual</option>
-            <option value="realtime">realtime</option>
-          </select>
-        </label>
-        <label>video_fps
-          <select id="cameraVideoFps">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="15">15</option>
-            <option value="30">30</option>
-          </select>
-        </label>
-        <label>video_bitrate
-          <input id="cameraVideoBitrate" type="text" value="2M" />
-        </label>
-        <label>video_crf
-          <input id="cameraVideoCrf" type="number" min="18" max="35" step="1" value="23" />
-        </label>
-        <label>downsample_factor
-          <select id="cameraDownsample">
-            <option value="1">1x</option>
-            <option value="2">2x</option>
-            <option value="3">3x</option>
-            <option value="4">4x</option>
-          </select>
-        </label>
-      </article>
-
-      <article class="card">
-        <h2>Location Module (GPS)</h2>
-        <label><input id="gpsEnabled" type="checkbox" /> enabled</label>
-        <label>rate_hz
-          <select id="gpsRate">
-            <option value="1">1</option>
-            <option value="2">2</option>
-          </select>
-        </label>
-        <label><input id="gpsRecord" type="checkbox" /> record</label>
-      </article>
-
-      <article class="card">
-        <h2>Audio Module</h2>
-        <label><input id="audioEnabled" type="checkbox" /> enabled</label>
-        <label>rate_hz
-          <select id="audioRate">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="15">15</option>
-          </select>
-        </label>
-        <label><input id="audioRecord" type="checkbox" /> record</label>
-      </article>
-
-      <article class="card">
-        <h2>Device Module</h2>
-        <label><input id="deviceEnabled" type="checkbox" /> enabled</label>
-        <label>rate_hz
-          <select id="deviceRate">
-            <option value="1">1</option>
-            <option value="2">2</option>
-          </select>
-        </label>
-        <label><input id="deviceRecord" type="checkbox" /> record</label>
-      </article>
-
-      <article class="card">
-        <h2>Fusion Module</h2>
-        <label><input id="fusionEnabled" type="checkbox" /> enabled</label>
-        <label><input id="fusionRecord" type="checkbox" /> record</label>
-      </article>
-
-      <article class="card">
-        <h2>Events / Network Module</h2>
-        <label><input id="eventsRecord" type="checkbox" /> events record</label>
-        <label><input id="netEnabled" type="checkbox" /> net enabled</label>
-        <label><input id="netRecord" type="checkbox" /> net record</label>
-        <div class="row">
-          <input id="eventLabel" type="text" placeholder="event label" />
-          <button id="markEventBtn" class="btn">Mark Event</button>
-        </div>
-      </article>
-    </section>
-
-    <section class="grid two">
-      <article class="card">
-        <h2>IMU Plot</h2>
-        <canvas id="imuCanvas" width="700" height="180"></canvas>
-        <div id="motionPill" class="pill">UNKNOWN</div>
-        <p id="motionMeta" class="mono muted">confidence=0.00 inactivity=0.0s</p>
-      </article>
-
-      <article class="card">
-        <h2>Camera Stream Preview</h2>
-        <img id="cameraImg" alt="latest camera frame" />
-      </article>
-    </section>
-
-    <section class="card">
-      <h2>Net Stats</h2>
-      <p id="netStats" class="mono">fps=0 dropped=0 rtt_ms=-</p>
-    </section>
-
-    <section class="grid two">
-      <article class="card">
-        <h2>Stream Status</h2>
-        <table id="streamTable">
-          <thead>
-            <tr>
-              <th>stream_id</th>
-              <th>enabled</th>
-              <th>recording</th>
-              <th>rate</th>
-              <th>last_seen</th>
-            </tr>
-          </thead>
-          <tbody id="streamTableBody"></tbody>
-        </table>
-      </article>
-      <article class="card">
-        <h2>Event Timeline</h2>
-        <ul id="eventTimeline" class="timeline"></ul>
-      </article>
-    </section>
-
-    <section class="card">
-      <h2>Replay Session</h2>
-      <div class="row">
-        <button id="reloadSessionsBtn" class="btn btn-alt">Reload Sessions</button>
-        <select id="replaySessionSelect"></select>
-        <label>Speed
-          <select id="replaySpeed">
-            <option value="0.5">0.5x</option>
-            <option value="1" selected>1x</option>
-            <option value="2">2x</option>
-          </select>
-        </label>
-        <button id="replayPlayBtn" class="btn">Play Replay</button>
-        <button id="replayStopBtn" class="btn btn-alt">Stop Replay</button>
-        <button id="encodeVideoBtn" class="btn">Encode Video</button>
+    <section class="card status-bar" id="globalStatusBar" aria-label="Global status">
+      <div class="status-signal" id="statusConn">
+        <span class="status-k">WebSocket</span>
+        <span class="status-v">Disconnected</span>
       </div>
-      <p id="replayStatus" class="mono muted">Replay: idle</p>
-      <video id="replayVideo" controls muted playsinline style="display:none; width:100%; margin-top:8px;"></video>
-      <audio id="replayAudio" controls style="display:none; width:100%; margin-top:8px;"></audio>
+      <div class="status-signal" id="statusRec">
+        <span class="status-k">Recording</span>
+        <span class="status-v">Off</span>
+      </div>
+      <div class="status-signal" id="statusDevices">
+        <span class="status-k">Devices</span>
+        <span class="status-v">0 online</span>
+      </div>
+      <div class="status-signal" id="statusImu">
+        <span class="status-k">IMU</span>
+        <span class="status-v">0 Hz</span>
+      </div>
+      <div class="status-signal" id="statusCam">
+        <span class="status-k">Camera</span>
+        <span class="status-v">0 FPS</span>
+      </div>
+      <div class="status-signal" id="statusAudio">
+        <span class="status-k">Audio</span>
+        <span class="status-v status-v-audio">Audio Level: -- dB</span>
+        <span class="status-sub">Detected: --</span>
+        <span class="status-sub">Clip: 0</span>
+        <span class="status-sub">Dropouts: 0</span>
+      </div>
     </section>
+
+    <section class="card toolbar" id="advancedLayoutPanel" hidden>
+      <div class="toolbar-row">
+        <label>Fleet Device Filter
+          <select id="globalDeviceFilter"></select>
+        </label>
+        <label>Layout
+          <select id="layoutSelect"></select>
+        </label>
+        <label>Layout Preset
+          <select id="layoutPresetSelect">
+            <option value="">Select preset</option>
+            <option value="Recording">Recording</option>
+            <option value="Monitoring">Monitoring</option>
+            <option value="Debug">Debug</option>
+          </select>
+        </label>
+        <button id="editLayoutBtn" class="btn btn-alt">Edit Layout</button>
+      </div>
+
+      <div class="toolbar-row">
+        <label>New Layout Name
+          <input id="layoutNameInput" type="text" placeholder="e.g. Demo" />
+        </label>
+        <button id="saveLayoutBtn" class="btn">Save Layout</button>
+        <button id="deleteLayoutBtn" class="btn btn-alt">Delete Layout</button>
+        <button id="exportLayoutBtn" class="btn btn-alt">Export Layout</button>
+        <label class="file-label">Import Layout
+          <input id="importLayoutFile" type="file" accept="application/json" />
+        </label>
+      </div>
+
+      <div class="toolbar-row edit-row" id="editToolsRow">
+        <label>Add Widget
+          <select id="addWidgetSelect"></select>
+        </label>
+        <button id="addWidgetBtn" class="btn">Add</button>
+        <span class="muted mono">Drag cards by header to reorder. Resize from the bottom-right corner handle.</span>
+      </div>
+    </section>
+
+    <section id="widgetGrid" class="widget-grid"></section>
   </main>
-  <script src="/dashboard.js"></script>
+  <script type="module" src="/dashboard.js"></script>
 </body>
 </html>
+
+
 
 
 

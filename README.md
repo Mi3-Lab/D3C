@@ -3,7 +3,7 @@
 D3C is a distributed driving data research platform where personal smartphones act as fleet nodes.
 Each node contributes multimodal driving data to a coordinated fleet session managed by the laptop fleet server.
 
-## Repository Structure (Migrated)
+## Repository Structure
 
 ```text
 d3c/
@@ -14,6 +14,9 @@ d3c/
     dashboard.html
     dashboard.js
     styles.css
+    store.js
+    layouts.js
+    widgets.js
   fleet-server/
     index.js
     config.js
@@ -25,6 +28,9 @@ d3c/
       schema.js
     session/
       session_manager.js
+      parquet/
+        converter.js
+        write_parquet.py
       recorders/
         audio_recorder.js
         audio_wav_recorder.js
@@ -36,10 +42,6 @@ d3c/
         imu_recorder.js
         net_recorder.js
   datasets/
-    session_YYYYMMDD_HHMMSS/
-      meta.json
-      control_log.jsonl
-      devices/<device_id>/streams/...
   docs/
     migration-map.md
   certs/
@@ -50,7 +52,7 @@ d3c/
 ## Fleet Model
 
 - Many phones connect simultaneously (`device_id` per node).
-- Dashboard selects a focused node for live panels.
+- Dashboard can focus one node while monitoring the fleet.
 - Recording scope:
   - focused node
   - all connected nodes
@@ -60,11 +62,38 @@ d3c/
 
 - Motion & Pose: `imu`
 - Vision & Environment: `camera`
-- Audio: `audio` (`audio.csv` + `audio.wav`)
+- Audio: `audio` (`audio.parquet` + `audio.wav`)
 - Location & Context: `gps`
 - Device State: `device`
 - Network & Performance: `net`
 - Fusion Metrics: `fusion`
+
+## Storage Format
+
+- Real-time transport remains JSON over WebSocket.
+- Canonical on-disk sensor logs are Apache Parquet (`*.parquet`).
+- CSV outputs remain as compatibility artifacts during transition.
+- Parquet conversion runs automatically when recording stops.
+
+### Canonical Parquet Streams
+
+Per device under `datasets/session_.../devices/<device_id>/streams/`:
+- `imu.parquet`
+- `gps.parquet`
+- `events.parquet`
+- `net.parquet`
+- `audio.parquet`
+- `device.parquet`
+- `fusion.parquet`
+
+### IMU Parquet Schema
+
+- `session_id`, `device_id`
+- `t_device_ns` (int64)
+- `t_wall_utc_ns` (int64)
+- `accel_x`, `accel_y`, `accel_z`
+- `gyro_x`, `gyro_y`, `gyro_z`
+- optional placeholders: `mag_x`, `mag_y`, `mag_z`, `sample_rate_hz`, `sensor_frame`
 
 ## Install
 
@@ -76,6 +105,12 @@ If PowerShell blocks `npm`:
 
 ```powershell
 & "C:\Program Files\nodejs\npm.cmd" install
+```
+
+Install PyArrow for parquet conversion:
+
+```powershell
+pip install pyarrow
 ```
 
 ## Certificate Setup (HTTPS)
@@ -91,7 +126,9 @@ mkdir certs -Force
 mkcert -key-file certs\key.pem -cert-file certs\cert.pem localhost 127.0.0.1 ::1 <laptop-ip>
 ```
 
-Use your active hotspot/Wi-Fi IPv4 for `<laptop-ip>` (example: `172.20.10.2`).
+Use your active hotspot/Wi-Fi IPv4 for `<laptop-ip>`.
+
+Important: in PowerShell, replace `<laptop-ip>` with the actual IP value (for example `172.20.10.2`). Do not type angle brackets literally.
 
 ### Option B (fallback): self-signed cert
 
@@ -120,13 +157,55 @@ If `node` is not in PATH:
 ## Dataset APIs
 
 - `GET /api/datasets`
-- `GET /api/datasets/:id/manifest`
+- `GET /api/datasets/:id/manifest` (returns CSV + Parquet URLs when available)
 - `POST /api/datasets/:id/encode`
 - `DELETE /api/datasets/:id`
 
 Compatibility aliases remain enabled:
 - Static: `/sessions/...` -> serves from `datasets/`
 - API: `/api/sessions/*` -> HTTP 307 redirect to `/api/datasets/*`
+
+## Camera MP4 Encoding (FFmpeg)
+
+When a recording session stops, D3C can automatically encode camera JPG frames into `camera_video.mp4` and keep the JPG sequence.
+
+Default behavior:
+- `streams.camera.auto_mp4_on_stop: true`
+- JPG frames in `camera/` are kept
+- MP4 output is written as `camera_video.mp4`
+
+### Install FFmpeg (Windows)
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+Verify:
+
+```powershell
+ffmpeg -version
+```
+
+### If FFmpeg is not in PATH
+
+Set the binary path explicitly before starting the server:
+
+```powershell
+$env:FFMPEG_BIN="C:\path\to\ffmpeg.exe"
+& $env:FFMPEG_BIN -version
+```
+
+Then run D3C in the same PowerShell window:
+
+```powershell
+& "C:\Program Files\nodejs\node.exe" fleet-server\index.js --cert certs\cert.pem --key certs\key.pem --port 8443
+```
+
+### Find `ffmpeg.exe` path
+
+```powershell
+Get-ChildItem "C:\Program Files","C:\Program Files (x86)","C:\ffmpeg","C:\tools","$env:LOCALAPPDATA" -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+```
 
 ## Dataset Output
 
@@ -137,17 +216,24 @@ datasets/session_YYYYMMDD_HHMMSS/
   devices/
     <device_id>/
       streams/
-        imu.csv
+        imu.parquet (canonical)
+        imu.csv (compat)
+        gps.parquet (canonical)
+        gps.csv (compat)
+        events.parquet (canonical)
+        events.csv (compat)
+        net.parquet (canonical)
+        net.csv (compat)
+        audio.parquet (canonical)
+        audio.csv (compat)
+        audio.wav
+        device.parquet (canonical)
+        device.csv (compat)
+        fusion.parquet (canonical)
+        fusion.csv (compat)
         camera/*.jpg
         camera_timestamps.csv
         camera_video.mp4
-        gps.csv
-        audio.csv
-        audio.wav
-        device.csv
-        fusion.csv
-        events.csv
-        net.csv
 ```
 
 ## Troubleshooting
@@ -158,8 +244,13 @@ datasets/session_YYYYMMDD_HHMMSS/
   - verify same hotspot/LAN
   - use active IPv4 from `ipconfig` (not virtual adapters)
   - allow inbound TCP 8443 in Windows Firewall
+- Parquet files missing:
+  - ensure Python + PyArrow are installed (`pip install pyarrow`)
+  - set Python binary if needed:
+    - `$env:PARQUET_PYTHON_BIN = "C:\path\to\python.exe"`
+  - check `control_log.jsonl` for `parquet_convert` result
 - Video not generated:
-  - verify `ffmpeg -version`
+  - verify FFmpeg works: `& $env:FFMPEG_BIN -version` (or `ffmpeg -version` if in PATH)
   - set FFmpeg path if needed:
     - `$env:FFMPEG_BIN = "C:\path\to\ffmpeg.exe"`
-
+  - confirm `streams.camera.auto_mp4_on_stop` is `true` and camera mode is `stream` during recording

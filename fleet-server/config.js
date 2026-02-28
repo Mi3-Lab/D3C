@@ -11,6 +11,7 @@ const DEFAULT_RUN_CONFIG = {
       record: false,
       record_mode: "jpg",
       encode_timing: "post_session",
+      auto_mp4_on_stop: true,
       jpg_quality: 85,
       video_fps: 10,
       video_bitrate: "2M",
@@ -38,6 +39,12 @@ const DEFAULT_RUN_CONFIG = {
     keep_minimum_sessions: 10,
     on_quota_exceeded: "warn"
   },
+  parquet: {
+    enabled: true,
+    python_bin: "python",
+    canonical: true,
+    keep_csv_compat: true
+  },
   performance: {
     throttle_dashboard: true,
     max_ws_buffer_kb: 1024,
@@ -61,4 +68,6 @@ module.exports = {
   MOTION_THRESHOLDS,
   DATASETS_ROOT
 };
+
+
 

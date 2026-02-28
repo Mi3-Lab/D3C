@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { DATASETS_ROOT } = require("../config");
+const { DATASETS_ROOT, DEFAULT_RUN_CONFIG } = require("../config");
 const { ImuRecorder } = require("./recorders/imu_recorder");
 const { CameraRecorder } = require("./recorders/camera_recorder");
 const { EventsRecorder } = require("./recorders/events_recorder");
@@ -10,6 +10,7 @@ const { AudioWavRecorder } = require("./recorders/audio_wav_recorder");
 const { GpsRecorder } = require("./recorders/gps_recorder");
 const { DeviceRecorder } = require("./recorders/device_recorder");
 const { FusionRecorder } = require("./recorders/fusion_recorder");
+const { convertSessionCsvToParquet } = require("./parquet/converter");
 
 class SessionManager {
   constructor() {
@@ -49,6 +50,7 @@ class SessionManager {
       recording_mode: this.mode,
       focused_device_id: focusedDeviceId || null,
       target_device_ids: [...this.targetDeviceIds],
+      dataset_format: { canonical: "parquet", csv_compat: DEFAULT_RUN_CONFIG.parquet?.keep_csv_compat !== false },
       devices: Object.fromEntries(
         [...devicesConfigMap.entries()].map(([id, cfg]) => [id, { runConfig: cfg }])
       ),
@@ -70,6 +72,7 @@ class SessionManager {
     const activeControlLogPath = this.controlLogPath;
     const recorderEntries = [...this.recordersByDevice.entries()];
     const configMap = new Map(this.deviceConfigs);
+    const finalizeTasks = [];
     const stoppedDir = this.sessionDir;
 
     this.logControl({
@@ -90,20 +93,30 @@ class SessionManager {
         const cameraCfg = configMap.get(deviceId)?.streams?.camera || {};
         const encodeTiming = cameraCfg.encode_timing || "post_session";
         const fps = cameraCfg.video_fps || cameraCfg.fps || 10;
-        rec.camera
+        const cameraTask = rec.camera
           .finalize({
             fps,
             encodeTiming,
             bitrate: cameraCfg.video_bitrate || "2M",
             crf: Number.isFinite(cameraCfg.video_crf) ? cameraCfg.video_crf : 23,
-            ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg"
+            ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg",
+            forcePostSessionMp4: cameraCfg.auto_mp4_on_stop !== false
           })
-          .then((result) => appendControlLog(activeControlLogPath, {
-            type: "camera_finalize",
+          .then((result) => {
+            appendControlLog(activeControlLogPath, {
+              type: "camera_finalize",
+              device_id: deviceId,
+              at_iso: new Date().toISOString(),
+              result
+            });
+            return { device_id: deviceId, kind: "camera", result };
+          })
+          .catch((err) => ({
             device_id: deviceId,
-            at_iso: new Date().toISOString(),
-            result
+            kind: "camera",
+            result: { ok: false, error: String(err?.message || err) }
           }));
+        finalizeTasks.push(cameraTask);
       }
       if (rec.audioWav) {
         const result = rec.audioWav.finalize();
@@ -116,7 +129,26 @@ class SessionManager {
       }
     }
 
-    return { active: false, sessionDir: stoppedDir };
+
+    const parquetCfg = DEFAULT_RUN_CONFIG.parquet || {};
+    if (parquetCfg.enabled !== false) {
+      convertSessionCsvToParquet({
+        sessionDir: stoppedDir,
+        pythonBin: process.env.PARQUET_PYTHON_BIN || parquetCfg.python_bin || "python"
+      }).then((result) => {
+        appendControlLog(activeControlLogPath, {
+          type: "parquet_convert",
+          at_iso: new Date().toISOString(),
+          result
+        });
+      });
+    }
+    return {
+      active: false,
+      sessionDir: stoppedDir,
+      stoppedDeviceIds: recorderEntries.map(([deviceId]) => deviceId),
+      finalizeTasks
+    };
   }
 
   updateDeviceConfig(deviceId, runConfig) {
@@ -154,7 +186,7 @@ class SessionManager {
       fps: c.video_fps || c.fps || 10,
       bitrate: c.video_bitrate || "2M",
       crf: Number.isFinite(c.video_crf) ? c.video_crf : 23,
-      ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg"
+      ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg",
     });
   }
 
@@ -223,6 +255,34 @@ class SessionManager {
     return dir;
   }
 
+
+  getActiveRecorderFlags(deviceId) {
+    const rec = this.recordersByDevice.get(deviceId);
+    if (!rec) {
+      return {
+        imu: false,
+        camera: false,
+        audio: false,
+        audioWav: false,
+        gps: false,
+        device: false,
+        events: false,
+        net: false,
+        fusion: false
+      };
+    }
+    return {
+      imu: !!rec.imu,
+      camera: !!rec.camera,
+      audio: !!rec.audio,
+      audioWav: !!rec.audioWav,
+      gps: !!rec.gps,
+      device: !!rec.device,
+      events: !!rec.events,
+      net: !!rec.net,
+      fusion: !!rec.fusion
+    };
+  }
   getRecorders(deviceId) {
     if (!this.recordersByDevice.has(deviceId)) {
       this.recordersByDevice.set(deviceId, {
@@ -291,6 +351,14 @@ function appendControlLog(controlLogPath, entry) {
 module.exports = {
   SessionManager
 };
+
+
+
+
+
+
+
+
 
 
 

@@ -7,27 +7,54 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <main class="phone-wrap">
-    <div class="row">
-      <h1>D3C Fleet Node</h1>
-      <button id="phoneThemeToggleBtn" class="btn btn-alt">Dark Mode</button>
+  <main class="phone-wrap phone-shell">
+    <div class="row top-header">
+      <div>
+        <h1>D3C Fleet Node</h1>
+        <p class="muted compact">Distributed driving data capture client</p>
+      </div>
+      <div class="row header-actions">
+        <button id="startBtn" class="btn">Start</button>
+        <button id="disconnectBtn" class="btn btn-alt">Disconnect</button>
+        <button id="phoneThemeToggleBtn" class="btn btn-alt">Dark Mode</button>
+      </div>
     </div>
-    <p class="muted">Tap start once to grant iOS permissions.</p>
-    <button id="startBtn" class="btn">Start</button>
-    <div id="connStatus" class="pill">Disconnected</div>
-    <div id="deviceIdPill" class="pill">device: -</div>
+    <p class="muted">Tap Start once to grant permissions and begin live streaming.</p>
 
-    <section class="card">
-      <h2>Module Status</h2>
-      <ul id="statusList"></ul>
+    <section class="status-bar phone-status-bar">
+      <div id="phoneConnCard" class="status-signal is-bad">
+        <div class="status-k">Websocket</div>
+        <div id="phoneConnText" class="status-v">Disconnected</div>
+      </div>
+      <div class="status-signal is-ok">
+        <div class="status-k">Device</div>
+        <div id="deviceIdPill" class="status-v mono">-</div>
+      </div>
+      <div id="phoneCameraCard" class="status-signal is-warn">
+        <div class="status-k">Camera</div>
+        <div id="phoneCameraMode" class="status-v">OFF</div>
+      </div>
+      <div id="phoneAudioCard" class="status-signal is-warn">
+        <div class="status-k">Audio</div>
+        <div id="phoneAudioMode" class="status-v">OFF</div>
+      </div>
     </section>
 
-    <section class="card">
-      <h2>Camera Preview</h2>
-      <video id="preview" playsinline autoplay muted></video>
+    <section class="grid two">
+      <section class="card">
+        <h2>Active Streams</h2>
+        <ul id="statusList" class="phone-stream-list"></ul>
+
+      </section>
+
+      <section class="card">
+        <h2>Camera Preview</h2>
+        <video id="preview" playsinline autoplay muted></video>
+      </section>
     </section>
+
+    <div id="connStatus" class="phone-hidden-status">Disconnected</div>
   </main>
   <script src="/phone.js"></script>
 </body>
 </html>
-

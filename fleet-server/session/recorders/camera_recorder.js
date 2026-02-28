@@ -1,4 +1,4 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
@@ -83,10 +83,18 @@ class CameraRecorder {
     });
   }
 
-  async finalize({ fps, ffmpegBin = "ffmpeg", encodeTiming = "post_session", bitrate = "2M", crf = 23, cleanupAfterEncode = false }) {
+  async finalize({
+    fps,
+    ffmpegBin = "ffmpeg",
+    encodeTiming = "post_session",
+    bitrate = "2M",
+    crf = 23,
+    cleanupAfterEncode = false,
+    forcePostSessionMp4 = false
+  }) {
     if (!this.initialized) return { ok: true, skipped: true };
 
-    const shouldEncodeVideo = this.mode === "video" || this.mode === "both";
+    const shouldEncodeVideo = forcePostSessionMp4 || this.mode === "video" || this.mode === "both";
     if (!shouldEncodeVideo) return { ok: true, skipped: true };
     if (!this.frameIndex) return { ok: true, skipped: true };
 

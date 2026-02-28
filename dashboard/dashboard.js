@@ -1,621 +1,1096 @@
-(() => {
-  const els = {
-    phoneConn: document.getElementById("phoneConn"),
-    recordingPill: document.getElementById("recordingPill"),
-    themeToggleBtn: document.getElementById("themeToggleBtn"),
-    presetSelect: document.getElementById("presetSelect"),
-    deviceSelect: document.getElementById("deviceSelect"),
-    deviceListMini: document.getElementById("deviceListMini"),
-    startRecFocusedBtn: document.getElementById("startRecFocusedBtn"),
-    startRecAllBtn: document.getElementById("startRecAllBtn"),
-    stopRecBtn: document.getElementById("stopRecBtn"),
-    sessionDir: document.getElementById("sessionDir"),
-    imuEnabled: document.getElementById("imuEnabled"),
-    imuRate: document.getElementById("imuRate"),
-    imuRecord: document.getElementById("imuRecord"),
-    cameraMode: document.getElementById("cameraMode"),
-    cameraFps: document.getElementById("cameraFps"),
-    cameraJpegQ: document.getElementById("cameraJpegQ"),
-    jpegQLabel: document.getElementById("jpegQLabel"),
-    cameraRecord: document.getElementById("cameraRecord"),
-    cameraRecordMode: document.getElementById("cameraRecordMode"),
-    cameraEncodeTiming: document.getElementById("cameraEncodeTiming"),
-    cameraVideoFps: document.getElementById("cameraVideoFps"),
-    cameraVideoBitrate: document.getElementById("cameraVideoBitrate"),
-    cameraVideoCrf: document.getElementById("cameraVideoCrf"),
-    cameraDownsample: document.getElementById("cameraDownsample"),
-    gpsEnabled: document.getElementById("gpsEnabled"),
-    gpsRate: document.getElementById("gpsRate"),
-    gpsRecord: document.getElementById("gpsRecord"),
-    audioEnabled: document.getElementById("audioEnabled"),
-    audioRate: document.getElementById("audioRate"),
-    audioRecord: document.getElementById("audioRecord"),
-    deviceEnabled: document.getElementById("deviceEnabled"),
-    deviceRate: document.getElementById("deviceRate"),
-    deviceRecord: document.getElementById("deviceRecord"),
-    fusionEnabled: document.getElementById("fusionEnabled"),
-    fusionRecord: document.getElementById("fusionRecord"),
-    eventsRecord: document.getElementById("eventsRecord"),
-    netEnabled: document.getElementById("netEnabled"),
-    netRecord: document.getElementById("netRecord"),
-    eventLabel: document.getElementById("eventLabel"),
-    markEventBtn: document.getElementById("markEventBtn"),
-    imuCanvas: document.getElementById("imuCanvas"),
-    motionPill: document.getElementById("motionPill"),
-    motionMeta: document.getElementById("motionMeta"),
-    cameraImg: document.getElementById("cameraImg"),
-    netStats: document.getElementById("netStats"),
-    healthImu: document.getElementById("healthImu"),
-    healthCam: document.getElementById("healthCam"),
-    healthAudio: document.getElementById("healthAudio"),
-    healthBattery: document.getElementById("healthBattery"),
-    healthDrop: document.getElementById("healthDrop"),
-    healthRtt: document.getElementById("healthRtt"),
-    healthElapsed: document.getElementById("healthElapsed"),
-    healthLight: document.getElementById("healthLight"),
-    healthFusion: document.getElementById("healthFusion"),
-    healthStorage: document.getElementById("healthStorage"),
-    recordingStreams: document.getElementById("recordingStreams"),
-    presetName: document.getElementById("presetName"),
-    savePresetBtn: document.getElementById("savePresetBtn"),
-    exportPresetBtn: document.getElementById("exportPresetBtn"),
-    importPresetFile: document.getElementById("importPresetFile"),
-    streamTableBody: document.getElementById("streamTableBody"),
-    eventTimeline: document.getElementById("eventTimeline"),
-    reloadSessionsBtn: document.getElementById("reloadSessionsBtn"),
-    replaySessionSelect: document.getElementById("replaySessionSelect"),
-    replaySpeed: document.getElementById("replaySpeed"),
-    replayPlayBtn: document.getElementById("replayPlayBtn"),
-    replayStopBtn: document.getElementById("replayStopBtn"),
-    encodeVideoBtn: document.getElementById("encodeVideoBtn"),
-    replayStatus: document.getElementById("replayStatus"),
-    replayVideo: document.getElementById("replayVideo"),
-    replayAudio: document.getElementById("replayAudio")
+import { createStore, createEventBus, clamp, clone, formatElapsed } from "./store.js";
+import { ACTIVE_LAYOUT_KEY, defaultLayouts, loadLayouts, normalizeLayout, persistLayouts } from "./layouts.js";
+import { createWidgetRegistry, resolveWidgetDevice } from "./widgets.js";
+
+const THEME_KEY = "d3c_theme";
+
+const DEFAULT_RUN_CONFIG = {
+  device_id: "phone1",
+  streams: {
+    imu: { enabled: true, rate_hz: 30, record: true },
+    camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", encode_timing: "post_session", video_fps: 10, video_bitrate: "2M", video_crf: 23, downsample_factor: 1 },
+    gps: { enabled: false, rate_hz: 1, record: false },
+    audio: { enabled: false, rate_hz: 10, record: false },
+    device: { enabled: true, rate_hz: 1, record: false },
+    fusion: { enabled: true, record: false },
+    events: { enabled: true, record: true },
+    net: { enabled: true, record: true }
+  }
+};
+
+const els = {
+  themeToggleBtn: document.getElementById("themeToggleBtn"),
+  statusConn: document.getElementById("statusConn"),
+  statusRec: document.getElementById("statusRec"),
+  statusDevices: document.getElementById("statusDevices"),
+  statusImu: document.getElementById("statusImu"),
+  statusCam: document.getElementById("statusCam"),
+  recordingBanner: document.getElementById("recordingBanner"),
+  statusAudio: document.getElementById("statusAudio"),
+  advancedLayoutBtn: document.getElementById("advancedLayoutBtn"),
+  advancedLayoutPanel: document.getElementById("advancedLayoutPanel"),
+  globalDeviceFilter: document.getElementById("globalDeviceFilter"),
+  layoutSelect: document.getElementById("layoutSelect"),
+  layoutPresetSelect: document.getElementById("layoutPresetSelect"),
+  editLayoutBtn: document.getElementById("editLayoutBtn"),
+  layoutNameInput: document.getElementById("layoutNameInput"),
+  saveLayoutBtn: document.getElementById("saveLayoutBtn"),
+  deleteLayoutBtn: document.getElementById("deleteLayoutBtn"),
+  exportLayoutBtn: document.getElementById("exportLayoutBtn"),
+  importLayoutFile: document.getElementById("importLayoutFile"),
+  addWidgetSelect: document.getElementById("addWidgetSelect"),
+  addWidgetBtn: document.getElementById("addWidgetBtn"),
+  editToolsRow: document.getElementById("editToolsRow"),
+  widgetGrid: document.getElementById("widgetGrid")
+};
+
+let ws = null;
+let isAdvancedOpen = false;
+let dragSession = null;
+let snapOverlayEl = null;
+const mountedWidgets = new Map();
+
+const store = createStore({
+  wsConnected: false,
+  deviceList: [],
+  focusedDeviceId: null,
+  globalDeviceFilter: "",
+  statesByDevice: {},
+  runConfigsByDevice: {},
+  sessionConfig: clone(DEFAULT_RUN_CONFIG),
+  sessionState: "draft",
+  recording: { active: false, phase: "IDLE", mode: "focused", session_id: null, session_dir: null, started_at_utc_ms: null, elapsed_sec: 0, devices_recording: 0, devices_online: 0 },
+  recordByDevice: {},
+  replaySessions: [],
+  storage: { sessions_size_gb: 0, session_count: 0, free_disk_bytes: null },
+  editMode: false,
+  focusWidgetId: null,
+  layouts: {},
+  activeLayoutName: "Recording"
+});
+
+const bus = createEventBus();
+const widgetRegistry = createWidgetRegistry({
+  store,
+  bus,
+  sendJson,
+  mergeRunConfig,
+  defaultRunConfig: DEFAULT_RUN_CONFIG,
+  loadReplaySessions
+});
+
+init();
+
+function init() {
+  const makeWidget = (type, overrides = {}) => {
+    const def = widgetRegistry[type];
+    return {
+      id: `w_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      type,
+      w: overrides.w ?? def.defaults.w,
+      h: overrides.h ?? def.defaults.h,
+      pinned: overrides.pinned ?? !!def.defaults.pinned,
+      settings: { ...clone(def.defaults.settings || {}), ...(overrides.settings || {}) }
+    };
   };
 
-  const DEFAULT_RUN_CONFIG = {
-    device_id: "phone1",
-    streams: {
-      imu: { enabled: true, rate_hz: 30, record: true },
-      camera: {
-        mode: "off",
-        fps: 10,
-        jpeg_q: 0.6,
-        record: false,
-        record_mode: "jpg",
-        encode_timing: "post_session",
-        video_fps: 10,
-        video_bitrate: "2M",
-        video_crf: 23,
-        downsample_factor: 1
-      },
-      gps: { enabled: false, rate_hz: 1, record: false },
-      audio: { enabled: false, rate_hz: 10, record: false },
-      device: { enabled: true, rate_hz: 1, record: false },
-      fusion: { enabled: true, record: false },
-      events: { enabled: true, record: true },
-      net: { enabled: true, record: true }
-    }
-  };
+  const layouts = loadLayouts(() => defaultLayouts(makeWidget));
+  const active = localStorage.getItem(ACTIVE_LAYOUT_KEY) || "Recording";
+  store.setState({
+    layouts,
+    activeLayoutName: layouts[active] ? active : Object.keys(layouts)[0] || "Recording"
+  });
 
-  let ws = null;
-  let runConfig = clone(DEFAULT_RUN_CONFIG);
-  let focusedDeviceId = null;
-  let deviceList = [];
-  const customPresets = loadCustomPresets();
-  const imuHistory = [];
-  const maxImuHistory = 180;
-  let lastCameraTs = null;
-  let replayActive = false;
-  let replayTimer = null;
-
-  bindUi();
+  bindTopUi();
   initTheme();
-  refreshPresetOptions();
+  renderWidgetTypeOptions();
+  renderLayoutSelectors();
+  renderDeviceFilter();
+  renderDashboard();
+  connectWs();
   loadReplaySessions();
   loadStorageHealth();
   setInterval(loadStorageHealth, 5000);
-  connectWs();
-  renderConfig();
 
-  function connectWs() {
-    ws = new WebSocket(`wss://${location.host}/ws`);
-    ws.onopen = () => sendJson({ type: "hello", role: "dashboard" });
-    ws.onclose = () => setTimeout(connectWs, 1000);
-    ws.onmessage = (ev) => {
-      let msg = null;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      if (!msg) return;
+  store.subscribe(
+    (s) => ({
+      ws: s.wsConnected,
+      rec: s.recording,
+      list: s.deviceList,
+      focused: s.focusedDeviceId,
+      filter: s.globalDeviceFilter,
+      states: s.statesByDevice
+    }),
+    () => {
+      renderDeviceFilter();
+      updateGlobalStatusBar();
+  updateRecordingBanner();
+    }
+  );
 
-      if (msg.type === "device_list") {
-        deviceList = Array.isArray(msg.devices) ? msg.devices : [];
-        renderDeviceList();
-        return;
-      }
-      if (msg.type === "focus") {
-        focusedDeviceId = msg.focused_device_id || focusedDeviceId;
-        renderDeviceList();
-        return;
-      }
-      if (msg.type === "config") {
-        if (msg.device_id) focusedDeviceId = msg.device_id;
-        if (focusedDeviceId && msg.device_id && msg.device_id !== focusedDeviceId) return;
-        runConfig = mergeRunConfig(msg.runConfig);
-        renderConfig();
-        return;
-      }
-      if (msg.type === "state" && !replayActive) {
-        renderState(msg);
-        return;
-      }
-      if (msg.type === "recording_error") {
-        const reason = msg.error || "unknown";
-        const details = msg.details?.currentSize != null && msg.details?.maxBytes != null
-          ? ` size=${(msg.details.currentSize / (1024 ** 3)).toFixed(2)}GB max=${(msg.details.maxBytes / (1024 ** 3)).toFixed(2)}GB`
-          : "";
-        els.recordingPill.textContent = `Recording: blocked (${reason}${details})`;
-      }
-    };
+  store.subscribe((s) => ({ edit: s.editMode, active: s.activeLayoutName, layouts: s.layouts }), () => {
+    if (els.advancedLayoutPanel) els.advancedLayoutPanel.hidden = !store.getState().editMode && !isAdvancedOpen;
+    renderLayoutSelectors();
+    els.editToolsRow.style.display = store.getState().editMode ? "flex" : "none";
+    els.editLayoutBtn.textContent = store.getState().editMode ? "Done Editing" : "Edit Layout";
+  });
+
+  updateGlobalStatusBar();
+  updateRecordingBanner();
+
+  bus.on("preview_image", (src) => {
+    const cameraWidget = [...mountedWidgets.values()].find((m) => m.type === "camera_preview");
+    const img = cameraWidget?.el.querySelector("img");
+    if (img) img.src = src;
+  });
+}
+
+function updateGlobalStatusBar() {
+  const st = store.getState();
+  const onlineCount = (st.deviceList || []).filter((d) => d?.connected !== false).length;
+
+  const selectedId = st.globalDeviceFilter || st.focusedDeviceId || "";
+  const selectedState = selectedId ? st.statesByDevice?.[selectedId] : null;
+  let imuHz = Number(selectedState?.net?.imu_hz);
+  let camFps = Number(selectedState?.net?.camera_fps);
+  if (!Number.isFinite(imuHz)) {
+    const rates = (st.deviceList || [])
+      .filter((d) => d?.connected !== false)
+      .map((d) => Number(d?.imuHz ?? d?.imu_hz))
+      .filter((v) => Number.isFinite(v));
+    imuHz = rates.length ? Math.max(...rates) : 0;
   }
 
-  function bindUi() {
-    const updateIds = [
-      "imuEnabled", "imuRate", "imuRecord",
-      "cameraMode", "cameraFps", "cameraJpegQ", "cameraRecord", "cameraRecordMode",
-      "cameraEncodeTiming", "cameraVideoFps", "cameraVideoBitrate", "cameraVideoCrf", "cameraDownsample",
-      "gpsEnabled", "gpsRate", "gpsRecord",
-      "audioEnabled", "audioRate", "audioRecord",
-      "deviceEnabled", "deviceRate", "deviceRecord",
-      "fusionEnabled", "fusionRecord",
-      "eventsRecord", "netEnabled", "netRecord"
-    ];
-    for (const id of updateIds) {
-      els[id].addEventListener("change", () => {
-        runConfig = readConfigFromUi();
-        renderJpegQ();
-        renderRecordingStreams();
-        pushConfig();
-      });
-    }
-    els.deviceSelect.addEventListener("change", () => {
-      const id = els.deviceSelect.value;
-      if (!id) return;
-      focusedDeviceId = id;
-      sendJson({ type: "set_focus", device_id: id });
+  setStatusSignal(els.statusConn, st.wsConnected ? "Connected" : "Disconnected", st.wsConnected ? "ok" : "bad");
+  setStatusSignal(
+    els.statusRec,
+    st.recording?.active
+      ? `ON (${st.recording.mode || "focused"} ${formatElapsed(st.recording.elapsed_sec || 0)})`
+      : "Off",
+    st.recording?.active ? "warn" : "bad"
+  );
+  setStatusSignal(els.statusDevices, `${onlineCount} online`, onlineCount > 0 ? "ok" : "bad");
+  setStatusSignal(els.statusImu, `${Math.round(Math.max(0, imuHz))} Hz`, imuHz > 0 ? "ok" : "bad");
+  if (!Number.isFinite(camFps)) {
+    const cams = (st.deviceList || [])
+      .filter((d) => d?.connected !== false)
+      .map((d) => Number(d?.camFps ?? d?.cameraFps ?? d?.camera_fps))
+      .filter((v) => Number.isFinite(v));
+    camFps = cams.length ? Math.max(...cams) : 0;
+  }
+  setStatusSignal(els.statusCam, `${Math.round(Math.max(0, camFps))} FPS`, camFps > 0 ? "ok" : "warn");
+
+  const audio = selectedState?.audio_latest || {};
+  let audioDb = Number(audio.db ?? audio.level_db ?? audio.rms_db);
+  const amp = Number(audio.amplitude);
+  if (!Number.isFinite(audioDb) && Number.isFinite(amp)) {
+    audioDb = 20 * Math.log10(Math.max(1e-6, amp));
+  }
+  if (!Number.isFinite(audioDb)) audioDb = -120;
+
+  const detected = Boolean(audio.detected ?? audio.voice_detected ?? audio.speech_detected ?? (audioDb > -45));
+  const clip = Number(audio.clip_count ?? audio.clipped_samples ?? audio.clip ?? 0);
+  const dropouts = Number(audio.dropouts ?? selectedState?.net?.audio_dropouts ?? 0);
+  const audioTone = !st.wsConnected ? "bad" : (detected ? "ok" : "warn");
+  setAudioStatusSignal(els.statusAudio, {
+    db: audioDb,
+    detected,
+    clip: Number.isFinite(clip) ? clip : 0,
+    dropouts: Number.isFinite(dropouts) ? dropouts : 0
+  }, audioTone);
+}
+
+function setStatusSignal(el, value, tone) {
+  if (!el) return;
+  const valueEl = el.querySelector(".status-v");
+  if (valueEl) valueEl.textContent = value;
+  el.classList.remove("is-ok", "is-warn", "is-bad");
+  el.classList.add(tone === "warn" ? "is-warn" : tone === "bad" ? "is-bad" : "is-ok");
+}
+function setAudioStatusSignal(el, data, tone) {
+  if (!el) return;
+  const dbText = `${Math.round(data.db)} dB`;
+  const detectedText = data.detected ? "Detected: ON" : "Detected: Quiet";
+  const valueEl = el.querySelector(".status-v");
+  const subs = el.querySelectorAll(".status-sub");
+  if (valueEl) valueEl.textContent = `Audio Level: ${dbText}`;
+  if (subs[0]) subs[0].textContent = detectedText;
+  if (subs[1]) subs[1].textContent = `Clip: ${data.clip}`;
+  if (subs[2]) subs[2].textContent = `Dropouts: ${data.dropouts}`;
+  el.classList.remove("is-ok", "is-warn", "is-bad");
+  el.classList.add(tone === "warn" ? "is-warn" : tone === "bad" ? "is-bad" : "is-ok");
+}
+function updateRecordingBanner() {
+  if (!els.recordingBanner) return;
+  const st = store.getState();
+  const rec = st.recording || {};
+  const phase = rec.phase || (rec.active ? "RECORDING" : "IDLE");
+
+  let elapsedSec = Number(rec.elapsed_sec || 0);
+  if (Number.isFinite(rec.started_at_utc_ms) && rec.started_at_utc_ms > 0) {
+    elapsedSec = Math.max(0, Math.floor((Date.now() - rec.started_at_utc_ms) / 1000));
+  }
+  const ackStarts = Object.values(st.recordByDevice || {})
+    .filter((d) => d?.recording && Number.isFinite(d?.started_at_utc_ms))
+    .map((d) => Number(d.started_at_utc_ms));
+  if (ackStarts.length) {
+    elapsedSec = Math.max(0, Math.floor((Date.now() - Math.min(...ackStarts)) / 1000));
+  }
+  const elapsed = formatElapsedWide(elapsedSec);
+  const session = rec.session_id || "----";
+
+  const byDev = st.recordByDevice || {};
+  const recordingCount = Number.isFinite(rec.devices_recording)
+    ? Number(rec.devices_recording)
+    : Object.values(byDev).filter((d) => d?.recording).length;
+  const onlineCount = Number.isFinite(rec.devices_online)
+    ? Number(rec.devices_online)
+    : (st.deviceList || []).filter((d) => d?.connected !== false).length;
+
+  const banner = els.recordingBanner;
+  banner.classList.remove("idle", "recording", "stopping", "error", "ready");
+
+  if (rec.last_error) {
+    banner.classList.add("error");
+    banner.textContent = `RECORDING ERROR | ${rec.last_error.type || "unknown"}`;
+    return;
+  }
+
+  if (phase === "STOPPING") {
+    banner.classList.add("stopping");
+    banner.textContent = `DEVICES FLUSHING  ${elapsed}  | session ${session}  | ${recordingCount}/${onlineCount} devices`;
+    return;
+  }
+
+  if (phase === "RECORDING" && recordingCount > 0) {
+    banner.classList.add("recording");
+    banner.textContent = `RECORDING  ${elapsed}  | session ${session}  | ${recordingCount}/${onlineCount} devices`;
+    return;
+  }
+
+  if (st.wsConnected && onlineCount > 0) {
+    banner.classList.add("ready");
+    banner.textContent = `SYSTEM READY  | ${onlineCount} devices online`;
+    return;
+  }
+
+  if (st.wsConnected) {
+    banner.classList.add("idle");
+    banner.textContent = `DEVICES CONNECTING`;
+    return;
+  }
+
+  banner.classList.add("idle");
+  banner.textContent = `OFFLINE`;
+}
+function formatElapsedWide(totalSec) {
+  const s = Math.max(0, Number(totalSec || 0));
+  const hh = Math.floor(s / 3600);
+  const mm = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  if (hh > 0) return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+function widgetModality(widgetType) {
+  if (widgetType === "imu_plot") return "imu";
+  if (widgetType === "camera_preview") return "cam";
+  if (widgetType === "audio_live") return "audio";
+  return null;
+}
+
+function panelRecBadgeHtml(instance) {
+  const modality = widgetModality(instance.type);
+  if (!modality) return "";
+  const st = store.getState();
+  const deviceId = resolveWidgetDevice(instance.settings, st);
+  const rec = st.recordByDevice?.[deviceId];
+  const on = !!rec?.recording && !!rec?.modalities?.[modality];
+  return on
+    ? ' <span class="panel-rec rec-on">REC</span>'
+    : ' <span class="panel-rec rec-off">OFF</span>';
+}
+function bindTopUi() {
+  if (els.advancedLayoutBtn && els.advancedLayoutPanel) {
+    els.advancedLayoutBtn.addEventListener("click", () => {
+      isAdvancedOpen = !isAdvancedOpen;
+      els.advancedLayoutPanel.hidden = !isAdvancedOpen && !store.getState().editMode;
+      els.advancedLayoutBtn.textContent = isAdvancedOpen ? "Hide Advanced" : "Advanced Layout";
     });
-    els.startRecFocusedBtn.addEventListener("click", () =>
-      sendJson({ type: "recording", action: "start", scope: "focused" })
-    );
-    els.startRecAllBtn.addEventListener("click", () =>
-      sendJson({ type: "recording", action: "start", scope: "all" })
-    );
-    els.stopRecBtn.addEventListener("click", () => sendJson({ type: "recording", action: "stop" }));
-    els.markEventBtn.addEventListener("click", () => {
-      sendJson({ type: "event", device_id: focusedDeviceId, label: (els.eventLabel.value || "event").trim() });
-      els.eventLabel.value = "";
-    });
-    els.presetSelect.addEventListener("change", () => {
-      const v = els.presetSelect.value;
-      if (v.startsWith("custom:")) runConfig = mergeRunConfig(customPresets[v.slice(7)]);
-      else applyPreset(v);
-      renderConfig();
-      pushConfig();
-    });
-    els.savePresetBtn.addEventListener("click", saveCurrentPreset);
-    els.exportPresetBtn.addEventListener("click", exportPresetJson);
-    els.importPresetFile.addEventListener("change", importPresetJson);
-    els.reloadSessionsBtn.addEventListener("click", loadReplaySessions);
-    els.replayPlayBtn.addEventListener("click", playReplay);
-    els.replayStopBtn.addEventListener("click", stopReplay);
-    els.encodeVideoBtn.addEventListener("click", encodeCurrentReplaySession);
-    els.themeToggleBtn.addEventListener("click", toggleTheme);
   }
+  els.themeToggleBtn.addEventListener("click", toggleTheme);
+  els.globalDeviceFilter.addEventListener("change", () => {
+    const id = els.globalDeviceFilter.value || "";
+    store.setState({ globalDeviceFilter: id });
+    if (id) sendJson({ type: "set_focus", device_id: id });
+  });
 
-  function renderConfig() {
-    const s = runConfig.streams;
-    setValue("imuEnabled", s.imu.enabled); setValue("imuRate", s.imu.rate_hz); setValue("imuRecord", s.imu.record);
-    setValue("cameraMode", s.camera.mode); setValue("cameraFps", s.camera.fps); setValue("cameraJpegQ", s.camera.jpeg_q);
-    setValue("cameraRecord", s.camera.record); setValue("cameraRecordMode", s.camera.record_mode || "jpg");
-    setValue("cameraEncodeTiming", s.camera.encode_timing || "post_session");
-    setValue("cameraVideoFps", s.camera.video_fps || s.camera.fps || 10);
-    setValue("cameraVideoBitrate", s.camera.video_bitrate || "2M");
-    setValue("cameraVideoCrf", s.camera.video_crf || 23);
-    setValue("cameraDownsample", s.camera.downsample_factor || 1);
-    setValue("gpsEnabled", s.gps.enabled); setValue("gpsRate", s.gps.rate_hz); setValue("gpsRecord", s.gps.record);
-    setValue("audioEnabled", s.audio.enabled); setValue("audioRate", s.audio.rate_hz); setValue("audioRecord", s.audio.record);
-    setValue("deviceEnabled", s.device.enabled); setValue("deviceRate", s.device.rate_hz); setValue("deviceRecord", s.device.record);
-    setValue("fusionEnabled", s.fusion.enabled); setValue("fusionRecord", s.fusion.record);
-    setValue("eventsRecord", s.events.record); setValue("netEnabled", s.net.enabled); setValue("netRecord", s.net.record);
-    renderJpegQ();
-    renderRecordingStreams();
-  }
+  els.editLayoutBtn.addEventListener("click", () => {
+    store.setState({ editMode: !store.getState().editMode });
+    renderDashboard();
+  });
 
-  function renderState(st) {
-    focusedDeviceId = st.focused_device_id || focusedDeviceId;
-    if (Array.isArray(st.devices)) {
-      deviceList = st.devices;
-      renderDeviceList();
-    }
-    const f = st.focused || {};
-    els.phoneConn.textContent = `Phone: ${f.connected ? "connected" : "disconnected"}`;
-    els.recordingPill.textContent = `Recording: ${st.recording.active ? `on (${st.recording.mode})` : "off"}`;
-    els.sessionDir.textContent = `session: ${st.recording.session_dir || "none"}`;
-
-    if (f.imu_latest?.mag != null) {
-      imuHistory.push(f.imu_latest.mag);
-      if (imuHistory.length > maxImuHistory) imuHistory.shift();
-      drawImuPlot();
-    }
-    updateMotionPill(f.motion_state || "UNKNOWN");
-    els.motionMeta.textContent = `confidence=${Number(f.motion_conf || 0).toFixed(2)} inactivity=${Number(f.inactivity_duration_sec || 0).toFixed(1)}s`;
-    const rtt = f.net?.rtt_ms == null ? "-" : Number(f.net.rtt_ms).toFixed(0);
-    els.netStats.textContent = `imu_hz=${Number(f.net?.imu_hz || 0).toFixed(1)} cam_fps=${Number(f.net?.camera_fps || 0).toFixed(1)} dropped=${f.net?.dropped_packets || 0} rtt_ms=${rtt}`;
-    els.healthImu.textContent = `IMU Hz: ${Number(f.net?.imu_hz || 0).toFixed(1)}`;
-    els.healthCam.textContent = `Camera FPS: ${Number(f.net?.camera_fps || 0).toFixed(1)}`;
-    els.healthAudio.textContent = `Audio amp: ${f.audio_latest ? Number(f.audio_latest.amplitude || 0).toFixed(3) : "-"}`;
-    els.healthBattery.textContent = `Battery: ${f.device_latest && Number(f.device_latest.battery_level) >= 0 ? `${Number(f.device_latest.battery_level).toFixed(1)}% ${f.device_latest.charging ? "(charging)" : ""}` : "-"}`;
-    els.healthDrop.textContent = `Dropped: ${f.net?.dropped_packets || 0}`;
-    els.healthRtt.textContent = `RTT ms: ${rtt}`;
-    els.healthElapsed.textContent = `Rec Elapsed: ${formatElapsed(st.recording.elapsed_sec || 0)}`;
-    els.healthLight.textContent = `Lighting: ${f.camera_quality?.lighting_score == null ? "-" : Number(f.camera_quality.lighting_score).toFixed(3)}`;
-    els.healthFusion.textContent = `Fusion: cq=${Number(f.fusion?.connection_quality || 0).toFixed(2)} sc=${Number(f.fusion?.sensing_confidence || 0).toFixed(2)}`;
-
-    renderStreamTable(f.stream_status || {});
-    renderEventTimeline(f.event_timeline || []);
-    if (f.camera_latest_ts && f.camera_latest_ts !== lastCameraTs && runConfig.streams.camera.mode === "stream") {
-      lastCameraTs = f.camera_latest_ts;
-      els.cameraImg.src = `/latest.jpg?device_id=${encodeURIComponent(focusedDeviceId || "")}&ts=${f.camera_latest_ts}`;
-    }
-  }
-
-  function renderDeviceList() {
-    const prevFocused = focusedDeviceId;
-    els.deviceSelect.innerHTML = "";
-    if (!deviceList.length) {
-      els.deviceListMini.textContent = "No devices connected";
-      const opt = document.createElement("option"); opt.value = ""; opt.textContent = "No devices";
-      els.deviceSelect.appendChild(opt);
-      return;
-    }
-    for (const d of deviceList) {
-      const opt = document.createElement("option");
-      opt.value = d.device_id;
-      opt.textContent = d.device_id;
-      els.deviceSelect.appendChild(opt);
-    }
-    if (!focusedDeviceId || !deviceList.some((d) => d.device_id === focusedDeviceId)) focusedDeviceId = deviceList[0].device_id;
-    els.deviceSelect.value = focusedDeviceId;
-    if (focusedDeviceId && focusedDeviceId !== prevFocused) {
-      sendJson({ type: "set_focus", device_id: focusedDeviceId });
-    }
-    els.deviceListMini.textContent = deviceList
-      .map((d) => `${d.device_id}:${d.connectionStatus || (d.connected ? "on" : "off")} imu=${Number(d.imuHz || 0).toFixed(1)} cam=${Number(d.camFps || 0).toFixed(1)} rtt=${d.rttMs ?? "-"}`)
-      .join(" | ");
-  }
-
-  function readConfigFromUi() {
-    return {
-      device_id: focusedDeviceId || runConfig.device_id,
-      streams: {
-        imu: { enabled: els.imuEnabled.checked, rate_hz: Number(els.imuRate.value), record: els.imuRecord.checked },
-        camera: {
-          mode: els.cameraMode.value,
-          fps: Number(els.cameraFps.value),
-          jpeg_q: Number(els.cameraJpegQ.value),
-          record: els.cameraRecord.checked,
-          record_mode: els.cameraRecordMode.value,
-          encode_timing: els.cameraEncodeTiming.value,
-          video_fps: Number(els.cameraVideoFps.value),
-          video_bitrate: (els.cameraVideoBitrate.value || "2M").trim() || "2M",
-          video_crf: Number(els.cameraVideoCrf.value),
-          downsample_factor: Number(els.cameraDownsample.value)
-        },
-        gps: { enabled: els.gpsEnabled.checked, rate_hz: Number(els.gpsRate.value), record: els.gpsRecord.checked },
-        audio: { enabled: els.audioEnabled.checked, rate_hz: Number(els.audioRate.value), record: els.audioRecord.checked },
-        device: { enabled: els.deviceEnabled.checked, rate_hz: Number(els.deviceRate.value), record: els.deviceRecord.checked },
-        fusion: { enabled: els.fusionEnabled.checked, record: els.fusionRecord.checked },
-        events: { enabled: true, record: els.eventsRecord.checked },
-        net: { enabled: els.netEnabled.checked, record: els.netRecord.checked }
-      }
-    };
-  }
-
-  function pushConfig() {
-    if (!focusedDeviceId) return;
-    sendJson({ type: "set_config", device_id: focusedDeviceId, runConfig });
-  }
-
-  function applyPreset(name) {
-    const s = runConfig.streams;
-    if (name === "imu-only") { s.imu.enabled = true; s.imu.rate_hz = 60; s.imu.record = true; s.camera.mode = "off"; s.camera.record = false; return; }
-    if (name === "camera-only") { s.imu.enabled = false; s.imu.record = false; s.camera.mode = "stream"; s.camera.fps = 10; s.camera.record = true; s.camera.record_mode = "jpg"; return; }
-    if (name === "no-camera-privacy") { s.camera.mode = "off"; s.camera.record = false; s.imu.enabled = true; s.imu.record = true; return; }
-    if (name === "full-multimodal") { s.imu.enabled = true; s.camera.mode = "stream"; s.camera.record = true; s.audio.enabled = true; s.device.enabled = true; return; }
-  }
-
-  function renderRecordingStreams() {
-    const s = runConfig.streams;
-    els.recordingStreams.textContent =
-      `Recording: imu ${onOff(s.imu.record)} | camera ${onOff(s.camera.record && s.camera.mode === "stream")}(${s.camera.record_mode || "jpg"}) | audio ${onOff(s.audio.record)} | device ${onOff(s.device.record)} | fusion ${onOff(s.fusion.record)} | events ${onOff(s.events.record)} | net ${onOff(s.net.record)}`;
-  }
-
-  function renderStreamTable(streamStatus) {
-    const ids = ["imu", "camera", "gps", "audio", "device", "fusion", "events", "net"];
-    els.streamTableBody.innerHTML = "";
-    for (const id of ids) {
-      const s = streamStatus[id] || {};
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${id}</td><td>${!!s.enabled}</td><td>${!!s.recording}</td><td>${s.rate || "-"}</td><td>${formatTs(s.last_seen_ms)}</td>`;
-      els.streamTableBody.appendChild(tr);
-    }
-  }
-
-  function renderEventTimeline(events) {
-    els.eventTimeline.innerHTML = "";
-    for (let i = events.length - 1; i >= 0; i -= 1) {
-      const ev = events[i];
-      const li = document.createElement("li");
-      li.textContent = `${formatTs(ev.t_recv_ms)} ${ev.source || "unknown"}: ${ev.label || ""}`;
-      els.eventTimeline.appendChild(li);
-    }
-  }
-
-  function drawImuPlot() {
-    const c = els.imuCanvas;
-    const ctx = c.getContext("2d");
-    const w = c.width;
-    const h = c.height;
-    ctx.clearRect(0, 0, w, h);
-    const style = getComputedStyle(document.documentElement);
-    const gridColor = style.getPropertyValue("--plot-grid").trim() || "#cccccc";
-    const lineColor = style.getPropertyValue("--plot-line").trim() || "#6c74c9";
-    ctx.strokeStyle = gridColor; ctx.beginPath(); ctx.moveTo(0, h - 1); ctx.lineTo(w, h - 1); ctx.stroke();
-    if (imuHistory.length < 2) return;
-    let max = 12; for (const v of imuHistory) max = Math.max(max, v);
-    ctx.strokeStyle = lineColor; ctx.lineWidth = 2; ctx.beginPath();
-    for (let i = 0; i < imuHistory.length; i += 1) {
-      const x = (i / (maxImuHistory - 1)) * w;
-      const y = h - (imuHistory[i] / max) * (h - 6) - 3;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  }
-
-  function updateMotionPill(state) {
-    els.motionPill.textContent = state;
-    if (state === "STILL") { els.motionPill.style.background = "#4caf50"; els.motionPill.style.color = "#fff"; return; }
-    if (state === "MOVING") { els.motionPill.style.background = "#ff9800"; els.motionPill.style.color = "#102022"; return; }
-    if (state === "HIGH") { els.motionPill.style.background = "#f44336"; els.motionPill.style.color = "#fff"; return; }
-    els.motionPill.style.background = "#cccccc"; els.motionPill.style.color = "#102022";
-  }
-
-  async function loadReplaySessions() {
-    try {
-      const data = await (await fetch("/api/datasets")).json();
-      const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-      els.replaySessionSelect.innerHTML = "";
-      for (const id of sessions) {
-        const opt = document.createElement("option"); opt.value = id; opt.textContent = id;
-        els.replaySessionSelect.appendChild(opt);
-      }
-      if (!sessions.length) {
-        const opt = document.createElement("option"); opt.value = ""; opt.textContent = "No sessions";
-        els.replaySessionSelect.appendChild(opt);
-      }
-    } catch { els.replayStatus.textContent = "Replay: failed to load sessions"; }
-  }
-
-  async function playReplay() {
-    const sessionId = els.replaySessionSelect.value;
-    if (!sessionId) return;
-    stopReplay();
-    replayActive = true;
-    const qs = focusedDeviceId ? `?device_id=${encodeURIComponent(focusedDeviceId)}` : "";
-    const manifest = await (await fetch(`/api/datasets/${encodeURIComponent(sessionId)}/manifest${qs}`)).json();
-    const speed = Math.max(0.25, Number(els.replaySpeed.value || 1));
-    const imuRows = manifest.imuCsv ? parseImuCsv(await (await fetch(manifest.imuCsv)).text()) : [];
-    const evRows = manifest.eventsCsv ? parseEventsCsv(await (await fetch(manifest.eventsCsv)).text()) : [];
-    const camRows = manifest.cameraTimestampsCsv ? parseCameraTsCsv(await (await fetch(manifest.cameraTimestampsCsv)).text()) : [];
-    if (manifest.cameraVideo) { els.replayVideo.style.display = "block"; els.replayVideo.src = manifest.cameraVideo; }
-    else { els.replayVideo.style.display = "none"; els.replayVideo.removeAttribute("src"); }
-    if (manifest.audioWav && els.replayAudio) {
-      els.replayAudio.style.display = "block";
-      els.replayAudio.src = manifest.audioWav;
-      els.replayAudio.playbackRate = speed;
-      els.replayAudio.currentTime = 0;
-      els.replayAudio.play().catch(() => {});
-    } else if (els.replayAudio) {
-      els.replayAudio.pause();
-      els.replayAudio.style.display = "none";
-      els.replayAudio.removeAttribute("src");
-    }
-    if (!imuRows.length && !evRows.length && !camRows.length && !manifest.cameraVideo && !manifest.audioWav) { replayActive = false; return; }
-
-    const startTs = (imuRows[0]?.t_recv_ms) || (evRows[0]?.t_recv_ms) || (camRows[0]?.t_recv_ms) || Date.now();
-    const endTs = Math.max(
-      imuRows.length ? imuRows[imuRows.length - 1].t_recv_ms : startTs,
-      evRows.length ? evRows[evRows.length - 1].t_recv_ms : startTs,
-      camRows.length ? camRows[camRows.length - 1].t_recv_ms : startTs
-    );
-    const wallStart = Date.now();
-    let imuIdx = 0; let evIdx = 0; let camIdx = 0;
-    const replayEvents = [];
-    imuHistory.length = 0;
-
-    replayTimer = setInterval(() => {
-      const nowTs = startTs + (Date.now() - wallStart) * speed;
-      while (imuIdx < imuRows.length && imuRows[imuIdx].t_recv_ms <= nowTs) {
-        imuHistory.push(imuRows[imuIdx++].mag); if (imuHistory.length > maxImuHistory) imuHistory.shift();
-      }
-      drawImuPlot();
-      while (evIdx < evRows.length && evRows[evIdx].t_recv_ms <= nowTs) replayEvents.push(evRows[evIdx++]);
-      renderEventTimeline(replayEvents.slice(-50));
-      while (camIdx < camRows.length && camRows[camIdx].t_recv_ms <= nowTs) {
-        els.cameraImg.src = `/datasets/${sessionId}/devices/${manifest.device_id}/streams/camera/${camRows[camIdx++].filename}`;
-      }
-      els.replayStatus.textContent = `Replay: ${sessionId} @ ${speed}x`;
-      if (nowTs >= endTs) stopReplay("Replay: done");
-    }, 40);
-  }
-
-  function stopReplay(status = "Replay: idle") {
-    replayActive = false;
-    if (replayTimer) clearInterval(replayTimer);
-    replayTimer = null;
-    els.replayStatus.textContent = status;
-    if (els.replayAudio) {
-      els.replayAudio.pause();
-    }
-  }
-
-  async function encodeCurrentReplaySession() {
-    const sessionId = els.replaySessionSelect.value;
-    if (!sessionId || !focusedDeviceId) return;
-    els.replayStatus.textContent = "Replay: encoding video...";
-    try {
-      const resp = await fetch(`/api/datasets/${encodeURIComponent(sessionId)}/encode`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          device_id: focusedDeviceId,
-          fps: runConfig.streams.camera.video_fps || runConfig.streams.camera.fps || 10,
-          bitrate: runConfig.streams.camera.video_bitrate || "2M",
-          crf: runConfig.streams.camera.video_crf || 23
-        })
-      });
-      const data = await resp.json();
-      if (!resp.ok || !data.ok) {
-        els.replayStatus.textContent = `Replay: encode failed (${data.error || resp.status})`;
-        return;
-      }
-      els.replayStatus.textContent = "Replay: encode complete";
-      await loadReplaySessions();
-    } catch {
-      els.replayStatus.textContent = "Replay: encode failed";
-    }
-  }
-
-  async function loadStorageHealth() {
-    try {
-      const data = await (await fetch("/api/storage")).json();
-      const gb = Number(data.sessions_size_gb || 0).toFixed(2);
-      const count = Number(data.session_count || 0);
-      const freeGb = Number.isFinite(data.free_disk_bytes) ? (Number(data.free_disk_bytes) / (1024 ** 3)).toFixed(1) : "?";
-      els.healthStorage.textContent = `Storage: ${gb}GB / ${count} datasets | free ${freeGb}GB`;
-    } catch {
-      els.healthStorage.textContent = "Storage: unavailable";
-    }
-  }
-
-  function parseImuCsv(text) {
-    const rows = [];
-    for (const line of text.split(/\r?\n/).slice(1)) {
-      if (!line.trim()) continue;
-      const p = line.split(",");
-      const t = Number(p[0]); const ax = Number(p[2]); const ay = Number(p[3]); const az = Number(p[4]);
-      rows.push({ t_recv_ms: t, mag: Math.sqrt(ax * ax + ay * ay + az * az) });
-    }
-    return rows;
-  }
-
-  function parseCameraTsCsv(text) {
-    const rows = [];
-    for (const line of text.split(/\r?\n/).slice(1)) {
-      if (!line.trim()) continue;
-      const p = line.split(",");
-      if (p.length >= 4) rows.push({ filename: p[1], t_recv_ms: Number(p[3]) });
-    }
-    return rows;
-  }
-
-  function parseEventsCsv(text) {
-    const rows = [];
-    for (const line of text.split(/\r?\n/).slice(1)) {
-      if (!line.trim()) continue;
-      const first = line.indexOf(","); const second = line.indexOf(",", first + 1); const third = line.indexOf(",", second + 1);
-      if (first < 0 || second < 0 || third < 0) continue;
-      rows.push({ t_recv_ms: Number(line.slice(0, first)), label: line.slice(second + 1, third).replace(/^"|"$/g, ""), source: "replay" });
-    }
-    return rows;
-  }
-
-  function saveCurrentPreset() {
-    const name = (els.presetName.value || "").trim();
+  els.layoutSelect.addEventListener("change", () => {
+    const name = els.layoutSelect.value;
     if (!name) return;
-    customPresets[name] = clone(runConfig);
-    localStorage.setItem("phonesense_custom_presets", JSON.stringify(customPresets));
-    refreshPresetOptions(name);
-  }
+    setActiveLayout(name);
+    renderDashboard();
+  });
 
-  function exportPresetJson() {
-    const blob = new Blob([JSON.stringify(runConfig, null, 2)], { type: "application/json" });
+  els.layoutPresetSelect.addEventListener("change", () => {
+    const name = els.layoutPresetSelect.value;
+    if (!name) return;
+    applyLayoutPreset(name);
+    els.layoutPresetSelect.value = "";
+  });
+
+  els.saveLayoutBtn.addEventListener("click", () => {
+    const raw = (els.layoutNameInput.value || "").trim();
+    if (!raw) return;
+    const st = store.getState();
+    const current = clone(st.layouts[st.activeLayoutName]);
+    current.name = raw;
+    const layouts = { ...st.layouts, [raw]: current };
+    store.setState({ layouts, activeLayoutName: raw });
+    persistLayouts(layouts, raw);
+    renderDashboard();
+    els.layoutNameInput.value = "";
+  });
+
+  els.deleteLayoutBtn.addEventListener("click", () => {
+    const st = store.getState();
+    const layouts = { ...st.layouts };
+    delete layouts[st.activeLayoutName];
+    if (!Object.keys(layouts).length) return;
+    const next = Object.keys(layouts)[0];
+    store.setState({ layouts, activeLayoutName: next, focusWidgetId: null });
+    persistLayouts(layouts, next);
+    renderDashboard();
+  });
+
+  els.exportLayoutBtn.addEventListener("click", () => {
+    const st = store.getState();
+    const layout = st.layouts[st.activeLayoutName];
+    if (!layout) return;
+    const blob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "phonesense_preset.json";
+    a.download = `${layout.name}.json`;
     a.click();
-  }
+  });
 
-  async function importPresetJson() {
-    const file = els.importPresetFile.files?.[0];
+  els.importLayoutFile.addEventListener("change", async () => {
+    const file = els.importLayoutFile.files?.[0];
     if (!file) return;
-    runConfig = mergeRunConfig(JSON.parse(await file.text()));
-    renderConfig();
-    pushConfig();
-    els.importPresetFile.value = "";
-  }
-
-  function refreshPresetOptions(selectName) {
-    const current = els.presetSelect.value;
-    for (const option of [...els.presetSelect.querySelectorAll("option[data-custom='1']")]) option.remove();
-    for (const name of Object.keys(customPresets).sort()) {
-      const opt = document.createElement("option");
-      opt.value = `custom:${name}`; opt.textContent = `Custom: ${name}`; opt.dataset.custom = "1";
-      els.presetSelect.appendChild(opt);
+    try {
+      const layout = JSON.parse(await file.text());
+      if (!layout?.name || !Array.isArray(layout.widgets)) return;
+      const st = store.getState();
+      const layouts = { ...st.layouts, [layout.name]: normalizeLayout(layout, widgetRegistry) };
+      store.setState({ layouts, activeLayoutName: layout.name });
+      persistLayouts(layouts, layout.name);
+      renderDashboard();
+    } finally {
+      els.importLayoutFile.value = "";
     }
-    if (selectName && customPresets[selectName]) els.presetSelect.value = `custom:${selectName}`;
-    else if (current) els.presetSelect.value = current;
+  });
+
+  els.addWidgetBtn.addEventListener("click", () => {
+    const type = els.addWidgetSelect.value;
+    if (!type || !widgetRegistry[type]) return;
+    mutateLayout((layout) => {
+      const def = widgetRegistry[type];
+      layout.widgets.push({
+        id: `w_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        type,
+        w: def.defaults.w,
+        h: def.defaults.h,
+        pinned: !!def.defaults.pinned,
+        settings: clone(def.defaults.settings || {})
+      });
+    });
+    renderDashboard();
+  });
+}
+
+function connectWs() {
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.onopen = () => {
+    store.setState({ wsConnected: true });
+    sendJson({ type: "hello", role: "dashboard" });
+  };
+  ws.onclose = () => {
+    store.setState({ wsConnected: false });
+    setTimeout(connectWs, 1000);
+  };
+  ws.onmessage = (ev) => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (!msg) return;
+
+    if (msg.type === "device_list") {
+      const st = store.getState();
+      const nextList = Array.isArray(msg.devices) ? msg.devices : [];
+      const nextStates = { ...st.statesByDevice };
+      for (const d of nextList) {
+        if (!nextStates[d.device_id]) nextStates[d.device_id] = { connected: !!d.connected };
+      }
+      store.setState({ deviceList: nextList, statesByDevice: nextStates });
+      return;
+    }
+
+    if (msg.type === "focus") {
+      if (msg.focused_device_id) store.setState({ focusedDeviceId: msg.focused_device_id });
+      return;
+    }
+
+    if (msg.type === "config") {
+      const id = msg.device_id || store.getState().focusedDeviceId;
+      const st = store.getState();
+      const merged = mergeRunConfig(msg.runConfig || {});
+      if (!id) {
+        store.setState({ sessionConfig: merged });
+      } else {
+        store.setState({ runConfigsByDevice: { ...st.runConfigsByDevice, [id]: merged }, sessionConfig: merged });
+      }
+      return;
+    }
+
+    if (msg.type === "session_config") {
+      const st = store.getState();
+      store.setState({
+        sessionConfig: mergeRunConfig(msg.sessionConfig || st.sessionConfig || DEFAULT_RUN_CONFIG),
+        sessionState: msg.sessionState || (st.recording?.active ? "active" : "draft")
+      });
+      return;
+    }
+
+    if (msg.type === "record_status") {
+      const id = msg.device_id;
+      if (!id) return;
+      const st = store.getState();
+      store.setState({
+        recordByDevice: {
+          ...st.recordByDevice,
+          [id]: {
+            ...(st.recordByDevice[id] || {}),
+            device_id: id,
+            connected: msg.connected !== false,
+            recording: !!msg.recording,
+            session_id: msg.session_id || null,
+            started_at_utc_ms: msg.started_at_utc_ms || null,
+            modalities: msg.modalities || { imu: false, cam: false, audio: false },
+            writer: msg.writer || { last_write_utc_ms: null, dropped: 0 }
+          }
+        }
+      });
+      return;
+    }
+
+    if (msg.type === "record_stopped") {
+      const id = msg.device_id;
+      if (!id) return;
+      const st = store.getState();
+      const prev = st.recordByDevice[id] || {};
+      store.setState({
+        recordByDevice: {
+          ...st.recordByDevice,
+          [id]: {
+            ...prev,
+            recording: false,
+            modalities: { imu: false, cam: false, audio: false },
+            files: msg.files || prev.files || {}
+          }
+        }
+      });
+      return;
+    }
+
+    if (msg.type === "state") {
+      const st = store.getState();
+      const focusedId = msg.focused_device_id || st.focusedDeviceId;
+      const byDevice = { ...st.statesByDevice };
+      if (msg.device_states && typeof msg.device_states === "object") {
+        for (const [id, state] of Object.entries(msg.device_states)) byDevice[id] = state;
+      } else if (focusedId && msg.focused) {
+        byDevice[focusedId] = msg.focused;
+      }
+      store.setState({
+        focusedDeviceId: focusedId,
+        deviceList: Array.isArray(msg.devices) ? msg.devices : st.deviceList,
+        statesByDevice: byDevice,
+        recording: msg.recording || st.recording,
+        sessionConfig: mergeRunConfig(msg.sessionConfig || st.sessionConfig || DEFAULT_RUN_CONFIG),
+        sessionState: msg.sessionState || ((msg.recording || st.recording).active ? "active" : "draft")
+      });
+      if (!store.getState().globalDeviceFilter && focusedId) {
+        store.setState({ globalDeviceFilter: focusedId });
+      }
+      return;
+    }
+  };
+}
+function mutateLayout(mutator) {
+  const st = store.getState();
+  const layout = clone(st.layouts[st.activeLayoutName]);
+  if (!layout) return;
+  mutator(layout);
+  const normalized = normalizeLayout(layout, widgetRegistry);
+  const layouts = { ...st.layouts, [normalized.name]: normalized };
+  store.setState({ layouts });
+  persistLayouts(layouts, st.activeLayoutName);
+}
+
+function getActiveLayout() {
+  const st = store.getState();
+  return normalizeLayout(st.layouts[st.activeLayoutName], widgetRegistry);
+}
+
+function setActiveLayout(name) {
+  const st = store.getState();
+  if (!st.layouts[name]) return;
+  store.setState({ activeLayoutName: name, focusWidgetId: null });
+  persistLayouts(st.layouts, name);
+}
+
+function applyLayoutPreset(name) {
+  const makeWidget = (type, overrides = {}) => {
+    const def = widgetRegistry[type];
+    return { id: `w_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, type, w: overrides.w ?? def.defaults.w, h: overrides.h ?? def.defaults.h, pinned: overrides.pinned ?? !!def.defaults.pinned, settings: { ...clone(def.defaults.settings || {}), ...(overrides.settings || {}) } };
+  };
+  const presets = defaultLayouts(makeWidget);
+  if (!presets[name]) return;
+  const st = store.getState();
+  const layouts = { ...st.layouts, [name]: normalizeLayout(presets[name], widgetRegistry) };
+  store.setState({ layouts, activeLayoutName: name, focusWidgetId: null });
+  persistLayouts(layouts, name);
+  renderDashboard();
+}
+
+function renderWidgetTypeOptions() {
+  els.addWidgetSelect.innerHTML = "";
+  for (const [type, def] of Object.entries(widgetRegistry)) {
+    const opt = document.createElement("option");
+    opt.value = type;
+    opt.textContent = def.title;
+    els.addWidgetSelect.appendChild(opt);
+  }
+}
+
+function renderLayoutSelectors() {
+  const st = store.getState();
+  els.layoutSelect.innerHTML = "";
+  for (const n of Object.keys(st.layouts)) {
+    const opt = document.createElement("option");
+    opt.value = n;
+    opt.textContent = n;
+    els.layoutSelect.appendChild(opt);
+  }
+  if (st.layouts[st.activeLayoutName]) els.layoutSelect.value = st.activeLayoutName;
+}
+
+function renderDeviceFilter() {
+  const st = store.getState();
+  els.globalDeviceFilter.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Auto (focused)";
+  els.globalDeviceFilter.appendChild(auto);
+  for (const d of st.deviceList) {
+    const opt = document.createElement("option");
+    opt.value = d.device_id;
+    const name = d.deviceName ? `${d.deviceName} (${d.device_id})` : d.device_id;
+    opt.textContent = name;
+    els.globalDeviceFilter.appendChild(opt);
+  }
+  els.globalDeviceFilter.value = st.globalDeviceFilter || "";
+}
+
+function renderDashboard() {
+  for (const m of mountedWidgets.values()) for (const c of m.cleanups) c();
+  mountedWidgets.clear();
+  els.widgetGrid.innerHTML = "";
+  dragSession = null;
+
+  snapOverlayEl = document.createElement("div");
+  snapOverlayEl.className = "grid-snap-overlay";
+  els.widgetGrid.appendChild(snapOverlayEl);
+
+  const st = store.getState();
+  const layout = getActiveLayout();
+  if (!layout) return;
+  const ordered = [...layout.widgets].sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  const visible = st.focusWidgetId ? ordered.filter((w) => w.id === st.focusWidgetId || w.pinned) : ordered;
+  els.widgetGrid.classList.toggle("focus-mode", !!st.focusWidgetId);
+  els.widgetGrid.classList.toggle("grid-editing", !!st.editMode);
+
+  for (const instance of visible) {
+    const def = widgetRegistry[instance.type];
+    if (!def) continue;
+
+    const card = document.createElement("article");
+    card.className = "card widget-card";
+    const controlTypes = new Set(["stream_controls", "events_timeline", "replay"]);
+    card.classList.add(controlTypes.has(instance.type) ? "widget-control" : "widget-telemetry");
+    card.dataset.widgetId = instance.id;
+    card.style.gridColumn = `span ${clamp(instance.w || 4, 2, 12)}`;
+    card.style.gridRow = `span ${clamp(instance.h || 2, 1, 6)}`;
+    if (instance.pinned) card.classList.add("widget-pinned");
+    if (st.focusWidgetId && st.focusWidgetId === instance.id) card.classList.add("widget-focus");
+
+    const head = document.createElement("div");
+    head.className = "widget-head";
+
+    const title = document.createElement("div");
+    title.className = "widget-title";
+    title.innerHTML = `${def.title}${panelRecBadgeHtml(instance)}${instance.pinned ? ' <span class="pin-badge">PIN</span>' : ""}`;
+
+    const actions = document.createElement("div");
+    actions.className = "widget-actions";
+    actions.appendChild(actionBtn(st.focusWidgetId === instance.id ? "Exit Focus" : "Focus", () => {
+      store.setState({ focusWidgetId: st.focusWidgetId === instance.id ? null : instance.id });
+      renderDashboard();
+    }));
+
+    if (def.settingsSchema?.length) {
+      actions.appendChild(actionBtn("Settings", () => {
+        const panel = card.querySelector(".widget-settings");
+        panel.style.display = panel.style.display === "none" ? "block" : "none";
+      }));
+    }
+
+    if (st.editMode) {
+      actions.appendChild(actionBtn(instance.pinned ? "Unpin" : "Pin", () => {
+        mutateLayout((l) => {
+          const w = l.widgets.find((x) => x.id === instance.id);
+          if (w) w.pinned = !w.pinned;
+        });
+        renderDashboard();
+      }));
+      actions.appendChild(actionBtn("Remove", () => {
+        mutateLayout((l) => { l.widgets = l.widgets.filter((w) => w.id !== instance.id); });
+        renderDashboard();
+      }));
+      head.classList.add("drag-handle");
+      head.addEventListener("pointerdown", (e) => startWidgetDrag(e, instance.id, card));
+    }
+
+    head.append(title, actions);
+    card.appendChild(head);
+
+    const settings = document.createElement("div");
+    settings.className = "widget-settings";
+    settings.style.display = "none";
+    if (def.settingsSchema?.length) renderSettings(settings, instance, def.settingsSchema);
+    card.appendChild(settings);
+
+    const body = document.createElement("div");
+    body.className = "widget-content";
+    card.appendChild(body);
+
+    if (st.editMode) {
+      const handle = document.createElement("div");
+      handle.className = "widget-resize-handle";
+      handle.title = "Drag to resize";
+      handle.addEventListener("pointerdown", (e) => startWidgetResize(e, instance.id, card));
+      card.appendChild(handle);
+    }
+
+    els.widgetGrid.appendChild(card);
+    const cleanup = def.render(body, { instance, store, bus });
+    mountedWidgets.set(instance.id, { cleanups: cleanup ? [cleanup] : [], type: instance.type, el: card });
+  }
+}
+function renderSettings(container, instance, schema) {
+  container.innerHTML = "";
+  for (const field of schema) {
+    const label = document.createElement("label");
+    label.textContent = field.label;
+    let input = null;
+    if (field.type === "select") {
+      input = document.createElement("select");
+      for (const v of field.options || []) {
+        const opt = document.createElement("option");
+        opt.value = String(v);
+        opt.textContent = String(v);
+        input.appendChild(opt);
+      }
+    } else if (field.type === "device") {
+      input = document.createElement("select");
+      const auto = document.createElement("option");
+      auto.value = "global";
+      auto.textContent = "Global filter";
+      input.appendChild(auto);
+      for (const d of store.getState().deviceList) {
+        const opt = document.createElement("option");
+        opt.value = d.device_id;
+        const name = d.deviceName ? `${d.deviceName} (${d.device_id})` : d.device_id;
+    opt.textContent = name;
+        input.appendChild(opt);
+      }
+    } else {
+      input = document.createElement("input");
+      input.type = field.type === "number" ? "number" : "text";
+      if (field.min != null) input.min = String(field.min);
+      if (field.max != null) input.max = String(field.max);
+      if (field.step != null) input.step = String(field.step);
+    }
+    input.value = String(instance.settings?.[field.key] ?? field.default ?? "");
+    input.addEventListener("change", () => {
+      mutateLayout((layout) => {
+        const w = layout.widgets.find((x) => x.id === instance.id);
+        if (!w) return;
+        w.settings = { ...w.settings, [field.key]: field.type === "number" ? Number(input.value) : input.value };
+      });
+      renderDashboard();
+    });
+    label.appendChild(input);
+    container.appendChild(label);
+  }
+}
+
+function startWidgetDrag(e, widgetId, card) {
+  if (!store.getState().editMode || store.getState().focusWidgetId) return;
+  if (e.button !== 0) return;
+  if (e.target.closest("button, input, select, label, a")) return;
+  e.preventDefault();
+
+  const rect = card.getBoundingClientRect();
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const startLeft = rect.left;
+  const startTop = rect.top;
+
+  const placeholder = document.createElement("article");
+  placeholder.className = "card widget-card drag-placeholder";
+  placeholder.style.gridColumn = card.style.gridColumn;
+  placeholder.style.gridRow = card.style.gridRow;
+  placeholder.dataset.widgetId = widgetId;
+
+  els.widgetGrid.insertBefore(placeholder, card.nextSibling);
+
+  card.classList.add("widget-dragging");
+  card.style.width = `${rect.width}px`;
+  card.style.height = `${rect.height}px`;
+  card.style.position = "fixed";
+  card.style.left = `${startLeft}px`;
+  card.style.top = `${startTop}px`;
+  card.style.margin = "0";
+  card.style.zIndex = "40";
+  card.style.transform = "translate3d(0px, 0px, 0px)";
+  card.style.pointerEvents = "none";
+
+  showSnapOverlay(true);
+
+  dragSession = {
+    widgetId,
+    card,
+    placeholder,
+    startX,
+    startY,
+    startLeft,
+    startTop,
+    dx: 0,
+    dy: 0,
+    raf: null,
+    lastEvent: null
+  };
+
+  const onMove = (ev) => {
+    if (!dragSession) return;
+    dragSession.lastEvent = ev;
+    if (dragSession.raf) return;
+    dragSession.raf = requestAnimationFrame(() => {
+      if (!dragSession) return;
+      dragSession.raf = null;
+      updateWidgetDrag(dragSession.lastEvent);
+    });
+  };
+
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    finishWidgetDrag();
+  };
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+
+function updateWidgetDrag(ev) {
+  if (!dragSession || !ev) return;
+  const s = dragSession;
+  s.dx = ev.clientX - s.startX;
+  s.dy = ev.clientY - s.startY;
+  s.card.style.transform = `translate3d(${s.dx}px, ${s.dy}px, 0)`;
+
+  const targetIndex = findDropIndex(ev.clientX, ev.clientY, s.widgetId);
+  movePlaceholderToIndex(s.placeholder, targetIndex);
+  refreshSnapOverlayMetrics();
+}
+
+function finishWidgetDrag() {
+  if (!dragSession) return;
+  const s = dragSession;
+  if (s.raf) cancelAnimationFrame(s.raf);
+
+  const orderedIds = [];
+  for (const child of els.widgetGrid.children) {
+    if (child.classList.contains("grid-snap-overlay")) continue;
+    if (child.classList.contains("widget-dragging")) continue;
+    if (child.classList.contains("drag-placeholder")) {
+      orderedIds.push(s.widgetId);
+      continue;
+    }
+    if (child.classList.contains("widget-card") && child.dataset.widgetId) {
+      orderedIds.push(child.dataset.widgetId);
+    }
   }
 
-  function loadCustomPresets() {
-    try { return JSON.parse(localStorage.getItem("phonesense_custom_presets") || "{}"); }
-    catch { return {}; }
+  s.card.classList.remove("widget-dragging");
+  s.card.style.width = "";
+  s.card.style.height = "";
+  s.card.style.position = "";
+  s.card.style.left = "";
+  s.card.style.top = "";
+  s.card.style.margin = "";
+  s.card.style.zIndex = "";
+  s.card.style.transform = "";
+  s.card.style.pointerEvents = "";
+
+  s.placeholder.remove();
+  dragSession = null;
+  showSnapOverlay(false);
+
+  if (orderedIds.length) {
+    mutateLayout((layout) => {
+      const byId = new Map(layout.widgets.map((w) => [w.id, w]));
+      const picked = [];
+      const seen = new Set();
+      for (const id of orderedIds) {
+        const w = byId.get(id);
+        if (w && !seen.has(id)) {
+          picked.push(w);
+          seen.add(id);
+        }
+      }
+      for (const w of layout.widgets) {
+        if (!seen.has(w.id)) picked.push(w);
+      }
+      layout.widgets = picked;
+    });
   }
 
-  function initTheme() {
-    applyTheme(localStorage.getItem("phonesense_theme") === "dark" ? "dark" : "light");
-  }
-  function toggleTheme() {
-    applyTheme((document.body.getAttribute("data-theme") || "light") === "light" ? "dark" : "light");
-  }
-  function applyTheme(theme) {
-    document.body.setAttribute("data-theme", theme);
-    localStorage.setItem("phonesense_theme", theme);
-    els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
-    drawImuPlot();
-  }
+  renderDashboard();
+}
 
-  function mergeRunConfig(input) {
-    const merged = clone(DEFAULT_RUN_CONFIG);
-    if (!input || typeof input !== "object") return merged;
-    merged.device_id = typeof input.device_id === "string" ? input.device_id : merged.device_id;
-    const inS = input.streams || {};
-    for (const key of Object.keys(merged.streams)) merged.streams[key] = { ...merged.streams[key], ...(inS[key] || {}) };
-    return merged;
-  }
+function findDropIndex(x, y, draggingId) {
+  const cards = Array.from(els.widgetGrid.querySelectorAll(".widget-card"))
+    .filter((el) => !el.classList.contains("widget-dragging") && !el.classList.contains("drag-placeholder"));
 
-  function setValue(id, value) {
-    const el = els[id];
-    if (el.type === "checkbox") el.checked = !!value;
-    else el.value = String(value);
+  for (let i = 0; i < cards.length; i += 1) {
+    const el = cards[i];
+    if (el.dataset.widgetId === draggingId) continue;
+    const r = el.getBoundingClientRect();
+    const midY = r.top + r.height / 2;
+    const midX = r.left + r.width / 2;
+    const before = (y < midY) || (Math.abs(y - midY) < r.height * 0.3 && x < midX);
+    if (before) {
+      const allChildren = Array.from(els.widgetGrid.children)
+        .filter((c) => (c.classList.contains("widget-card") || c.classList.contains("drag-placeholder")) && !c.classList.contains("widget-dragging"));
+      return allChildren.indexOf(el);
+    }
   }
+  return Array.from(els.widgetGrid.children)
+    .filter((c) => (c.classList.contains("widget-card") || c.classList.contains("drag-placeholder")) && !c.classList.contains("widget-dragging")).length;
+}
 
-  function onOff(v) { return v ? "on" : "off"; }
-  function formatTs(t) { return t ? new Date(Number(t)).toLocaleTimeString() : "-"; }
-  function formatElapsed(sec) { const s = Math.max(0, Number(sec || 0)); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; }
-  function renderJpegQ() { els.jpegQLabel.textContent = Number(els.cameraJpegQ.value).toFixed(2); }
-  function clone(v) { return JSON.parse(JSON.stringify(v)); }
-  function sendJson(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
-})();
+function movePlaceholderToIndex(placeholder, targetIndex) {
+  const children = Array.from(els.widgetGrid.children)
+    .filter((c) => (c.classList.contains("widget-card") || c.classList.contains("drag-placeholder")) && !c.classList.contains("widget-dragging"));
+  const clamped = clamp(targetIndex, 0, children.length);
+  const target = children[clamped];
+  if (!target) {
+    els.widgetGrid.appendChild(placeholder);
+    return;
+  }
+  if (target !== placeholder) {
+    els.widgetGrid.insertBefore(placeholder, target);
+  }
+}
+
+function showSnapOverlay(show) {
+  if (!snapOverlayEl) return;
+  snapOverlayEl.classList.toggle("show", !!show);
+  if (show) refreshSnapOverlayMetrics();
+}
+
+function refreshSnapOverlayMetrics() {
+  if (!snapOverlayEl) return;
+  const gs = getComputedStyle(els.widgetGrid);
+  const cols = gs.gridTemplateColumns.split(" ").filter(Boolean).length || 1;
+  const rowH = parseFloat(gs.gridAutoRows || "110") || 110;
+  const colGap = parseFloat(gs.columnGap || "0") || 0;
+  const rowGap = parseFloat(gs.rowGap || "0") || 0;
+  const gridW = els.widgetGrid.getBoundingClientRect().width;
+  const colW = Math.max(1, (gridW - colGap * (cols - 1)) / cols);
+
+  snapOverlayEl.style.setProperty("--snap-col", `${colW + colGap}px`);
+  snapOverlayEl.style.setProperty("--snap-row", `${rowH + rowGap}px`);
+}
+function resizeWidget(widgetId, dw, dh) {
+  mutateLayout((layout) => {
+    const w = layout.widgets.find((x) => x.id === widgetId);
+    if (!w) return;
+    w.w = clamp((w.w || 4) + dw, 2, 12);
+    w.h = clamp((w.h || 2) + dh, 1, 6);
+  });
+  renderDashboard();
+}
+
+function resizeWidgetTo(widgetId, nextW, nextH) {
+  mutateLayout((layout) => {
+    const w = layout.widgets.find((x) => x.id === widgetId);
+    if (!w) return;
+    w.w = clamp(Number(nextW || w.w || 4), 2, 12);
+    w.h = clamp(Number(nextH || w.h || 2), 1, 6);
+  });
+  renderDashboard();
+}
+
+function startWidgetResize(e, widgetId, card) {
+  if (!store.getState().editMode) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  const layout = getActiveLayout();
+  const target = layout?.widgets?.find((w) => w.id === widgetId);
+  if (!target) return;
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const startW = Number(target.w || 4);
+  const startH = Number(target.h || 2);
+
+  const gridStyle = getComputedStyle(els.widgetGrid);
+  const colCount = Math.max(1, gridStyle.gridTemplateColumns.split(" ").filter(Boolean).length);
+  const colGap = parseFloat(gridStyle.columnGap || "0") || 0;
+  const rowGap = parseFloat(gridStyle.rowGap || "0") || 0;
+  const rowPx = parseFloat(gridStyle.gridAutoRows || "110") || 110;
+  const gridW = els.widgetGrid.getBoundingClientRect().width;
+  const colPx = Math.max(1, (gridW - colGap * (colCount - 1)) / colCount);
+
+  let liveW = startW;
+  let liveH = startH;
+  showSnapOverlay(true);
+
+  const onMove = (ev) => {
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    const dCols = Math.round(dx / (colPx + colGap));
+    const dRows = Math.round(dy / (rowPx + rowGap));
+    liveW = clamp(startW + dCols, 2, 12);
+    liveH = clamp(startH + dRows, 1, 6);
+    card.style.gridColumn = `span ${liveW}`;
+    card.style.gridRow = `span ${liveH}`;
+    refreshSnapOverlayMetrics();
+  };
+
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    showSnapOverlay(false);
+    resizeWidgetTo(widgetId, liveW, liveH);
+  };
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
+function actionBtn(label, onClick) {
+  const b = document.createElement("button");
+  b.className = "btn btn-mini";
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+async function loadReplaySessions() {
+  try {
+    const data = await (await fetch("/api/datasets")).json();
+    store.setState({ replaySessions: Array.isArray(data.sessions) ? data.sessions : [] });
+  } catch {
+    store.setState({ replaySessions: [] });
+  }
+}
+
+async function loadStorageHealth() {
+  try {
+    const data = await (await fetch("/api/storage")).json();
+    store.setState({ storage: data || {} });
+  } catch {}
+}
+
+function mergeRunConfig(input) {
+  const merged = clone(DEFAULT_RUN_CONFIG);
+  if (!input || typeof input !== "object") return merged;
+  merged.device_id = typeof input.device_id === "string" ? input.device_id : merged.device_id;
+  const inS = input.streams || {};
+  for (const key of Object.keys(merged.streams)) merged.streams[key] = { ...merged.streams[key], ...(inS[key] || {}) };
+  return merged;
+}
+
+function sendJson(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function initTheme() {
+  applyTheme(localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light");
+}
+
+function toggleTheme() {
+  applyTheme((document.body.getAttribute("data-theme") || "light") === "light" ? "dark" : "light");
+}
+
+function applyTheme(theme) {
+  document.body.setAttribute("data-theme", theme);
+  localStorage.setItem(THEME_KEY, theme);
+  els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

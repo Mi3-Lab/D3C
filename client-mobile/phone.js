@@ -1,10 +1,17 @@
-﻿(() => {
+(() => {
   const startBtn = document.getElementById("startBtn");
   const themeToggleBtn = document.getElementById("phoneThemeToggleBtn");
+  const disconnectBtn = document.getElementById("disconnectBtn");
   const connStatus = document.getElementById("connStatus");
   const deviceIdPill = document.getElementById("deviceIdPill");
   const statusList = document.getElementById("statusList");
   const previewEl = document.getElementById("preview");
+  const phoneConnCard = document.getElementById("phoneConnCard");
+  const phoneConnText = document.getElementById("phoneConnText");
+  const phoneCameraCard = document.getElementById("phoneCameraCard");
+  const phoneCameraMode = document.getElementById("phoneCameraMode");
+  const phoneAudioCard = document.getElementById("phoneAudioCard");
+  const phoneAudioMode = document.getElementById("phoneAudioMode");
 
   const DEFAULT_RUN_CONFIG = {
     device_id: resolveDeviceId(),
@@ -56,8 +63,20 @@
   renderDeviceId();
   initTheme();
   renderStatus();
+  setConnectionUi(false, "Disconnected");
 
   themeToggleBtn?.addEventListener("click", toggleTheme);
+
+  disconnectBtn?.addEventListener("click", () => {
+    if (!wsClient) return;
+    if (wsClient.isConnected()) {
+      wsClient.disconnect(true);
+      setConnectionUi(false, "Disconnected");
+      return;
+    }
+    wsClient.reconnect();
+    setConnectionUi(false, "Connecting...");
+  });
 
   startBtn.addEventListener("click", async () => {
     if (started) return;
@@ -74,16 +93,20 @@
       maxBufferedBytes: 1024 * 1024,
       onOpen(sock) {
         ws = sock;
-        connStatus.textContent = "Connected (ws open)";
+        setConnectionUi(true, "Connected");
         queueJson({
           type: "hello",
           role: "phone",
           device_id: runConfig.device_id,
+          deviceId: runConfig.device_id,
+          deviceName: resolveDeviceName(),
+          capabilities: resolveCapabilities(),
           user_agent: navigator.userAgent
         });
       },
       onClose() {
-        connStatus.textContent = "Disconnected (ws closed)";
+        ws = null;
+        setConnectionUi(false, "Disconnected");
       },
       onMessage(data) {
         if (typeof data !== "string") return;
@@ -92,7 +115,7 @@
         if (!msg) return;
         if (msg.type === "hello_ack" && msg.device_id) {
           runConfig.device_id = String(msg.device_id);
-          localStorage.setItem("phonesense_phone_device_id", runConfig.device_id);
+          localStorage.setItem("d3c_phone_device_id", runConfig.device_id);
           renderDeviceId();
           return;
         }
@@ -427,28 +450,53 @@
   function renderStatus() {
     const s = runConfig.streams;
     statusList.innerHTML = "";
+
+    const imuLabel = s.imu.enabled ? `ON ${s.imu.rate_hz} Hz` : "OFF";
+    const camLabel = String(s.camera.mode || "off").toUpperCase();
+    const audLabel = s.audio.enabled ? "ON" : "OFF";
+
     const lines = [
-      `IMU: enabled=${s.imu.enabled} rate=${s.imu.rate_hz}Hz record=${s.imu.record}`,
-      `Camera: mode=${s.camera.mode} fps=${s.camera.fps} q=${s.camera.jpeg_q} record=${s.camera.record} encode=${s.camera.encode_timing || "post_session"}`,
-      `GPS: enabled=${s.gps.enabled} record=${s.gps.record}`,
-      `Audio: enabled=${s.audio.enabled} rate=${s.audio.rate_hz}Hz record=${s.audio.record}`,
-      `Device: enabled=${s.device.enabled} rate=${s.device.rate_hz}Hz record=${s.device.record}`,
-      `Fusion: enabled=${s.fusion.enabled} record=${s.fusion.record}`,
-      `Events: record=${s.events.record}`,
-      `Net: enabled=${s.net.enabled} record=${s.net.record}`
+      `IMU stream: ${imuLabel}`,
+      `Camera: ${camLabel} @ ${s.camera.fps} FPS`,
+      `Audio stream: ${audLabel}`,
+      `Recording flags: IMU ${s.imu.record ? "ON" : "OFF"}, CAM ${s.camera.record ? "ON" : "OFF"}, AUD ${s.audio.record ? "ON" : "OFF"}`
     ];
+
     for (const line of lines) {
       const li = document.createElement("li");
       li.textContent = line;
       statusList.appendChild(li);
     }
+
+    if (phoneCameraMode) phoneCameraMode.textContent = camLabel;
+    if (phoneAudioMode) phoneAudioMode.textContent = audLabel;
+    setSignalState(phoneCameraCard, s.camera.mode === "stream" ? "ok" : (s.camera.mode === "preview" ? "warn" : "bad"));
+    setSignalState(phoneAudioCard, s.audio.enabled ? "ok" : "warn");
   }
 
   function renderDeviceId() {
-    deviceIdPill.textContent = `device: ${runConfig.device_id}`;
+    deviceIdPill.textContent = runConfig.device_id;
   }
 
-  function queueJson(obj) {
+    function setConnectionUi(isConnected, shortLabel) {
+    if (connStatus) {
+      connStatus.textContent = isConnected ? "Connected" : "Disconnected";
+    }
+    if (phoneConnText) {
+      phoneConnText.textContent = shortLabel || (isConnected ? "Connected" : "Disconnected");
+    }
+    setSignalState(phoneConnCard, isConnected ? "ok" : "bad");
+    if (disconnectBtn) disconnectBtn.textContent = isConnected ? "Disconnect" : "Reconnect";
+  }
+
+  function setSignalState(el, mode) {
+    if (!el) return;
+    el.classList.remove("is-ok", "is-warn", "is-bad");
+    if (mode === "ok") el.classList.add("is-ok");
+    else if (mode === "warn") el.classList.add("is-warn");
+    else el.classList.add("is-bad");
+  }
+function queueJson(obj) {
     wsClient?.sendJson(obj);
   }
 
@@ -467,15 +515,44 @@
     const qp = new URLSearchParams(location.search);
     const qid = (qp.get("device_id") || "").trim();
     if (qid) return qid;
-    const key = "phonesense_phone_device_id";
+    const key = "d3c_phone_device_id";
     const existing = localStorage.getItem(key);
     if (existing) return existing;
-    const generated = `iphone-${Math.random().toString(36).slice(2, 6)}`;
+    const generated = `iphone-${createUuidV4()}`;
     localStorage.setItem(key, generated);
     return generated;
   }
 
-  function mergeRunConfig(input) {
+    function resolveDeviceName() {
+    const model = navigator.platform || "iPhone";
+    const short = String(runConfig.device_id || "node").slice(0, 8);
+    return `${model}-${short}`;
+  }
+
+  function resolveCapabilities() {
+    return {
+      imu: true,
+      camera: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+      audio: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+      gps: !!navigator.geolocation,
+      battery: !!navigator.getBattery,
+      wake_lock: "wakeLock" in navigator
+    };
+  }
+
+  function createUuidV4() {
+    if (window.crypto && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    if (window.crypto && crypto.getRandomValues) crypto.getRandomValues(bytes);
+    else for (let i = 0; i < 16; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+function mergeRunConfig(input) {
     const merged = clone(DEFAULT_RUN_CONFIG);
     if (!input || typeof input !== "object") return merged;
     merged.device_id = typeof input.device_id === "string" ? input.device_id : merged.device_id;
@@ -530,6 +607,7 @@
       this.closedByUser = false;
     }
     connect() {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
       if (this.closedByUser) return;
       this.ws = new WebSocket(this.url);
       this.ws.binaryType = "arraybuffer";
@@ -540,6 +618,7 @@
       };
       this.ws.onclose = () => {
         this.opts.onClose?.();
+        if (this.closedByUser) return;
         if (runConfig.network?.reconnect_enabled === false) return;
         const base = 1000;
         const max = this.opts.maxReconnectDelayMs || 30000;
@@ -548,7 +627,7 @@
       };
       this.ws.onerror = () => {};
       this.ws.onerror = () => {
-        connStatus.textContent = "Disconnected (ws error)";
+        setConnectionUi(false, "Error");
       };
       this.ws.onmessage = (ev) => this.opts.onMessage?.(ev.data);
     }
@@ -569,6 +648,19 @@
       this.ws.send(buffer);
       return true;
     }
+    disconnect(byUser = true) {
+      this.closedByUser = !!byUser;
+      if (!this.ws) return;
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    reconnect() {
+      this.closedByUser = false;
+      this.connect();
+    }
+    isConnected() {
+      return !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+    }
     flushQueue() {
       while (this.queue.length && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(this.queue.shift());
@@ -578,5 +670,14 @@
 
   connectWs();
 })();
+
+
+
+
+
+
+
+
+
 
 

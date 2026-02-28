@@ -117,13 +117,20 @@ app.get("/api/datasets/:id/manifest", (req, res) => {
     device_id: deviceId,
     metaJson: toUrlIfExists(path.join(root, "meta.json"), `/datasets/${id}/meta.json`),
     imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
+    imuParquet: toUrlIfExists(path.join(streamRoot, "imu.parquet"), `/datasets/${id}/devices/${deviceId}/streams/imu.parquet`),
     audioCsv: toUrlIfExists(path.join(streamRoot, "audio.csv"), `/datasets/${id}/devices/${deviceId}/streams/audio.csv`),
+    audioParquet: toUrlIfExists(path.join(streamRoot, "audio.parquet"), `/datasets/${id}/devices/${deviceId}/streams/audio.parquet`),
     audioWav: toUrlIfExists(path.join(streamRoot, "audio.wav"), `/datasets/${id}/devices/${deviceId}/streams/audio.wav`),
     deviceCsv: toUrlIfExists(path.join(streamRoot, "device.csv"), `/datasets/${id}/devices/${deviceId}/streams/device.csv`),
+    deviceParquet: toUrlIfExists(path.join(streamRoot, "device.parquet"), `/datasets/${id}/devices/${deviceId}/streams/device.parquet`),
     fusionCsv: toUrlIfExists(path.join(streamRoot, "fusion.csv"), `/datasets/${id}/devices/${deviceId}/streams/fusion.csv`),
+    fusionParquet: toUrlIfExists(path.join(streamRoot, "fusion.parquet"), `/datasets/${id}/devices/${deviceId}/streams/fusion.parquet`),
     eventsCsv: toUrlIfExists(path.join(streamRoot, "events.csv"), `/datasets/${id}/devices/${deviceId}/streams/events.csv`),
+    eventsParquet: toUrlIfExists(path.join(streamRoot, "events.parquet"), `/datasets/${id}/devices/${deviceId}/streams/events.parquet`),
     netCsv: toUrlIfExists(path.join(streamRoot, "net.csv"), `/datasets/${id}/devices/${deviceId}/streams/net.csv`),
+    netParquet: toUrlIfExists(path.join(streamRoot, "net.parquet"), `/datasets/${id}/devices/${deviceId}/streams/net.parquet`),
     gpsCsv: toUrlIfExists(path.join(streamRoot, "gps.csv"), `/datasets/${id}/devices/${deviceId}/streams/gps.csv`),
+    gpsParquet: toUrlIfExists(path.join(streamRoot, "gps.parquet"), `/datasets/${id}/devices/${deviceId}/streams/gps.parquet`),
     cameraTimestampsCsv: toUrlIfExists(
       path.join(streamRoot, "camera_timestamps.csv"),
       `/datasets/${id}/devices/${deviceId}/streams/camera_timestamps.csv`
@@ -149,15 +156,24 @@ const pendingCameraHeaderBySocket = new Map(); // ws -> header
 const pendingPingsByDevice = new Map(); // device_id -> ping map
 
 let focusedDeviceId = null;
+let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
+const connectionStats = { sockets_connected: 0, sockets_closed: 0, phones_connected: 0, phones_disconnected: 0, dashboards_connected: 0, dashboards_disconnected: 0 };
+
 const recording = {
   active: false,
+  phase: "IDLE",
   mode: "focused",
   session_dir: null,
-  started_at_ms: null
+  session_id: null,
+  started_at_ms: null,
+  target_device_ids: [],
+  last_error: null,
+  stop_requested_at_ms: null
 };
 
 wss.on("connection", (ws) => {
-  console.log("[ws] socket connected");
+  connectionStats.sockets_connected += 1;
+  console.log("[ws] socket connected", { sockets_connected: connectionStats.sockets_connected, sockets_closed: connectionStats.sockets_closed });
   ws.role = null;
   ws.device_id = null;
 
@@ -171,7 +187,7 @@ wss.on("connection", (ws) => {
     if (!msg) return;
 
     if (msg.type === "hello") {
-      console.log("[ws] hello", { role: msg.role, device_id: msg.device_id || null });
+      console.log("[ws] hello", { role: msg.role, device_id: msg.device_id || msg.deviceId || null, device_name: msg.deviceName || null });
       handleHello(ws, msg);
       return;
     }
@@ -180,7 +196,10 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log("[ws] socket closed", { role: ws.role, device_id: ws.device_id });
+    connectionStats.sockets_closed += 1;
+    if (ws.role === "phone") connectionStats.phones_disconnected += 1;
+    if (ws.role === "dashboard") connectionStats.dashboards_disconnected += 1;
+    console.log("[ws] socket closed", { role: ws.role, device_id: ws.device_id, sockets_connected: connectionStats.sockets_connected, sockets_closed: connectionStats.sockets_closed, phones_connected: connectionStats.phones_connected, phones_disconnected: connectionStats.phones_disconnected });
     pendingCameraHeaderBySocket.delete(ws);
     if (ws.role === "phone") {
       const d = devices.get(ws.device_id);
@@ -188,6 +207,8 @@ wss.on("connection", (ws) => {
         d.connected = false;
         d.ws = null;
         d.lastSeenTs = Date.now();
+        d.recordingStatus.recording = false;
+        d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
       }
       if (focusedDeviceId === ws.device_id) {
         focusedDeviceId = firstConnectedDeviceId() || null;
@@ -212,6 +233,7 @@ setInterval(() => {
       connected: d.connected,
       rttMs: d.stats.rtt_ms,
       droppedPackets: d.stats.dropped_packets,
+      droppedPackets: d.stats.dropped_packets,
       lastSeenMs: d.lastSeenTs
     });
     if (recording.active && sessionManager.shouldRecordDevice(id)) {
@@ -232,6 +254,7 @@ setInterval(() => {
   }
   broadcastState();
   broadcastDeviceList();
+  broadcastRecordStatuses();
 }, 1000);
 
 setInterval(() => {
@@ -244,7 +267,11 @@ setInterval(() => {
 }, 2000);
 
 const stateIntervalMs = Math.round(1000 / STATE_BROADCAST_HZ);
-setInterval(() => broadcastState(), stateIntervalMs);
+setInterval(() => {
+  broadcastState();
+  if (recording.phase !== "IDLE") broadcastRecordStatuses();
+  broadcastDeviceList();
+}, stateIntervalMs);
 
 server.listen(args.port, "0.0.0.0", () => {
   console.log(`D3C Fleet Server listening on https://0.0.0.0:${args.port}`);
@@ -255,41 +282,65 @@ server.listen(args.port, "0.0.0.0", () => {
 function handleHello(ws, msg) {
   if (!WS_ROLES.includes(msg.role)) return;
   ws.role = msg.role;
+
   if (ws.role === "dashboard") {
-    console.log("[ws] dashboard registered");
+    ws.client_id = `dash_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    connectionStats.dashboards_connected += 1;
+    console.log("[ws] dashboard registered", {
+      dashboards_connected: connectionStats.dashboards_connected,
+      dashboards_disconnected: connectionStats.dashboards_disconnected
+    });
     dashboardSockets.add(ws);
     sendWs(ws, { type: "device_list", devices: deviceSummaries() });
     sendWs(ws, { type: "focus", focused_device_id: focusedDeviceId });
+    sendWs(ws, { type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
     if (focusedDeviceId && devices.has(focusedDeviceId)) {
       sendWs(ws, { type: "config", device_id: focusedDeviceId, runConfig: devices.get(focusedDeviceId).config });
+    }
+    for (const [id, d] of devices.entries()) {
+      refreshDeviceRecordingStatus(id, d);
+      sendWs(ws, buildRecordStatusPayload(id, d));
     }
     return;
   }
 
-  const requested = String(msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
+  const requested = String(msg.deviceId || msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
   const unique = uniqueDeviceId(requested);
   ws.device_id = unique;
+
   const existing = devices.get(unique) || newDeviceEntry(unique);
   existing.ws = ws;
   existing.connected = true;
   existing.connectedAt = Date.now();
   existing.lastSeenTs = Date.now();
   existing.user_agent = msg.user_agent || null;
+  existing.device_name = typeof msg.deviceName === "string" ? msg.deviceName : (existing.device_name || unique);
+  existing.capabilities = msg.capabilities && typeof msg.capabilities === "object"
+    ? { ...msg.capabilities }
+    : (existing.capabilities || {});
+  existing.config = clone(sessionConfig);
   devices.set(unique, existing);
+
   if (!pendingPingsByDevice.has(unique)) pendingPingsByDevice.set(unique, new Map());
   if (!focusedDeviceId) focusedDeviceId = unique;
 
+  connectionStats.phones_connected += 1;
   sendWs(ws, {
     type: "hello_ack",
     device_id: unique,
     renamed_from: unique !== requested ? requested : null
   });
-  console.log("[ws] phone registered", { requested, assigned: unique });
-  sendWs(ws, { type: "config", device_id: unique, runConfig: existing.config });
+  console.log("[ws] phone registered", {
+    requested,
+    assigned: unique,
+    device_name: existing.device_name,
+    phones_connected: connectionStats.phones_connected,
+    phones_disconnected: connectionStats.phones_disconnected
+  });
+  sendWs(ws, { type: "config", device_id: unique, runConfig: sessionConfig });
   broadcastDeviceList();
   broadcastState();
 }
-
 function handlePhoneJson(ws, msg) {
   const deviceId = ws.device_id;
   const d = devices.get(deviceId);
@@ -328,6 +379,7 @@ function handlePhoneJson(ws, msg) {
         t_device_ms: Number(msg.t_device_ms || 0),
         ax, ay, az, gx, gy, gz
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
@@ -357,6 +409,7 @@ function handlePhoneJson(ws, msg) {
         amplitude: Number(msg.amplitude || 0),
         noise_level: Number(msg.noise_level || 0)
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
@@ -380,6 +433,7 @@ function handlePhoneJson(ws, msg) {
         t_device_ms: Number(msg.t_device_ms || 0),
         lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
@@ -404,6 +458,7 @@ function handlePhoneJson(ws, msg) {
       channels: Number(msg.channels || 1),
       bitsPerSample: 16
     });
+    markDeviceWrite(deviceId, Date.now());
     return;
   }
   if (msg.type === "device") {
@@ -424,6 +479,7 @@ function handlePhoneJson(ws, msg) {
         charging: !!msg.charging,
         orientation: String(msg.orientation || "unknown")
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
@@ -443,6 +499,7 @@ function handlePhoneJson(ws, msg) {
         label: entry.label,
         meta: { source: "phone" }
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
@@ -473,6 +530,7 @@ function handlePhoneBinary(ws, data) {
       t_device_ms: header.t_device_ms,
       t_recv_ms: tRecvMs
     });
+    markDeviceWrite(ws.device_id, tRecvMs);
   }
 }
 
@@ -481,69 +539,99 @@ function handleDashboardJson(ws, msg) {
     const id = String(msg.device_id || "");
     if (devices.has(id)) focusedDeviceId = id;
     sendWs(ws, { type: "focus", focused_device_id: focusedDeviceId });
-    if (focusedDeviceId) sendWs(ws, { type: "config", device_id: focusedDeviceId, runConfig: devices.get(focusedDeviceId).config });
+    sendWs(ws, { type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    if (focusedDeviceId && devices.has(focusedDeviceId)) {
+      sendWs(ws, {
+        type: "config",
+        device_id: focusedDeviceId,
+        runConfig: devices.get(focusedDeviceId).config
+      });
+    }
     broadcastState();
     return;
   }
+
   if (msg.type === "set_config") {
-    const target = String(msg.device_id || focusedDeviceId || "");
-    if (!target || !devices.has(target)) return;
-    const d = devices.get(target);
-    d.config = sanitizeRunConfig(msg.runConfig, d.config);
-    sessionManager.updateDeviceConfig(target, d.config);
-    sendWs(d.ws, { type: "config", device_id: target, runConfig: d.config });
-    broadcastToDashboards({ type: "config", device_id: target, runConfig: d.config });
+    // Backward-compatible alias: treat old per-device config command as global session config update.
+    const incoming = msg.runConfig && typeof msg.runConfig === "object" ? msg.runConfig : null;
+    if (!incoming) return;
+    if (recording.active && msg.force !== true) {
+      sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
+      return;
+    }
+    sessionConfig = sanitizeRunConfig(incoming, sessionConfig);
+    for (const [id, d] of devices.entries()) {
+      d.config = clone(sessionConfig);
+      sessionManager.updateDeviceConfig(id, d.config);
+      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
+    }
+    broadcastToDashboards({ type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
     broadcastState();
     return;
   }
+
+  if (msg.type === "session_config_update") {
+    if (!msg.sessionConfig || typeof msg.sessionConfig !== "object") return;
+    if (recording.active && msg.force !== true) {
+      sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
+      return;
+    }
+    sessionConfig = sanitizeRunConfig(msg.sessionConfig, sessionConfig);
+    for (const [id, d] of devices.entries()) {
+      d.config = clone(sessionConfig);
+      sessionManager.updateDeviceConfig(id, d.config);
+      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
+    }
+    broadcastToDashboards({ type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    broadcastState();
+    return;
+  }
+
+  if (msg.type === "session_start") {
+    const modalities = [];
+    if (sessionConfig.streams.imu.enabled) modalities.push("imu");
+    if (sessionConfig.streams.camera.mode === "stream") modalities.push("cam");
+    if (sessionConfig.streams.audio.enabled) modalities.push("audio");
+    startRecordingSession({
+      scope: "all",
+      session_name: msg.session_name || null,
+      modalities: modalities.length ? modalities : ["imu", "cam", "audio"]
+    });
+    return;
+  }
+
+  if (msg.type === "session_stop") {
+    void stopRecordingSession({ scope: "all", session_id: recording.session_id || null });
+    return;
+  }
+
+  if (msg.type === "record_start") {
+    startRecordingSession({
+      scope: msg.scope,
+      session_name: msg.session_name || null,
+      modalities: Array.isArray(msg.modalities) ? msg.modalities : ["imu", "cam", "audio"]
+    });
+    return;
+  }
+
+  if (msg.type === "record_stop") {
+    void stopRecordingSession({ scope: msg.scope, session_id: msg.session_id || recording.session_id || null });
+    return;
+  }
+
   if (msg.type === "recording") {
     if (msg.action === "start") {
-      if (DEFAULT_RUN_CONFIG.storage?.auto_cleanup) {
-        const cleanup = runStorageCleanupPolicy(DEFAULT_RUN_CONFIG.storage);
-        if (cleanup.blocked) {
-          broadcastToDashboards({
-            type: "recording_error",
-            error: "storage_quota_exceeded",
-            details: cleanup
-          });
-          return;
-        }
-      }
-      const mode = msg.scope === "all" ? "all" : "focused";
-      const connectedEntries = [...devices.entries()].filter(([, d]) => d.connected);
-      const deviceConfigs = new Map(
-        (mode === "all" ? connectedEntries : connectedEntries.filter(([id]) => id === focusedDeviceId))
-          .map(([id, d]) => [id, d.config])
-      );
-      const deviceDetails = Object.fromEntries(
-        (mode === "all" ? connectedEntries : connectedEntries.filter(([id]) => id === focusedDeviceId))
-          .map(([id, d]) => [id, {
-            user_agent: d.user_agent || null,
-            connected_at_ms: d.connectedAt || null,
-            last_seen_ms: d.lastSeenTs || null
-          }])
-      );
-      if (!deviceConfigs.size) return;
-      const res = sessionManager.start({
-        mode,
-        focusedDeviceId: focusedDeviceId || null,
-        devicesConfigMap: deviceConfigs,
-        extraMeta: { laptop_ip: getPrimaryLanIp(), device_details: deviceDetails }
+      startRecordingSession({
+        scope: msg.scope,
+        session_name: msg.session_name_optional || null,
+        modalities: ["imu", "cam", "audio"]
       });
-      recording.active = true;
-      recording.mode = mode;
-      recording.session_dir = res.sessionDir;
-      recording.started_at_ms = Date.now();
-      broadcastState();
     } else if (msg.action === "stop") {
-      const res = sessionManager.stop();
-      recording.active = false;
-      recording.session_dir = res.sessionDir;
-      recording.started_at_ms = null;
-      broadcastState();
+      void stopRecordingSession({ scope: msg.scope, session_id: recording.session_id || null });
     }
     return;
   }
+
   if (msg.type === "event") {
     const deviceId = String(msg.device_id || focusedDeviceId || "");
     if (!deviceId || !devices.has(deviceId)) return;
@@ -559,22 +647,226 @@ function handleDashboardJson(ws, msg) {
         label: entry.label,
         meta: { source: "dashboard" }
       });
+      markDeviceWrite(deviceId, tRecvMs);
     }
   }
+}
+function startRecordingSession({ scope, session_name, modalities = ["imu", "cam", "audio"] }) {
+  if (recording.phase === "STOPPING") return;
+  if (recording.active) return;
+  if (DEFAULT_RUN_CONFIG.storage?.auto_cleanup) {
+    const cleanup = runStorageCleanupPolicy(DEFAULT_RUN_CONFIG.storage);
+    if (cleanup.blocked) {
+      recording.last_error = { type: "storage_quota_exceeded", details: cleanup };
+      broadcastToDashboards({ type: "recording_error", error: "storage_quota_exceeded", details: cleanup });
+      return;
+    }
+  }
+  const mode = scope === "all" ? "all" : "focused";
+  const connectedEntries = [...devices.entries()].filter(([, d]) => d.connected);
+  const targetEntries = mode === "all" ? connectedEntries : connectedEntries.filter(([id]) => id === focusedDeviceId);
+  const deviceConfigs = new Map(targetEntries.map(([id, d]) => [id, d.config]));
+  const deviceDetails = Object.fromEntries(targetEntries.map(([id, d]) => [id, {
+    user_agent: d.user_agent || null,
+    connected_at_ms: d.connectedAt || null,
+    last_seen_ms: d.lastSeenTs || null
+  }]));
+  if (!deviceConfigs.size) return;
+  const res = sessionManager.start({
+    mode,
+    focusedDeviceId: focusedDeviceId || null,
+    devicesConfigMap: deviceConfigs,
+    extraMeta: {
+      laptop_ip: getPrimaryLanIp(),
+      device_details: deviceDetails,
+      session_name: session_name || null,
+      requested_modalities: modalities
+    }
+  });
+  const startedAt = Date.now();
+  const sid = shortSessionId(res.sessionDir);
+  recording.active = true;
+  recording.phase = "RECORDING";
+  recording.mode = mode;
+  recording.session_dir = res.sessionDir;
+  recording.session_id = sid;
+  recording.started_at_ms = startedAt;
+  recording.target_device_ids = targetEntries.map(([id]) => id);
+  recording.last_error = null;
+  recording.stop_requested_at_ms = null;
+
+  for (const [id, d] of devices.entries()) {
+    const targeted = recording.target_device_ids.includes(id);
+    if (targeted) {
+      d.recordingStatus.recording = true;
+      d.recordingStatus.session_id = sid;
+      d.recordingStatus.started_at_utc_ms = startedAt;
+      d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
+      d.recordingStatus.writer = { last_write_utc_ms: null, dropped: 0 };
+      d.recordingStatus.files = {};
+      d.recordingStatus.error = null;
+    } else if (!recording.active) {
+      d.recordingStatus.recording = false;
+    }
+  }
+
+  broadcastState();
+  broadcastDeviceList();
+  broadcastRecordStatuses();
+}
+
+async function stopRecordingSession() {
+  if (recording.phase === "STOPPING") return;
+  if (!recording.active) return;
+
+  recording.phase = "STOPPING";
+  recording.stop_requested_at_ms = Date.now();
+  broadcastState();
+  broadcastRecordStatuses();
+
+  const stoppingSessionId = recording.session_id;
+  const stoppingTargets = [...recording.target_device_ids];
+  const res = sessionManager.stop();
+  const finalizeTasks = Array.isArray(res.finalizeTasks) ? res.finalizeTasks : [];
+  const timeoutMs = 5000;
+  let timedOut = false;
+
+  if (finalizeTasks.length) {
+    const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve("timeout"), timeoutMs));
+    const settled = await Promise.race([Promise.allSettled(finalizeTasks), timeoutPromise]);
+    if (settled === "timeout") timedOut = true;
+  }
+
+  for (const id of stoppingTargets) {
+    const d = devices.get(id);
+    if (!d) continue;
+    d.recordingStatus.recording = false;
+    d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
+    d.recordingStatus.files = collectStoppedFiles(res.sessionDir, id);
+    d.recordingStatus.writer = { ...d.recordingStatus.writer, dropped: d.stats?.dropped_packets || 0 };
+    broadcastToDashboards({
+      type: "record_stopped",
+      device_id: id,
+      session_id: stoppingSessionId,
+      files: d.recordingStatus.files
+    });
+  }
+
+  recording.active = false;
+  recording.phase = "IDLE";
+  recording.session_dir = res.sessionDir;
+  recording.started_at_ms = null;
+  recording.target_device_ids = [];
+  recording.stop_requested_at_ms = null;
+  recording.last_error = timedOut ? { type: "stop_timeout", timeout_ms: timeoutMs } : null;
+
+  if (timedOut) {
+    broadcastToDashboards({
+      type: "recording_error",
+      error: "stop_timeout",
+      details: { timeout_ms: timeoutMs, session_id: stoppingSessionId, devices: stoppingTargets }
+    });
+  }
+
+  broadcastState();
+  broadcastDeviceList();
+  broadcastRecordStatuses();
+}
+
+function broadcastRecordStatuses() {
+  for (const [id, d] of devices.entries()) {
+    refreshDeviceRecordingStatus(id, d);
+    broadcastToDashboards(buildRecordStatusPayload(id, d));
+  }
+}
+
+function refreshDeviceRecordingStatus(deviceId, d) {
+  if (!d.recordingStatus) return;
+  const writer = d.recordingStatus.writer || { last_write_utc_ms: null, dropped: 0 };
+  writer.dropped = Number(d.stats?.dropped_packets || 0);
+  d.recordingStatus.writer = writer;
+  if (!d.recordingStatus.recording) return;
+  const flags = sessionManager.getActiveRecorderFlags(deviceId);
+  d.recordingStatus.modalities = {
+    imu: !!flags.imu,
+    cam: !!flags.camera,
+    audio: !!(flags.audio || flags.audioWav)
+  };
+}
+
+function buildRecordStatusPayload(deviceId, d) {
+  return {
+    type: "record_status",
+    device_id: deviceId,
+    connected: !!d.connected,
+    recording: !!d.recordingStatus?.recording,
+    session_id: d.recordingStatus?.session_id || null,
+    started_at_utc_ms: d.recordingStatus?.started_at_utc_ms || null,
+    modalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
+    writer: d.recordingStatus?.writer || { last_write_utc_ms: null, dropped: 0 }
+  };
+}
+
+function markDeviceWrite(deviceId, tRecvMs) {
+  const d = devices.get(deviceId);
+  if (!d || !d.recordingStatus) return;
+  if (!d.recordingStatus.writer) d.recordingStatus.writer = { last_write_utc_ms: null, dropped: 0 };
+  d.recordingStatus.writer.last_write_utc_ms = Number(tRecvMs || Date.now());
+}
+function countDevicesRecording() {
+  let n = 0;
+  for (const d of devices.values()) if (d.recordingStatus?.recording) n += 1;
+  return n;
+}
+
+function shortSessionId(sessionDir) {
+  const base = path.basename(String(sessionDir || ""));
+  const tail = base.replace(/^session_/, "");
+  const compact = tail.replace(/[^A-Za-z0-9]/g, "");
+  return (compact.slice(-4) || Math.random().toString(36).slice(2, 6)).toUpperCase();
+}
+
+function collectStoppedFiles(sessionDir, deviceId) {
+  const out = {};
+  try {
+    const streamsDir = path.join(sessionDir || "", "devices", sanitizeDeviceId(deviceId), "streams");
+    if (fs.existsSync(path.join(streamsDir, "imu.parquet"))) out.imu = "imu.parquet";
+    else if (fs.existsSync(path.join(streamsDir, "imu.csv"))) out.imu = "imu.csv";
+    if (fs.existsSync(path.join(streamsDir, "camera_video.mp4"))) out.cam = "camera_video.mp4";
+    else if (fs.existsSync(path.join(streamsDir, "camera"))) out.cam = "camera/";
+    if (fs.existsSync(path.join(streamsDir, "audio.wav"))) out.audio = "audio.wav";
+    else if (fs.existsSync(path.join(streamsDir, "audio.parquet"))) out.audio = "audio.parquet";
+    else if (fs.existsSync(path.join(streamsDir, "audio.csv"))) out.audio = "audio.csv";
+  } catch {}
+  return out;
 }
 
 function broadcastState() {
   const focused = focusedDeviceId ? devices.get(focusedDeviceId) : null;
+  const allStates = {};
+  for (const [id, d] of devices.entries()) {
+    allStates[id] = publicStateForDevice(id, d);
+  }
   const payload = {
     type: "state",
     focused_device_id: focusedDeviceId,
     focused: focused ? publicStateForDevice(focusedDeviceId, focused) : null,
+    device_states: allStates,
     devices: deviceSummaries(),
+    sessionConfig,
+    sessionState: recording.active ? "active" : "draft",
     recording: {
       active: recording.active,
+      phase: recording.phase,
       mode: recording.mode,
+      session_id: recording.session_id,
       session_dir: recording.session_dir,
-      elapsed_sec: recording.started_at_ms ? Math.max(0, Math.round((Date.now() - recording.started_at_ms) / 1000)) : 0
+      started_at_utc_ms: recording.started_at_ms,
+      elapsed_sec: recording.started_at_ms ? Math.max(0, Math.round((Date.now() - recording.started_at_ms) / 1000)) : 0,
+      devices_recording: countDevicesRecording(),
+      devices_online: [...devices.values()].filter((d) => d.connected).length,
+      target_device_ids: recording.target_device_ids,
+      last_error: recording.last_error
     }
   };
   broadcastToDashboards(payload);
@@ -621,8 +913,14 @@ function deviceSummaries() {
       imuHz: d.stats.imu_hz,
       camFps: d.stats.camera_fps,
       rttMs: d.stats.rtt_ms,
+      droppedPackets: d.stats.dropped_packets,
       connectionStatus: d.connectionStatus || "disconnected",
-      recordingActive: recording.active && sessionManager.shouldRecordDevice(id)
+      deviceName: d.device_name || id,
+      capabilities: d.capabilities || {},
+      recordingActive: !!d.recordingStatus?.recording,
+      recordingState: d.recordingStatus?.recording ? "recording" : (d.connected ? "armed" : "idle"),
+      recordingModalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
+      recordingSessionId: d.recordingStatus?.session_id || null
     });
   }
   return out.sort((a, b) => a.device_id.localeCompare(b.device_id));
@@ -686,6 +984,8 @@ function newDeviceEntry(deviceId) {
     connectedAt: null,
     lastSeenTs: null,
     user_agent: null,
+    device_name: null,
+    capabilities: {},
     config: clone(DEFAULT_RUN_CONFIG),
     motion: new MotionState(60),
     stillSinceMs: null,
@@ -714,7 +1014,16 @@ function newDeviceEntry(deviceId) {
       rtt_ms: null
     },
     lastGateMs: {},
-    connectionStatus: "disconnected"
+    connectionStatus: "disconnected",
+    recordingStatus: {
+      recording: false,
+      session_id: null,
+      started_at_utc_ms: null,
+      modalities: { imu: false, cam: false, audio: false },
+      writer: { last_write_utc_ms: null, dropped: 0 },
+      files: {},
+      error: null
+    }
   };
 }
 
@@ -759,6 +1068,10 @@ function getPrimaryLanIp() {
     }
   }
   return null;
+}
+
+function sanitizeDeviceId(deviceId) {
+  return String(deviceId || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
 function sanitizeSessionId(raw) {
@@ -930,6 +1243,21 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
