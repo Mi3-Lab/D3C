@@ -52,12 +52,13 @@ const MOTION_THRESHOLDS = {
   movingVar: 1.5
 };
 
-const SESSIONS_ROOT = path.join(process.cwd(), "sessions");
+const DATASETS_ROOT = path.join(process.cwd(), "datasets");
 
 module.exports = {
   DEFAULT_RUN_CONFIG,
   STATE_BROADCAST_HZ,
   MOTION_WINDOW_MS,
   MOTION_THRESHOLDS,
-  SESSIONS_ROOT
+  DATASETS_ROOT
 };
+

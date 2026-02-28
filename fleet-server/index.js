@@ -4,22 +4,24 @@ const https = require("https");
 const os = require("os");
 const express = require("express");
 const { WebSocketServer, WebSocket } = require("ws");
-const { DEFAULT_RUN_CONFIG, STATE_BROADCAST_HZ, SESSIONS_ROOT } = require("./config");
+const { DEFAULT_RUN_CONFIG, STATE_BROADCAST_HZ, DATASETS_ROOT } = require("./config");
 const { sanitizeRunConfig, WS_ROLES } = require("./shared/schema");
 const { MotionState } = require("./compute/motion_state");
 const { SessionManager } = require("./session/session_manager");
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.cert || !args.key) {
-  console.error("Usage: node server/index.js --cert cert.pem --key key.pem --port 8443");
+  console.error("Usage: node fleet-server/index.js --cert cert.pem --key key.pem --port 8443");
   process.exit(1);
 }
 
 const app = express();
-app.use("/public", express.static(path.join(process.cwd(), "public")));
-app.use("/sessions", express.static(SESSIONS_ROOT));
-app.get("/phone", (_req, res) => res.sendFile(path.join(process.cwd(), "public", "phone.html")));
-app.get("/dashboard", (_req, res) => res.sendFile(path.join(process.cwd(), "public", "dashboard.html")));
+app.use(express.static(path.join(process.cwd(), "client-mobile")));
+app.use(express.static(path.join(process.cwd(), "dashboard")));
+app.use("/datasets", express.static(DATASETS_ROOT));
+app.use("/sessions", express.static(DATASETS_ROOT));
+app.get("/phone", (_req, res) => res.sendFile(path.join(process.cwd(), "client-mobile", "phone.html")));
+app.get("/dashboard", (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
 app.get("/latest.jpg", (req, res) => {
   const deviceId = typeof req.query.device_id === "string" ? req.query.device_id : focusedDeviceId;
   if (!deviceId || !devices.has(deviceId)) return res.status(404).send("No frame");
@@ -30,10 +32,16 @@ app.get("/latest.jpg", (req, res) => {
   res.send(d.latestCameraBuffer);
 });
 
-app.get("/api/sessions", (_req, res) => {
+// Legacy API compatibility: redirect old sessions endpoints to datasets endpoints.
+app.all("/api/sessions*", (req, res) => {
+  const target = req.originalUrl.replace(/^\/api\/sessions/, "/api/datasets");
+  res.redirect(307, target);
+});
+
+app.get("/api/datasets", (_req, res) => {
   try {
-    if (!fs.existsSync(SESSIONS_ROOT)) return res.json({ sessions: [] });
-    const sessions = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true })
+    if (!fs.existsSync(DATASETS_ROOT)) return res.json({ sessions: [] });
+    const sessions = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
       .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
       .map((d) => d.name)
       .sort()
@@ -45,10 +53,10 @@ app.get("/api/sessions", (_req, res) => {
 });
 app.get("/api/storage", (_req, res) => {
   try {
-    const sessionsSize = dirSizeBytes(SESSIONS_ROOT);
+    const sessionsSize = dirSizeBytes(DATASETS_ROOT);
     const freeBytes = getDiskFreeBytes(process.cwd());
-    const sessionCount = fs.existsSync(SESSIONS_ROOT)
-      ? fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith("session_")).length
+    const sessionCount = fs.existsSync(DATASETS_ROOT)
+      ? fs.readdirSync(DATASETS_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith("session_")).length
       : 0;
     res.json({
       sessions_size_bytes: sessionsSize,
@@ -60,10 +68,10 @@ app.get("/api/storage", (_req, res) => {
     res.status(500).json({ error: "storage query failed" });
   }
 });
-app.post("/api/sessions/:id/encode", express.json(), async (req, res) => {
+app.post("/api/datasets/:id/encode", express.json(), async (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
-  const root = path.join(SESSIONS_ROOT, id);
+  const root = path.join(DATASETS_ROOT, id);
   const deviceId = String(req.body?.device_id || "").trim();
   if (!deviceId) return res.status(400).json({ error: "device_id required" });
   const streamsDir = path.join(root, "devices", deviceId, "streams");
@@ -80,10 +88,10 @@ app.post("/api/sessions/:id/encode", express.json(), async (req, res) => {
   if (!result.ok) return res.status(500).json(result);
   res.json(result);
 });
-app.delete("/api/sessions/:id", (req, res) => {
+app.delete("/api/datasets/:id", (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
-  const root = path.join(SESSIONS_ROOT, id);
+  const root = path.join(DATASETS_ROOT, id);
   if (!fs.existsSync(root)) return res.status(404).json({ error: "not found" });
   try {
     fs.rmSync(root, { recursive: true, force: true });
@@ -93,10 +101,10 @@ app.delete("/api/sessions/:id", (req, res) => {
   }
 });
 
-app.get("/api/sessions/:id/manifest", (req, res) => {
+app.get("/api/datasets/:id/manifest", (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
-  const root = path.join(SESSIONS_ROOT, id);
+  const root = path.join(DATASETS_ROOT, id);
   if (!fs.existsSync(root)) return res.status(404).json({ error: "not found" });
   const requested = typeof req.query.device_id === "string" ? req.query.device_id : null;
   const deviceId = requested && fs.existsSync(path.join(root, "devices", requested))
@@ -107,23 +115,24 @@ app.get("/api/sessions/:id/manifest", (req, res) => {
   res.json({
     id,
     device_id: deviceId,
-    metaJson: toUrlIfExists(path.join(root, "meta.json"), `/sessions/${id}/meta.json`),
-    imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/sessions/${id}/devices/${deviceId}/streams/imu.csv`),
-    audioCsv: toUrlIfExists(path.join(streamRoot, "audio.csv"), `/sessions/${id}/devices/${deviceId}/streams/audio.csv`),
-    audioWav: toUrlIfExists(path.join(streamRoot, "audio.wav"), `/sessions/${id}/devices/${deviceId}/streams/audio.wav`),
-    deviceCsv: toUrlIfExists(path.join(streamRoot, "device.csv"), `/sessions/${id}/devices/${deviceId}/streams/device.csv`),
-    fusionCsv: toUrlIfExists(path.join(streamRoot, "fusion.csv"), `/sessions/${id}/devices/${deviceId}/streams/fusion.csv`),
-    eventsCsv: toUrlIfExists(path.join(streamRoot, "events.csv"), `/sessions/${id}/devices/${deviceId}/streams/events.csv`),
-    netCsv: toUrlIfExists(path.join(streamRoot, "net.csv"), `/sessions/${id}/devices/${deviceId}/streams/net.csv`),
+    metaJson: toUrlIfExists(path.join(root, "meta.json"), `/datasets/${id}/meta.json`),
+    imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
+    audioCsv: toUrlIfExists(path.join(streamRoot, "audio.csv"), `/datasets/${id}/devices/${deviceId}/streams/audio.csv`),
+    audioWav: toUrlIfExists(path.join(streamRoot, "audio.wav"), `/datasets/${id}/devices/${deviceId}/streams/audio.wav`),
+    deviceCsv: toUrlIfExists(path.join(streamRoot, "device.csv"), `/datasets/${id}/devices/${deviceId}/streams/device.csv`),
+    fusionCsv: toUrlIfExists(path.join(streamRoot, "fusion.csv"), `/datasets/${id}/devices/${deviceId}/streams/fusion.csv`),
+    eventsCsv: toUrlIfExists(path.join(streamRoot, "events.csv"), `/datasets/${id}/devices/${deviceId}/streams/events.csv`),
+    netCsv: toUrlIfExists(path.join(streamRoot, "net.csv"), `/datasets/${id}/devices/${deviceId}/streams/net.csv`),
+    gpsCsv: toUrlIfExists(path.join(streamRoot, "gps.csv"), `/datasets/${id}/devices/${deviceId}/streams/gps.csv`),
     cameraTimestampsCsv: toUrlIfExists(
       path.join(streamRoot, "camera_timestamps.csv"),
-      `/sessions/${id}/devices/${deviceId}/streams/camera_timestamps.csv`
+      `/datasets/${id}/devices/${deviceId}/streams/camera_timestamps.csv`
     ),
     cameraVideo: toUrlIfExists(
       path.join(streamRoot, "camera_video.mp4"),
-      `/sessions/${id}/devices/${deviceId}/streams/camera_video.mp4`
+      `/datasets/${id}/devices/${deviceId}/streams/camera_video.mp4`
     ),
-    cameraDir: toUrlIfExists(path.join(streamRoot, "camera"), `/sessions/${id}/devices/${deviceId}/streams/camera`)
+    cameraDir: toUrlIfExists(path.join(streamRoot, "camera"), `/datasets/${id}/devices/${deviceId}/streams/camera`)
   });
 });
 
@@ -238,7 +247,7 @@ const stateIntervalMs = Math.round(1000 / STATE_BROADCAST_HZ);
 setInterval(() => broadcastState(), stateIntervalMs);
 
 server.listen(args.port, "0.0.0.0", () => {
-  console.log(`PhoneSense listening on https://0.0.0.0:${args.port}`);
+  console.log(`D3C Fleet Server listening on https://0.0.0.0:${args.port}`);
   console.log(`Dashboard: https://localhost:${args.port}/dashboard`);
   console.log(`Phone: https://<laptop-ip>:${args.port}/phone`);
 });
@@ -347,6 +356,29 @@ function handlePhoneJson(ws, msg) {
         t_device_ms: Number(msg.t_device_ms || 0),
         amplitude: Number(msg.amplitude || 0),
         noise_level: Number(msg.noise_level || 0)
+      });
+    }
+    return;
+  }
+  if (msg.type === "gps") {
+    if (!allowByRate(d, "gps", d.config.streams.gps.rate_hz || 1)) return;
+    const tRecvMs = Date.now();
+    const lat = Number(msg.lat || 0);
+    const lon = Number(msg.lon || 0);
+    const accuracy_m = Number(msg.accuracy_m || -1);
+    const speed_mps = Number(msg.speed_mps || -1);
+    const heading_deg = Number(msg.heading_deg || -1);
+    const altitude_m = Number(msg.altitude_m || -1);
+    d.state.gps_latest = {
+      t_recv_ms: tRecvMs,
+      t_device_ms: Number(msg.t_device_ms || 0),
+      lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m
+    };
+    if (recording.active) {
+      sessionManager.writeGps(deviceId, {
+        t_recv_ms: tRecvMs,
+        t_device_ms: Number(msg.t_device_ms || 0),
+        lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m
       });
     }
     return;
@@ -562,6 +594,7 @@ function publicStateForDevice(deviceId, d) {
     imu_latest: d.state.imu_latest,
     camera_latest_ts: d.state.camera_latest_ts,
     audio_latest: d.state.audio_latest,
+    gps_latest: d.state.gps_latest,
     device_latest: d.state.device_latest,
     camera_quality: d.state.camera_quality,
     fusion: d.state.fusion,
@@ -606,7 +639,7 @@ function buildStreamStatus(config, d) {
       rate: s.camera.mode === "stream" ? `${s.camera.fps} fps (${s.camera.record_mode || "jpg"})` : s.camera.mode,
       last_seen_ms: d.state.camera_latest_ts || null
     },
-    gps: { enabled: !!s.gps.enabled, recording: !!s.gps.record, rate: `${s.gps.rate_hz} Hz`, last_seen_ms: null },
+    gps: { enabled: !!s.gps.enabled, recording: !!s.gps.record, rate: `${s.gps.rate_hz} Hz`, last_seen_ms: d.state.gps_latest?.t_recv_ms || null },
     audio: { enabled: !!s.audio.enabled, recording: !!s.audio.record, rate: `${s.audio.rate_hz} Hz`, last_seen_ms: d.state.audio_latest?.t_recv_ms || null },
     device: { enabled: !!s.device.enabled, recording: !!s.device.record, rate: `${s.device.rate_hz} Hz`, last_seen_ms: d.state.device_latest?.t_recv_ms || null },
     fusion: { enabled: !!s.fusion.enabled, recording: !!s.fusion.record, rate: "-", last_seen_ms: now },
@@ -665,6 +698,7 @@ function newDeviceEntry(deviceId) {
       imu_latest: null,
       camera_latest_ts: null,
       audio_latest: null,
+      gps_latest: null,
       device_latest: null,
       camera_quality: { lighting_score: null },
       fusion: { connection_quality: 0, sensing_confidence: 0 },
@@ -790,10 +824,10 @@ function dirSizeBytes(root) {
 }
 
 function runStorageCleanupPolicy(storageCfg) {
-  if (!fs.existsSync(SESSIONS_ROOT)) return { blocked: false };
-  const sessions = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true })
+  if (!fs.existsSync(DATASETS_ROOT)) return { blocked: false };
+  const sessions = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
     .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
-    .map((d) => ({ name: d.name, abs: path.join(SESSIONS_ROOT, d.name), mtime: fs.statSync(path.join(SESSIONS_ROOT, d.name)).mtimeMs }))
+    .map((d) => ({ name: d.name, abs: path.join(DATASETS_ROOT, d.name), mtime: fs.statSync(path.join(DATASETS_ROOT, d.name)).mtimeMs }))
     .sort((a, b) => a.mtime - b.mtime);
 
   const maxAgeMs = Number(storageCfg.max_session_age_days || 30) * 24 * 60 * 60 * 1000;
@@ -809,7 +843,7 @@ function runStorageCleanupPolicy(storageCfg) {
 
   const keepMin = Math.max(0, Number(storageCfg.keep_minimum_sessions || 10));
   const maxBytes = Number(storageCfg.max_total_size_gb || 50) * 1024 * 1024 * 1024;
-  let currentSize = dirSizeBytes(SESSIONS_ROOT);
+  let currentSize = dirSizeBytes(DATASETS_ROOT);
   const policy = storageCfg.on_quota_exceeded || "warn";
   if (currentSize <= maxBytes) {
     return { blocked: false, deletedByAge, deletedByQuota: 0, currentSize };
@@ -821,9 +855,9 @@ function runStorageCleanupPolicy(storageCfg) {
     return { blocked: false, deletedByAge, deletedByQuota: 0, currentSize, maxBytes };
   }
 
-  const latest = fs.readdirSync(SESSIONS_ROOT, { withFileTypes: true })
+  const latest = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
     .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
-    .map((d) => ({ name: d.name, abs: path.join(SESSIONS_ROOT, d.name), mtime: fs.statSync(path.join(SESSIONS_ROOT, d.name)).mtimeMs }))
+    .map((d) => ({ name: d.name, abs: path.join(DATASETS_ROOT, d.name), mtime: fs.statSync(path.join(DATASETS_ROOT, d.name)).mtimeMs }))
     .sort((a, b) => a.mtime - b.mtime);
 
   let deletedByQuota = 0;
@@ -833,7 +867,7 @@ function runStorageCleanupPolicy(storageCfg) {
       fs.rmSync(oldest.abs, { recursive: true, force: true });
       deletedByQuota += 1;
     } catch {}
-    currentSize = dirSizeBytes(SESSIONS_ROOT);
+    currentSize = dirSizeBytes(DATASETS_ROOT);
   }
   return { blocked: currentSize > maxBytes, deletedByAge, deletedByQuota, currentSize, maxBytes };
 }
@@ -896,3 +930,7 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
+
+
+
+

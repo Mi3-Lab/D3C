@@ -69,7 +69,8 @@
     replayStopBtn: document.getElementById("replayStopBtn"),
     encodeVideoBtn: document.getElementById("encodeVideoBtn"),
     replayStatus: document.getElementById("replayStatus"),
-    replayVideo: document.getElementById("replayVideo")
+    replayVideo: document.getElementById("replayVideo"),
+    replayAudio: document.getElementById("replayAudio")
   };
 
   const DEFAULT_RUN_CONFIG = {
@@ -390,7 +391,7 @@
 
   async function loadReplaySessions() {
     try {
-      const data = await (await fetch("/api/sessions")).json();
+      const data = await (await fetch("/api/datasets")).json();
       const sessions = Array.isArray(data.sessions) ? data.sessions : [];
       els.replaySessionSelect.innerHTML = "";
       for (const id of sessions) {
@@ -410,14 +411,25 @@
     stopReplay();
     replayActive = true;
     const qs = focusedDeviceId ? `?device_id=${encodeURIComponent(focusedDeviceId)}` : "";
-    const manifest = await (await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/manifest${qs}`)).json();
+    const manifest = await (await fetch(`/api/datasets/${encodeURIComponent(sessionId)}/manifest${qs}`)).json();
     const speed = Math.max(0.25, Number(els.replaySpeed.value || 1));
     const imuRows = manifest.imuCsv ? parseImuCsv(await (await fetch(manifest.imuCsv)).text()) : [];
     const evRows = manifest.eventsCsv ? parseEventsCsv(await (await fetch(manifest.eventsCsv)).text()) : [];
     const camRows = manifest.cameraTimestampsCsv ? parseCameraTsCsv(await (await fetch(manifest.cameraTimestampsCsv)).text()) : [];
     if (manifest.cameraVideo) { els.replayVideo.style.display = "block"; els.replayVideo.src = manifest.cameraVideo; }
     else { els.replayVideo.style.display = "none"; els.replayVideo.removeAttribute("src"); }
-    if (!imuRows.length && !evRows.length && !camRows.length && !manifest.cameraVideo) { replayActive = false; return; }
+    if (manifest.audioWav && els.replayAudio) {
+      els.replayAudio.style.display = "block";
+      els.replayAudio.src = manifest.audioWav;
+      els.replayAudio.playbackRate = speed;
+      els.replayAudio.currentTime = 0;
+      els.replayAudio.play().catch(() => {});
+    } else if (els.replayAudio) {
+      els.replayAudio.pause();
+      els.replayAudio.style.display = "none";
+      els.replayAudio.removeAttribute("src");
+    }
+    if (!imuRows.length && !evRows.length && !camRows.length && !manifest.cameraVideo && !manifest.audioWav) { replayActive = false; return; }
 
     const startTs = (imuRows[0]?.t_recv_ms) || (evRows[0]?.t_recv_ms) || (camRows[0]?.t_recv_ms) || Date.now();
     const endTs = Math.max(
@@ -439,7 +451,7 @@
       while (evIdx < evRows.length && evRows[evIdx].t_recv_ms <= nowTs) replayEvents.push(evRows[evIdx++]);
       renderEventTimeline(replayEvents.slice(-50));
       while (camIdx < camRows.length && camRows[camIdx].t_recv_ms <= nowTs) {
-        els.cameraImg.src = `/sessions/${sessionId}/devices/${manifest.device_id}/streams/camera/${camRows[camIdx++].filename}`;
+        els.cameraImg.src = `/datasets/${sessionId}/devices/${manifest.device_id}/streams/camera/${camRows[camIdx++].filename}`;
       }
       els.replayStatus.textContent = `Replay: ${sessionId} @ ${speed}x`;
       if (nowTs >= endTs) stopReplay("Replay: done");
@@ -451,6 +463,9 @@
     if (replayTimer) clearInterval(replayTimer);
     replayTimer = null;
     els.replayStatus.textContent = status;
+    if (els.replayAudio) {
+      els.replayAudio.pause();
+    }
   }
 
   async function encodeCurrentReplaySession() {
@@ -458,7 +473,7 @@
     if (!sessionId || !focusedDeviceId) return;
     els.replayStatus.textContent = "Replay: encoding video...";
     try {
-      const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/encode`, {
+      const resp = await fetch(`/api/datasets/${encodeURIComponent(sessionId)}/encode`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -486,7 +501,7 @@
       const gb = Number(data.sessions_size_gb || 0).toFixed(2);
       const count = Number(data.session_count || 0);
       const freeGb = Number.isFinite(data.free_disk_bytes) ? (Number(data.free_disk_bytes) / (1024 ** 3)).toFixed(1) : "?";
-      els.healthStorage.textContent = `Storage: ${gb}GB / ${count} sessions | free ${freeGb}GB`;
+      els.healthStorage.textContent = `Storage: ${gb}GB / ${count} datasets | free ${freeGb}GB`;
     } catch {
       els.healthStorage.textContent = "Storage: unavailable";
     }
@@ -601,3 +616,8 @@
   function clone(v) { return JSON.parse(JSON.stringify(v)); }
   function sendJson(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 })();
+
+
+
+
+

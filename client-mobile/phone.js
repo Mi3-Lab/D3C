@@ -1,4 +1,4 @@
-(() => {
+﻿(() => {
   const startBtn = document.getElementById("startBtn");
   const themeToggleBtn = document.getElementById("phoneThemeToggleBtn");
   const connStatus = document.getElementById("connStatus");
@@ -47,6 +47,8 @@
   let audioTimer = null;
   let deviceTimer = null;
   let batteryManager = null;
+  let gpsWatchId = null;
+  let lastGpsSent = 0;
   let heartbeatTimer = null;
   let wakeLock = null;
   let silentAudio = null;
@@ -330,6 +332,40 @@
     pcmChunkSamples = 0;
   }
 
+
+  function applyGpsConfig() {
+    const g = runConfig.streams.gps;
+    if (!g?.enabled) {
+      if (gpsWatchId != null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(gpsWatchId);
+      }
+      gpsWatchId = null;
+      return;
+    }
+    if (!navigator.geolocation) return;
+    if (gpsWatchId != null) return;
+    gpsWatchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const hz = Math.max(0.2, Number(runConfig.streams.gps?.rate_hz || 1));
+        const now = performance.now();
+        if (now - lastGpsSent < 1000 / hz) return;
+        lastGpsSent = now;
+        queueJson({
+          type: "gps",
+          device_id: runConfig.device_id,
+          t_device_ms: now,
+          lat: Number(pos.coords?.latitude || 0),
+          lon: Number(pos.coords?.longitude || 0),
+          accuracy_m: Number(pos.coords?.accuracy ?? -1),
+          speed_mps: Number(pos.coords?.speed ?? -1),
+          heading_deg: Number(pos.coords?.heading ?? -1),
+          altitude_m: Number(pos.coords?.altitude ?? -1)
+        });
+      },
+      () => {},
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+    );
+  }
   function applyDeviceConfig() {
     if (!runConfig.streams.device?.enabled) {
       if (deviceTimer) clearInterval(deviceTimer);
@@ -542,3 +578,5 @@
 
   connectWs();
 })();
+
+

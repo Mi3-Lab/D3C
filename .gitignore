@@ -215,3 +215,31 @@ certs/
 .DS_Store
 Thumbs.db
 
+# D3C runtime / research artifacts
+# Keep raw collected data out of git
+sessions/
+datasets/
+
+# Local cert material
+certs/
+*.pem
+*.crt
+*.key
+
+# Runtime traces/logs/temp
+*.log
+logs/
+tmp/
+*.tmp
+*.bak
+
+# Node and tooling
+node_modules/
+coverage/
+.nyc_output/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,12 +1,13 @@
 const fs = require("fs");
 const path = require("path");
-const { SESSIONS_ROOT } = require("../config");
+const { DATASETS_ROOT } = require("../config");
 const { ImuRecorder } = require("./recorders/imu_recorder");
 const { CameraRecorder } = require("./recorders/camera_recorder");
 const { EventsRecorder } = require("./recorders/events_recorder");
 const { NetRecorder } = require("./recorders/net_recorder");
 const { AudioRecorder } = require("./recorders/audio_recorder");
 const { AudioWavRecorder } = require("./recorders/audio_wav_recorder");
+const { GpsRecorder } = require("./recorders/gps_recorder");
 const { DeviceRecorder } = require("./recorders/device_recorder");
 const { FusionRecorder } = require("./recorders/fusion_recorder");
 
@@ -24,9 +25,9 @@ class SessionManager {
 
   start({ mode, focusedDeviceId, devicesConfigMap, extraMeta = {} }) {
     if (this.active) return { active: true, sessionDir: this.sessionDir };
-    fs.mkdirSync(SESSIONS_ROOT, { recursive: true });
+    fs.mkdirSync(DATASETS_ROOT, { recursive: true });
     const stamp = formatStamp(new Date());
-    this.sessionDir = path.join(SESSIONS_ROOT, `session_${stamp}`);
+    this.sessionDir = path.join(DATASETS_ROOT, `session_${stamp}`);
     this.devicesRoot = path.join(this.sessionDir, "devices");
     this.controlLogPath = path.join(this.sessionDir, "control_log.jsonl");
     fs.mkdirSync(this.devicesRoot, { recursive: true });
@@ -146,7 +147,15 @@ class SessionManager {
     const c = cfg?.streams?.camera;
     if (!c?.record || c.mode !== "stream") return;
     this.getRecorders(deviceId).camera ??= new CameraRecorder(this.getStreamsDir(deviceId));
-    this.getRecorders(deviceId).camera.writeFrame({ ...frame, record_mode: c.record_mode || "jpg" });
+    this.getRecorders(deviceId).camera.writeFrame({
+      ...frame,
+      record_mode: c.record_mode || "jpg",
+      encode_timing: c.encode_timing || "post_session",
+      fps: c.video_fps || c.fps || 10,
+      bitrate: c.video_bitrate || "2M",
+      crf: Number.isFinite(c.video_crf) ? c.video_crf : 23,
+      ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg"
+    });
   }
 
   writeEvent(deviceId, evt) {
@@ -161,6 +170,13 @@ class SessionManager {
     if (!cfg?.streams?.net?.record) return;
     this.getRecorders(deviceId).net ??= new NetRecorder(path.join(this.getStreamsDir(deviceId), "net.csv"));
     this.getRecorders(deviceId).net.write(sample);
+  }
+
+  writeGps(deviceId, sample) {
+    const cfg = this.getConfig(deviceId);
+    if (!cfg?.streams?.gps?.record) return;
+    this.getRecorders(deviceId).gps ??= new GpsRecorder(path.join(this.getStreamsDir(deviceId), "gps.csv"));
+    this.getRecorders(deviceId).gps.write(sample);
   }
 
   writeAudio(deviceId, sample) {
@@ -214,6 +230,7 @@ class SessionManager {
         camera: null,
         events: null,
         net: null,
+        gps: null,
         audio: null,
         audioWav: null,
         device: null,
@@ -274,3 +291,10 @@ function appendControlLog(controlLogPath, entry) {
 module.exports = {
   SessionManager
 };
+
+
+
+
+
+
+

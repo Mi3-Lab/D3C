@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PhoneSense / Dashboard</title>
-  <link rel="stylesheet" href="/public/styles.css" />
+  <title>D3C / Fleet Dashboard</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <main class="dash-wrap">
     <header class="row">
       <div>
-        <h1>PhoneSense Dashboard</h1>
-        <p class="muted compact">Multimodal local sensing platform</p>
+        <h1>D3C Fleet Dashboard</h1>
+        <p class="muted compact">Distributed Driving Data Collective</p>
       </div>
       <div class="row header-actions">
         <button id="themeToggleBtn" class="btn btn-alt">Switch Theme</button>
@@ -262,8 +262,12 @@
       </div>
       <p id="replayStatus" class="mono muted">Replay: idle</p>
       <video id="replayVideo" controls muted playsinline style="display:none; width:100%; margin-top:8px;"></video>
+      <audio id="replayAudio" controls style="display:none; width:100%; margin-top:8px;"></audio>
     </section>
   </main>
-  <script src="/public/dashboard.js"></script>
+  <script src="/dashboard.js"></script>
 </body>
 </html>
+
+
+
