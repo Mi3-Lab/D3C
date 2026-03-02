@@ -73,16 +73,16 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
       defaults: { w: 3, h: 5, pinned: true, settings: {} },
       render(content) {
         const table = document.createElement("table");
-        table.innerHTML = "<thead><tr><th>device</th><th>readiness</th><th>imu hz</th><th>cam fps</th><th>dropouts</th><th>lastSeen</th></tr></thead><tbody></tbody>";
+        table.innerHTML = "<thead><tr><th>device</th><th>readiness</th><th>imu hz</th><th>cam fps</th><th>gps</th><th>health</th><th>dropouts</th><th>lastSeen</th></tr></thead><tbody></tbody>";
         const tbody = table.querySelector("tbody");
         content.appendChild(table);
 
-        const unsub = store.subscribe((s) => ({ list: s.deviceList, sel: s.globalDeviceFilter, focused: s.focusedDeviceId }), () => {
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, sel: s.globalDeviceFilter, focused: s.focusedDeviceId, states: s.statesByDevice }), () => {
           const st = store.getState();
           tbody.innerHTML = "";
           if (!st.deviceList || !st.deviceList.length) {
             const tr = document.createElement("tr");
-            tr.innerHTML = "<td colspan=\"6\" class=\"empty-state\">No devices connected<br><span class=\"muted\">Waiting for phones to join the session</span></td>";
+            tr.innerHTML = "<td colspan=\"8\" class=\"empty-state\">No devices connected<br><span class=\"muted\">Waiting for phones to join the session</span></td>";
             tbody.appendChild(tr);
             return;
           }
@@ -102,7 +102,45 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const lastSeen = d.lastSeenTs ? formatTs(d.lastSeenTs) : "-";
             const displayName = escapeHtml(String(d.deviceName || d.device_id));
             const secondaryId = escapeHtml(String(d.device_id));
-            tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${cam.toFixed(1)}</td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
+            const now = Date.now();
+            const deviceState = st.statesByDevice?.[d.device_id] || {};
+            const gpsLatest = deviceState.gps_latest || null;
+            const gpsStream = deviceState.stream_status?.gps || null;
+            const gpsEnabled = !!gpsStream?.enabled;
+            const gpsLastSeen = Number(gpsLatest?.t_recv_ms || gpsStream?.last_seen_ms || 0);
+            const gpsAgeMs = gpsLastSeen ? (now - gpsLastSeen) : Number.POSITIVE_INFINITY;
+            const gpsAccuracy = Number(gpsLatest?.accuracy_m);
+            let gpsClass = "off";
+            let gpsText = "off";
+            if (!connected) {
+              gpsClass = "offline";
+              gpsText = "offline";
+            } else if (!gpsEnabled) {
+              gpsClass = "off";
+              gpsText = "off";
+            } else if (!gpsLastSeen) {
+              gpsClass = "warn";
+              gpsText = "no fix";
+            } else if (gpsAgeMs <= 5000) {
+              gpsClass = "ok";
+              gpsText = Number.isFinite(gpsAccuracy) && gpsAccuracy >= 0 ? `live (${Math.round(gpsAccuracy)}m)` : "live";
+            } else if (gpsAgeMs <= 15000) {
+              gpsClass = "warn";
+              gpsText = `stale (${Math.round(gpsAgeMs / 1000)}s)`;
+            } else {
+              gpsClass = "bad";
+              gpsText = "signal lost";
+            }
+            const healthAlerts = Array.isArray(d.healthAlerts) ? d.healthAlerts : [];
+            const hasError = healthAlerts.some((a) => String(a?.severity || "").toLowerCase() === "error");
+            const healthClass = !connected ? "bad" : (healthAlerts.length ? (hasError ? "bad" : "warn") : "ok");
+            const healthText = !connected
+              ? "offline"
+              : (healthAlerts.length ? `${healthAlerts.length} alert${healthAlerts.length > 1 ? "s" : ""}` : "ok");
+            const healthTitle = healthAlerts.length
+              ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
+              : "No active alerts";
+            tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${cam.toFixed(1)}</td><td><span class="gps-badge ${gpsClass}">${escapeHtml(gpsText)}</span></td><td><span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span></td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
             tr.style.cursor = "pointer";
             tr.addEventListener("click", () => {
               store.setState({ globalDeviceFilter: d.device_id, viewMode: "focused" });
@@ -204,7 +242,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             c.streams.camera.record = v;
           }), isActive);
           if (cfg.streams.camera.mode !== "off") {
-            addSelect(camBody, "Camera mode", String(cfg.streams.camera.mode || "stream"), ["preview", "stream"], (v) => updateSessionCfg(cfg, (c) => {
+            addSelect(camBody, "Camera mode", String(cfg.streams.camera.mode || "stream"), ["off", "stream"], (v) => updateSessionCfg(cfg, (c) => {
               c.streams.camera.mode = v;
               c.streams.camera.record = v === "stream";
             }), isActive);
@@ -502,7 +540,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const list = st.deviceList || [];
             if (!list.length) {
               const tr = document.createElement("tr");
-              tr.innerHTML = '<td colspan="5" class="empty-state">No devices connected</td>';
+            tr.innerHTML = "<td colspan=\"7\" class=\"empty-state\">No devices connected<br><span class=\"muted\">Waiting for phones to join the session</span></td>";
               tbody.appendChild(tr);
               note.textContent = "All Devices mode";
               return;
@@ -906,6 +944,14 @@ function addSelect(parent, label, value, options, onChange, disabled = false) {
   wrap.appendChild(sel);
   parent.appendChild(wrap);
 }
+
+
+
+
+
+
+
+
 
 
 

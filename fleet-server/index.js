@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 const https = require("https");
 const os = require("os");
 const express = require("express");
@@ -10,8 +11,9 @@ const { MotionState } = require("./compute/motion_state");
 const { SessionManager } = require("./session/session_manager");
 
 const args = parseArgs(process.argv.slice(2));
-if (!args.cert || !args.key) {
-  console.error("Usage: node fleet-server/index.js --cert cert.pem --key key.pem --port 8443");
+const useHttps = !!(args.cert && args.key);
+if ((args.cert && !args.key) || (!args.cert && args.key)) {
+  console.error("Provide both --cert and --key, or neither for HTTP mode.");
   process.exit(1);
 }
 
@@ -22,6 +24,7 @@ app.use("/datasets", express.static(DATASETS_ROOT));
 app.use("/sessions", express.static(DATASETS_ROOT));
 app.get("/phone", (_req, res) => res.sendFile(path.join(process.cwd(), "client-mobile", "phone.html")));
 app.get("/dashboard", (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
+app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/latest.jpg", (req, res) => {
   const deviceId = typeof req.query.device_id === "string" ? req.query.device_id : focusedDeviceId;
   if (!deviceId || !devices.has(deviceId)) return res.status(404).send("No frame");
@@ -116,6 +119,7 @@ app.get("/api/datasets/:id/manifest", (req, res) => {
     id,
     device_id: deviceId,
     metaJson: toUrlIfExists(path.join(root, "meta.json"), `/datasets/${id}/meta.json`),
+    syncReportJson: toUrlIfExists(path.join(root, "sync_report.json"), `/datasets/${id}/sync_report.json`),
     imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
     imuParquet: toUrlIfExists(path.join(streamRoot, "imu.parquet"), `/datasets/${id}/devices/${deviceId}/streams/imu.parquet`),
     audioCsv: toUrlIfExists(path.join(streamRoot, "audio.csv"), `/datasets/${id}/devices/${deviceId}/streams/audio.csv`),
@@ -143,10 +147,12 @@ app.get("/api/datasets/:id/manifest", (req, res) => {
   });
 });
 
-const server = https.createServer(
-  { cert: fs.readFileSync(args.cert), key: fs.readFileSync(args.key) },
-  app
-);
+const server = useHttps
+  ? https.createServer(
+      { cert: fs.readFileSync(args.cert), key: fs.readFileSync(args.key) },
+      app
+    )
+  : http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 const sessionManager = new SessionManager();
 
@@ -262,6 +268,7 @@ setInterval(() => {
     if (!d.connected || !d.ws || d.ws.readyState !== WebSocket.OPEN) continue;
     const ping_id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     pendingPingsByDevice.get(deviceId).set(ping_id, Date.now());
+    d.stats.sync.ping_sent += 1;
     sendWs(d.ws, { type: "ping", ping_id, t_sent_ms: Date.now() }, { critical: true });
   }
 }, 2000);
@@ -273,10 +280,16 @@ setInterval(() => {
   broadcastDeviceList();
 }, stateIntervalMs);
 
-server.listen(args.port, "0.0.0.0", () => {
-  console.log(`D3C Fleet Server listening on https://0.0.0.0:${args.port}`);
-  console.log(`Dashboard: https://localhost:${args.port}/dashboard`);
-  console.log(`Phone: https://<laptop-ip>:${args.port}/phone`);
+server.listen(args.port, args.host, () => {
+  const protocol = useHttps ? "https" : "http";
+  const wsProtocol = useHttps ? "wss" : "ws";
+  const lanIp = getLanIp(args.lanIp);
+  console.log(`Server running at ${protocol}://${lanIp}:${args.port}`);
+  console.log(`Dashboard: ${protocol}://localhost:${args.port}/dashboard`);
+  console.log(`Phone: ${protocol}://${lanIp}:${args.port}/phone`);
+  console.log(`WebSocket: ${wsProtocol}://${lanIp}:${args.port}/ws`);
+  console.log(`Health: ${protocol}://${lanIp}:${args.port}/health`);
+  console.log(`Firewall reminder: allow inbound TCP ${args.port} on Private networks.`);
 });
 
 function handleHello(ws, msg) {
@@ -373,6 +386,7 @@ function handlePhoneJson(ws, msg) {
       mag
     };
     d.stats.imu_count += 1;
+    trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     if (recording.active) {
       sessionManager.writeImu(deviceId, {
         t_recv_ms: tRecvMs,
@@ -396,6 +410,7 @@ function handlePhoneJson(ws, msg) {
   if (msg.type === "audio") {
     if (!allowByRate(d, "audio", d.config.streams.audio.rate_hz || 10)) return;
     const tRecvMs = Date.now();
+    trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     d.state.audio_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
@@ -422,6 +437,7 @@ function handlePhoneJson(ws, msg) {
     const speed_mps = Number(msg.speed_mps || -1);
     const heading_deg = Number(msg.heading_deg || -1);
     const altitude_m = Number(msg.altitude_m || -1);
+    trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     d.state.gps_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
@@ -464,6 +480,7 @@ function handlePhoneJson(ws, msg) {
   if (msg.type === "device") {
     if (!allowByRate(d, "device", d.config.streams.device.rate_hz || 1)) return;
     const tRecvMs = Date.now();
+    trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     d.state.device_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
@@ -507,7 +524,20 @@ function handlePhoneJson(ws, msg) {
     const pingMap = pendingPingsByDevice.get(deviceId);
     const sent = pingMap?.get(String(msg.ping_id || ""));
     if (!sent) return;
-    d.stats.rtt_ms = Date.now() - sent;
+    const recvMs = Date.now();
+    const rtt = recvMs - sent;
+    d.stats.rtt_ms = rtt;
+    d.stats.sync.ping_acked += 1;
+    d.stats.sync.rtt_samples += 1;
+    d.stats.sync.rtt_sum_ms += rtt;
+    d.stats.sync.rtt_min_ms = d.stats.sync.rtt_min_ms == null ? rtt : Math.min(d.stats.sync.rtt_min_ms, rtt);
+    d.stats.sync.rtt_max_ms = d.stats.sync.rtt_max_ms == null ? rtt : Math.max(d.stats.sync.rtt_max_ms, rtt);
+
+    const tPingRecvMs = Number(msg.t_ping_recv_ms);
+    if (Number.isFinite(tPingRecvMs) && tPingRecvMs > 0) {
+      trackDeviceClockSample(d, tPingRecvMs, recvMs);
+    }
+
     pingMap.delete(String(msg.ping_id || ""));
   }
 }
@@ -522,6 +552,7 @@ function handlePhoneBinary(ws, data) {
   d.latestCameraBuffer = Buffer.from(data);
   d.latestCameraMime = header.format === "jpeg" ? "image/jpeg" : "application/octet-stream";
   d.state.camera_latest_ts = tRecvMs;
+  trackDeviceClockSample(d, Number(header.t_device_ms || 0), tRecvMs);
   if (Number.isFinite(header.lighting_score)) d.state.camera_quality.lighting_score = header.lighting_score;
   d.stats.camera_count += 1;
   if (recording.active) {
@@ -662,9 +693,10 @@ function startRecordingSession({ scope, session_name, modalities = ["imu", "cam"
       return;
     }
   }
-  const mode = scope === "all" ? "all" : "focused";
+  // Recording is fleet-wide by design: focus mode is view-only.
+  const mode = "all";
   const connectedEntries = [...devices.entries()].filter(([, d]) => d.connected);
-  const targetEntries = mode === "all" ? connectedEntries : connectedEntries.filter(([id]) => id === focusedDeviceId);
+  const targetEntries = connectedEntries;
   const deviceConfigs = new Map(targetEntries.map(([id, d]) => [id, d.config]));
   const deviceDetails = Object.fromEntries(targetEntries.map(([id, d]) => [id, {
     user_agent: d.user_agent || null,
@@ -677,7 +709,7 @@ function startRecordingSession({ scope, session_name, modalities = ["imu", "cam"
     focusedDeviceId: focusedDeviceId || null,
     devicesConfigMap: deviceConfigs,
     extraMeta: {
-      laptop_ip: getPrimaryLanIp(),
+      laptop_ip: getLanIp(args.lanIp),
       device_details: deviceDetails,
       session_name: session_name || null,
       requested_modalities: modalities
@@ -728,7 +760,7 @@ async function stopRecordingSession() {
   const stoppingTargets = [...recording.target_device_ids];
   const res = sessionManager.stop();
   const finalizeTasks = Array.isArray(res.finalizeTasks) ? res.finalizeTasks : [];
-  const timeoutMs = 5000;
+  const timeoutMs = 300000;
   let timedOut = false;
 
   if (finalizeTasks.length) {
@@ -736,6 +768,12 @@ async function stopRecordingSession() {
     const settled = await Promise.race([Promise.allSettled(finalizeTasks), timeoutPromise]);
     if (settled === "timeout") timedOut = true;
   }
+
+  writeSyncReport(res.sessionDir, stoppingSessionId, stoppingTargets, {
+    timedOut,
+    timeout_ms: timeoutMs,
+    finalize_tasks: finalizeTasks.length
+  });
 
   for (const id of stoppingTargets) {
     const d = devices.get(id);
@@ -920,7 +958,9 @@ function deviceSummaries() {
       recordingActive: !!d.recordingStatus?.recording,
       recordingState: d.recordingStatus?.recording ? "recording" : (d.connected ? "armed" : "idle"),
       recordingModalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
-      recordingSessionId: d.recordingStatus?.session_id || null
+      recordingSessionId: d.recordingStatus?.session_id || null,
+      healthAlerts: computeDeviceAlerts(d),
+      syncSummary: summarizeSyncStats(d)
     });
   }
   return out.sort((a, b) => a.device_id.localeCompare(b.device_id));
@@ -1011,7 +1051,24 @@ function newDeviceEntry(deviceId) {
       camera_fps: 0,
       dropped_frames: 0,
       dropped_packets: 0,
-      rtt_ms: null
+      rtt_ms: null,
+      sync: {
+        ping_sent: 0,
+        ping_acked: 0,
+        rtt_samples: 0,
+        rtt_sum_ms: 0,
+        rtt_min_ms: null,
+        rtt_max_ms: null,
+        offset_samples: 0,
+        offset_sum_ms: 0,
+        offset_sq_sum_ms: 0,
+        offset_min_ms: null,
+        offset_max_ms: null,
+        last_offset_ms: null,
+        last_sync_recv_ms: null,
+        anchor_device_ms: null,
+        anchor_recv_ms: null
+      }
     },
     lastGateMs: {},
     connectionStatus: "disconnected",
@@ -1050,24 +1107,33 @@ function broadcastToDashboards(payload) {
 }
 
 function parseArgs(argv) {
-  const out = { port: 8443, cert: null, key: null };
+  const out = { port: 3000, cert: null, key: null, host: "0.0.0.0", lanIp: "" };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === "--port") out.port = Number(argv[++i] || 8443);
+    if (a === "--port") out.port = Number(argv[++i] || 3000);
     else if (a === "--cert") out.cert = argv[++i] || null;
     else if (a === "--key") out.key = argv[++i] || null;
+    else if (a === "--host") out.host = argv[++i] || "0.0.0.0";
+    else if (a === "--lan-ip") out.lanIp = argv[++i] || "";
   }
   return out;
 }
 
-function getPrimaryLanIp() {
+function getLanIp(preferred) {
+  if (preferred) return preferred;
+  const hotspotDefault = "192.168.137.1";
   const nets = os.networkInterfaces();
+  for (const key of Object.keys(nets)) {
+    for (const ni of nets[key] || []) {
+      if (ni.family === "IPv4" && !ni.internal && ni.address === hotspotDefault) return ni.address;
+    }
+  }
   for (const key of Object.keys(nets)) {
     for (const ni of nets[key] || []) {
       if (ni.family === "IPv4" && !ni.internal) return ni.address;
     }
   }
-  return null;
+  return hotspotDefault;
 }
 
 function sanitizeDeviceId(deviceId) {
@@ -1106,6 +1172,140 @@ function allowByRate(deviceEntry, streamKey, targetHz) {
   return true;
 }
 
+function trackDeviceClockSample(deviceEntry, tDeviceMs, tRecvMs) {
+  if (!Number.isFinite(tDeviceMs) || tDeviceMs <= 0 || !Number.isFinite(tRecvMs) || tRecvMs <= 0) return;
+  const sync = deviceEntry?.stats?.sync;
+  if (!sync) return;
+  if (!Number.isFinite(sync.anchor_device_ms) || !Number.isFinite(sync.anchor_recv_ms)) {
+    sync.anchor_device_ms = tDeviceMs;
+    sync.anchor_recv_ms = tRecvMs;
+  }
+  const offset = (tRecvMs - sync.anchor_recv_ms) - (tDeviceMs - sync.anchor_device_ms);
+  if (!Number.isFinite(offset)) return;
+  sync.offset_samples += 1;
+  sync.offset_sum_ms += offset;
+  sync.offset_sq_sum_ms += offset * offset;
+  sync.offset_min_ms = sync.offset_min_ms == null ? offset : Math.min(sync.offset_min_ms, offset);
+  sync.offset_max_ms = sync.offset_max_ms == null ? offset : Math.max(sync.offset_max_ms, offset);
+  sync.last_offset_ms = offset;
+  sync.last_sync_recv_ms = tRecvMs;
+}
+
+function summarizeSyncStats(d) {
+  const sync = d?.stats?.sync || {};
+  const rttMean = sync.rtt_samples ? (sync.rtt_sum_ms / sync.rtt_samples) : null;
+  const offsetMean = sync.offset_samples ? (sync.offset_sum_ms / sync.offset_samples) : null;
+  const variance = sync.offset_samples ? Math.max(0, (sync.offset_sq_sum_ms / sync.offset_samples) - Math.pow(offsetMean || 0, 2)) : null;
+  const offsetStd = variance == null ? null : Math.sqrt(variance);
+  const pingSent = Number(sync.ping_sent || 0);
+  const pingAcked = Number(sync.ping_acked || 0);
+  const pingLoss = pingSent > 0 ? Math.max(0, ((pingSent - pingAcked) / pingSent) * 100) : 0;
+  return {
+    ping_sent: pingSent,
+    ping_acked: pingAcked,
+    ping_loss_pct: Number(pingLoss.toFixed(2)),
+    rtt_ms: {
+      last: d?.stats?.rtt_ms ?? null,
+      mean: rttMean == null ? null : Number(rttMean.toFixed(2)),
+      min: sync.rtt_min_ms == null ? null : Number(sync.rtt_min_ms.toFixed(2)),
+      max: sync.rtt_max_ms == null ? null : Number(sync.rtt_max_ms.toFixed(2)),
+      samples: Number(sync.rtt_samples || 0)
+    },
+    clock_offset_ms: {
+      last: sync.last_offset_ms == null ? null : Number(sync.last_offset_ms.toFixed(2)),
+      mean: offsetMean == null ? null : Number(offsetMean.toFixed(2)),
+      std: offsetStd == null ? null : Number(offsetStd.toFixed(2)),
+      min: sync.offset_min_ms == null ? null : Number(sync.offset_min_ms.toFixed(2)),
+      max: sync.offset_max_ms == null ? null : Number(sync.offset_max_ms.toFixed(2)),
+      samples: Number(sync.offset_samples || 0)
+    }
+  };
+}
+
+function computeDeviceAlerts(d) {
+  const alerts = [];
+  const now = Date.now();
+  const stream = d?.config?.streams || {};
+  const lastSeenAge = d?.lastSeenTs ? now - d.lastSeenTs : Number.POSITIVE_INFINITY;
+  if (!d.connected) {
+    alerts.push({ severity: "error", code: "disconnected", message: "Device disconnected" });
+    return alerts;
+  }
+  if (lastSeenAge > 5000) alerts.push({ severity: "warn", code: "stale_link", message: `No packets for ${Math.round(lastSeenAge / 1000)}s` });
+
+  if (stream.imu?.enabled) {
+    const target = Number(stream.imu.rate_hz || 0);
+    const actual = Number(d.stats.imu_hz || 0);
+    if (target > 0 && actual < Math.max(1, target * 0.6)) {
+      alerts.push({ severity: "warn", code: "imu_low_hz", message: `IMU low ${actual.toFixed(1)}/${target} Hz` });
+    }
+  }
+
+  if (stream.camera?.mode === "stream") {
+    const target = Number(stream.camera.fps || 0);
+    const actual = Number(d.stats.camera_fps || 0);
+    if (target > 0 && actual < Math.max(1, target * 0.6)) {
+      alerts.push({ severity: "warn", code: "cam_low_fps", message: `Camera low ${actual.toFixed(1)}/${target} FPS` });
+    }
+  }
+
+  if (stream.gps?.enabled) {
+    const gpsTs = Number(d.state?.gps_latest?.t_recv_ms || 0);
+    const gpsAge = gpsTs ? (now - gpsTs) : Number.POSITIVE_INFINITY;
+    if (!gpsTs) alerts.push({ severity: "warn", code: "gps_no_fix", message: "GPS no fix" });
+    else if (gpsAge > 15000) alerts.push({ severity: "warn", code: "gps_stale", message: `GPS stale ${Math.round(gpsAge / 1000)}s` });
+  }
+
+  const rtt = Number(d.stats.rtt_ms || 0);
+  if (rtt > 350) alerts.push({ severity: "warn", code: "rtt_high", message: `High RTT ${Math.round(rtt)} ms` });
+  const dropped = Number(d.stats.dropped_packets || 0);
+  if (dropped > 8) alerts.push({ severity: "warn", code: "packet_drop", message: `Drops ${dropped}/s` });
+
+  return alerts;
+}
+
+function writeSyncReport(sessionDir, sessionId, targetDeviceIds, extra = {}) {
+  if (!sessionDir) return;
+  try {
+    const devicesReport = {};
+    for (const id of targetDeviceIds || []) {
+      const d = devices.get(id);
+      if (!d) continue;
+      devicesReport[id] = {
+        device_id: id,
+        device_name: d.device_name || id,
+        connected: !!d.connected,
+        connection_status: d.connectionStatus || "unknown",
+        last_seen_ms: d.lastSeenTs || null,
+        stream_health: {
+          imu_hz: Number(d.stats.imu_hz || 0),
+          camera_fps: Number(d.stats.camera_fps || 0),
+          dropped_packets: Number(d.stats.dropped_packets || 0)
+        },
+        sync: summarizeSyncStats(d),
+        alerts: computeDeviceAlerts(d)
+      };
+    }
+    const report = {
+      generated_at_iso: new Date().toISOString(),
+      session_id: sessionId || null,
+      recording_mode: recording.mode,
+      target_device_ids: [...(targetDeviceIds || [])],
+      device_count: Object.keys(devicesReport).length,
+      ...extra,
+      devices: devicesReport
+    };
+    fs.writeFileSync(path.join(sessionDir, "sync_report.json"), JSON.stringify(report, null, 2), "utf8");
+    appendControlLog(path.join(sessionDir, "control_log.jsonl"), {
+      type: "sync_report_written",
+      at_iso: new Date().toISOString(),
+      session_id: sessionId || null,
+      device_count: report.device_count
+    });
+  } catch (err) {
+    console.error("[sync-report] failed", err?.message || err);
+  }
+}
 function classifyConnection({ connected, rttMs, droppedPackets, lastSeenMs }) {
   if (!connected) return "disconnected";
   const age = Date.now() - Number(lastSeenMs || 0);
@@ -1243,6 +1443,17 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 

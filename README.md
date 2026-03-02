@@ -75,7 +75,8 @@ d3c/
 
 The `Devices` panel shows per-device runtime state only:
 - readiness (`armed`, `recording`, `not ready`)
-- live stream health (`imu hz`, `cam fps`)
+- live stream health (`imu hz`, `cam fps`, `gps status`)
+- health alerts (low IMU Hz, low camera FPS, stale/no-fix GPS, high RTT, packet drops)
 - dropouts
 - lastSeen timestamp
 
@@ -100,6 +101,7 @@ Overlay also shows FPS and resolution, with footer device + RTT.
 - Global banner shows `OFFLINE`, `DEVICES CONNECTING`, `SYSTEM READY`, `RECORDING`, or `DEVICES FLUSHING`.
 - `Session Setup` includes inline recording timer text (`Recording - mm:ss elapsed`).
 - Sensor panels show modality badges (`REC`/`OFF`) based on writer ACK state.
+- Session stop writes sync_report.json with per-device RTT/loss and clock-offset stats for alignment QA.
 ## Modalities
 
 - Motion & Pose: `imu`
@@ -199,7 +201,7 @@ If `node` is not in PATH:
 ## Dataset APIs
 
 - `GET /api/datasets`
-- `GET /api/datasets/:id/manifest` (returns CSV + Parquet URLs when available)
+- `GET /api/datasets/:id/manifest` (returns CSV + Parquet URLs + `syncReportJson` when available)
 - `POST /api/datasets/:id/encode`
 - `DELETE /api/datasets/:id`
 
@@ -255,6 +257,7 @@ Get-ChildItem "C:\Program Files","C:\Program Files (x86)","C:\ffmpeg","C:\tools"
 datasets/session_YYYYMMDD_HHMMSS/
   meta.json
   control_log.jsonl
+  sync_report.json
   devices/
     <device_id>/
       streams/
@@ -278,6 +281,37 @@ datasets/session_YYYYMMDD_HHMMSS/
         camera_video.mp4
 ```
 
+## Sync Report Guide
+
+`sync_report.json` is written when a recording session stops.
+It summarizes per-device timing quality and stream health for alignment QA.
+
+Location:
+- `datasets/session_YYYYMMDD_HHMMSS/sync_report.json`
+
+Example:
+```json
+{
+  "session_id": "8F3A",
+  "device_count": 2,
+  "devices": {
+    "phone1": {
+      "sync": {
+        "ping_loss_pct": 0.0,
+        "rtt_ms": { "mean": 34.2, "min": 21.0, "max": 59.0, "samples": 120 },
+        "clock_offset_ms": { "mean": 8.5, "std": 3.1, "min": 1.2, "max": 14.9, "samples": 420 }
+      },
+      "alerts": []
+    }
+  }
+}
+```
+
+Key fields:
+- `ping_loss_pct`: estimated ping/pong loss percentage during session.
+- `rtt_ms.mean/min/max`: network latency quality per device.
+- `clock_offset_ms.mean/std`: relative device-to-server timing drift estimate (lower and more stable is better).
+- `alerts`: warnings seen at stop time (for example `imu_low_hz`, `cam_low_fps`, `gps_stale`, `rtt_high`).
 ## Troubleshooting
 
 - Node/npm not recognized:
@@ -291,9 +325,13 @@ datasets/session_YYYYMMDD_HHMMSS/
   - set Python binary if needed:
     - `$env:PARQUET_PYTHON_BIN = "C:\path\to\python.exe"`
   - check `control_log.jsonl` for `parquet_convert` result
+- Sync report missing or empty:
+  - confirm at least one device sent ping/pong and stream data during session
+  - check `control_log.jsonl` for `sync_report_written`
 - Video not generated:
   - verify FFmpeg works: `& $env:FFMPEG_BIN -version` (or `ffmpeg -version` if in PATH)
   - set FFmpeg path if needed:
     - `$env:FFMPEG_BIN = "C:\path\to\ffmpeg.exe"`
   - confirm `streams.camera.auto_mp4_on_stop` is `true` and camera mode is `stream` during recording
+
 

@@ -447,7 +447,8 @@ function bindTopUi() {
 }
 
 function connectWs() {
-  ws = new WebSocket(`wss://${location.host}/ws`);
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${wsScheme}://${location.host}/ws`);
   ws.onopen = () => {
     store.setState({ wsConnected: true });
     sendJson({ type: "hello", role: "dashboard" });
@@ -1158,6 +1159,7 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_KEY, theme);
   els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
 }
+
 
 
 

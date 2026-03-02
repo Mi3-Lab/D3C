@@ -87,7 +87,8 @@
   });
 
   function connectWs() {
-    wsClient = new ResilientWs(`wss://${location.host}/ws`, {
+    const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+    wsClient = new ResilientWs(`${wsScheme}://${location.host}/ws`, {
       maxReconnectDelayMs: runConfig.network?.max_reconnect_delay_ms || 30000,
       maxQueueSize: runConfig.network?.message_queue_size || 1000,
       maxBufferedBytes: 1024 * 1024,
@@ -154,7 +155,7 @@
 
   async function applyConfig() {
     if (!started) return;
-    const mode = runConfig.streams.camera.mode;
+    const mode = runConfig.streams.camera.mode === "preview" ? "stream" : runConfig.streams.camera.mode;
     if (mode === "off") {
       stopCamera();
     } else {
@@ -164,7 +165,6 @@
           previewEl.srcObject = cameraStream;
         } catch {}
       }
-      if (mode === "preview") stopFrameLoop();
       if (mode === "stream") startFrameLoop();
     }
     await applyAudioConfig();
@@ -472,7 +472,7 @@
 
     if (phoneCameraMode) phoneCameraMode.textContent = camLabel;
     if (phoneAudioMode) phoneAudioMode.textContent = audLabel;
-    setSignalState(phoneCameraCard, s.camera.mode === "stream" ? "ok" : (s.camera.mode === "preview" ? "warn" : "bad"));
+    setSignalState(phoneCameraCard, s.camera.mode === "stream" ? "ok" : "bad");
     setSignalState(phoneAudioCard, s.audio.enabled ? "ok" : "warn");
   }
 
@@ -672,6 +672,9 @@ function mergeRunConfig(input) {
 
   connectWs();
 })();
+
+
+
 
 
 

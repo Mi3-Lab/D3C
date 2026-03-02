@@ -6,7 +6,7 @@ const STREAM_IDS = Object.freeze({
   NET: "net"
 });
 
-const CAMERA_MODES = Object.freeze(["off", "preview", "stream"]);
+const CAMERA_MODES = Object.freeze(["off", "stream"]);
 const CAMERA_RECORD_MODES = Object.freeze(["jpg", "video", "both"]);
 const CAMERA_ENCODE_TIMING = Object.freeze(["realtime", "post_session", "manual"]);
 const WS_ROLES = Object.freeze(["phone", "dashboard"]);
@@ -35,7 +35,8 @@ function sanitizeRunConfig(input, fallback) {
   }
 
   if (isObject(inStreams.camera)) {
-    if (CAMERA_MODES.includes(inStreams.camera.mode)) out.camera.mode = inStreams.camera.mode;
+    const requestedCameraMode = inStreams.camera.mode === "preview" ? "stream" : inStreams.camera.mode;
+    if (CAMERA_MODES.includes(requestedCameraMode)) out.camera.mode = requestedCameraMode;
     if (Number.isFinite(inStreams.camera.fps)) out.camera.fps = clamp(Math.round(inStreams.camera.fps), 1, 30);
     if (Number.isFinite(inStreams.camera.jpeg_q)) out.camera.jpeg_q = clamp(Number(inStreams.camera.jpeg_q), 0.1, 0.95);
     if (typeof inStreams.camera.record === "boolean") out.camera.record = inStreams.camera.record;
@@ -103,3 +104,4 @@ module.exports = {
   WS_ROLES,
   sanitizeRunConfig
 };
+

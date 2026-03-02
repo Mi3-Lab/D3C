@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --plot-grid: #d4d4de;
   --plot-line: #6c74c9;
 }
@@ -1270,4 +1270,76 @@ th {
   width: 100%;
   min-width: 0;
   border-radius: 0;
+}
+
+.mode-note {
+  margin: -4px 2px 12px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.gps-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+}
+
+.gps-badge.ok {
+  color: #d7ffe7;
+  background: rgba(46, 204, 113, 0.2);
+  border-color: rgba(46, 204, 113, 0.5);
+}
+
+.gps-badge.warn {
+  color: #ffe7be;
+  background: rgba(245, 166, 35, 0.2);
+  border-color: rgba(245, 166, 35, 0.55);
+}
+
+.gps-badge.bad,
+.gps-badge.offline,
+.gps-badge.off {
+  color: #ffd8d8;
+  background: rgba(209, 75, 75, 0.2);
+  border-color: rgba(209, 75, 75, 0.55);
+}
+
+.gps-badge.off {
+  color: #c9cfde;
+  background: rgba(120, 128, 150, 0.2);
+  border-color: rgba(120, 128, 150, 0.45);
+}
+
+.health-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+}
+
+.health-badge.ok {
+  color: #d7ffe7;
+  background: rgba(46, 204, 113, 0.2);
+  border-color: rgba(46, 204, 113, 0.5);
+}
+
+.health-badge.warn {
+  color: #ffe7be;
+  background: rgba(245, 166, 35, 0.2);
+  border-color: rgba(245, 166, 35, 0.55);
+}
+
+.health-badge.bad {
+  color: #ffd8d8;
+  background: rgba(209, 75, 75, 0.2);
+  border-color: rgba(209, 75, 75, 0.55);
 }
