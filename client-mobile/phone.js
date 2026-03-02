@@ -168,6 +168,7 @@
       if (mode === "stream") startFrameLoop();
     }
     await applyAudioConfig();
+    applyGpsConfig();
     applyDeviceConfig();
     startHeartbeat();
   }
@@ -459,7 +460,8 @@
       `IMU stream: ${imuLabel}`,
       `Camera: ${camLabel} @ ${s.camera.fps} FPS`,
       `Audio stream: ${audLabel}`,
-      `Recording flags: IMU ${s.imu.record ? "ON" : "OFF"}, CAM ${s.camera.record ? "ON" : "OFF"}, AUD ${s.audio.record ? "ON" : "OFF"}`
+      `GPS stream: ${s.gps.enabled ? "ON " + s.gps.rate_hz + " Hz" : "OFF"}`,
+      `Recording flags: IMU ${s.imu.record ? "ON" : "OFF"}, CAM ${s.camera.record ? "ON" : "OFF"}, AUD ${s.audio.record ? "ON" : "OFF"}, GPS ${s.gps.record ? "ON" : "OFF"}`
     ];
 
     for (const line of lines) {

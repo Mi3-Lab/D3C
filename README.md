@@ -56,8 +56,50 @@ d3c/
 - Recording scope:
   - focused node
   - all connected nodes
-- Per-node stream control with independent production and recording toggles.
+- Session-level stream control (camera/IMU/audio) is global for the active fleet session.
+- Device panel is metrics-only (readiness, live rates, dropouts, last-seen), not per-device control.
 
+
+## Dashboard Operation Model
+
+### Session-level controls (global)
+
+- `Session Setup` is global for the fleet session.
+- Camera/IMU/Audio toggles and rates are applied to all connected devices via server broadcast.
+- Session state is `draft` or `active`.
+- While active, config controls are locked and Start/Stop button states are enforced:
+  - idle: Start enabled, Stop disabled
+  - recording: Start disabled, Stop enabled
+
+### Device-level monitoring (no controls)
+
+The `Devices` panel shows per-device runtime state only:
+- readiness (`armed`, `recording`, `not ready`)
+- live stream health (`imu hz`, `cam fps`)
+- dropouts
+- lastSeen timestamp
+
+If no phones are connected, the table shows an explicit empty state.
+
+### Focused vs All Devices view
+
+- `Focused Device` mode: widgets render a single selected device.
+- `All Devices` mode: fleet summary remains active and top hint shows active counts by modality.
+
+### Camera Preview panel states
+
+Camera viewport uses consistent status labels:
+- `REC` when camera stream is being recorded
+- `LIVE` when streaming but not recording
+- `OFFLINE` when no fresh frame is available
+
+Overlay also shows FPS and resolution, with footer device + RTT.
+
+### Recording visibility
+
+- Global banner shows `OFFLINE`, `DEVICES CONNECTING`, `SYSTEM READY`, `RECORDING`, or `DEVICES FLUSHING`.
+- `Session Setup` includes inline recording timer text (`Recording - mm:ss elapsed`).
+- Sensor panels show modality badges (`REC`/`OFF`) based on writer ACK state.
 ## Modalities
 
 - Motion & Pose: `imu`
@@ -254,3 +296,4 @@ datasets/session_YYYYMMDD_HHMMSS/
   - set FFmpeg path if needed:
     - `$env:FFMPEG_BIN = "C:\path\to\ffmpeg.exe"`
   - confirm `streams.camera.auto_mp4_on_stop` is `true` and camera mode is `stream` during recording
+

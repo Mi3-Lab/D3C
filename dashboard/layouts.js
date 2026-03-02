@@ -1,4 +1,4 @@
-﻿import { clamp, clone } from "./store.js";
+import { clamp, clone } from "./store.js";
 
 export const LAYOUTS_KEY = "d3c_widget_layouts_v2";
 export const ACTIVE_LAYOUT_KEY = "d3c_active_layout_v2";
@@ -8,30 +8,52 @@ export function defaultLayouts(makeWidget) {
     Recording: {
       name: "Recording",
       widgets: [
-        makeWidget("stream_controls", { w: 4, h: 6, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("imu_plot", { w: 5, h: 4, pinned: true, settings: { device_id: "global", time_window_sec: 15 } }),
-        makeWidget("device_list", { w: 3, h: 4, pinned: true }),
-        makeWidget("camera_preview", { w: 6, h: 2, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("events_timeline", { w: 3, h: 2, pinned: false })
+        // Left: session control and fleet readiness
+        makeWidget("stream_controls", { w: 6, h: 6, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("device_list", { w: 2, h: 5, pinned: true }),
+        makeWidget("fleet_sensor_matrix", { w: 4, h: 3, pinned: true }),
+
+        // Center: primary live sensors
+        makeWidget("imu_plot", { w: 7, h: 4, pinned: true, settings: { device_id: "global", time_window_sec: 15 } }),
+        makeWidget("camera_preview", { w: 5, h: 3, pinned: true, settings: { device_id: "global" } }),
+
+        // Bottom support
+        makeWidget("gps_live", { w: 4, h: 2, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("events_timeline", { w: 8, h: 2, pinned: false })
       ]
     },
     Monitoring: {
       name: "Monitoring",
       widgets: [
-        makeWidget("stream_controls", { w: 4, h: 6, pinned: true }),
-        makeWidget("imu_plot", { w: 6, h: 4, pinned: true }),
-        makeWidget("device_list", { w: 3, h: 4, pinned: true }),
-        makeWidget("camera_preview", { w: 6, h: 2, pinned: true }),
-        makeWidget("events_timeline", { w: 3, h: 2, pinned: false }),
-        makeWidget("replay", { w: 9, h: 3, pinned: false })
+        // At-a-glance fleet health
+        makeWidget("fleet_sensor_matrix", { w: 12, h: 3, pinned: true }),
+
+        // Live monitoring row
+        makeWidget("imu_plot", { w: 7, h: 4, pinned: true, settings: { device_id: "global", time_window_sec: 15 } }),
+        makeWidget("camera_preview", { w: 5, h: 3, pinned: true, settings: { device_id: "global" } }),
+
+        // Device diagnostics and context
+        makeWidget("device_list", { w: 8, h: 3, pinned: true }),
+        makeWidget("gps_live", { w: 4, h: 2, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("events_timeline", { w: 6, h: 2, pinned: false }),
+
+        // Playback utility
+        makeWidget("replay", { w: 6, h: 3, pinned: false })
       ]
     },
     Debug: {
       name: "Debug",
       widgets: [
-        makeWidget("stream_controls", { w: 4, h: 4, pinned: true }),
-        makeWidget("device_list", { w: 4, h: 4, pinned: true }),
-        makeWidget("json_state", { w: 8, h: 4, pinned: false }),
+        // Diagnostic controls and raw state
+        makeWidget("stream_controls", { w: 5, h: 5, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("json_state", { w: 7, h: 4, pinned: false, settings: { device_id: "global" } }),
+
+        // Fleet + device diagnostics
+        makeWidget("fleet_sensor_matrix", { w: 12, h: 2, pinned: true }),
+        makeWidget("device_list", { w: 6, h: 4, pinned: true }),
+        makeWidget("gps_live", { w: 6, h: 2, pinned: false, settings: { device_id: "global" } }),
+
+        // Dataset tooling
         makeWidget("replay", { w: 12, h: 3, pinned: false })
       ]
     }

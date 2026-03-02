@@ -52,7 +52,23 @@
         <span class="status-sub">Dropouts: 0</span>
       </div>
     </section>
-
+    <section class="card mode-bar" aria-label="View mode">
+      <div class="mode-group">
+        <span class="mode-label">Device View</span>
+        <div class="mode-segment" role="tablist" aria-label="Device view mode">
+          <button id="modeFocusedBtn" class="mode-seg-btn" type="button">Focused Device</button>
+          <button id="modeAllBtn" class="mode-seg-btn" type="button">All Devices</button>
+        </div>
+        <select id="viewModeSelect" class="mode-select-hidden" aria-hidden="true" tabindex="-1">
+          <option value="focused">Focused Device</option>
+          <option value="all">All Devices</option>
+        </select>
+      </div>
+      <label class="mode-device-label">Focused Device
+        <select id="focusedDeviceSelect"></select>
+      </label>
+      <div id="viewModeHint" class="mode-hint" hidden>All Devices mode active</div>
+    </section>
     <section class="card toolbar" id="advancedLayoutPanel" hidden>
       <div class="toolbar-row">
         <label>Fleet Device Filter
@@ -98,6 +114,8 @@
   <script type="module" src="/dashboard.js"></script>
 </body>
 </html>
+
+
 
 
 

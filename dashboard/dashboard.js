@@ -30,6 +30,11 @@ const els = {
   advancedLayoutBtn: document.getElementById("advancedLayoutBtn"),
   advancedLayoutPanel: document.getElementById("advancedLayoutPanel"),
   globalDeviceFilter: document.getElementById("globalDeviceFilter"),
+  viewModeSelect: document.getElementById("viewModeSelect"),
+  modeFocusedBtn: document.getElementById("modeFocusedBtn"),
+  modeAllBtn: document.getElementById("modeAllBtn"),
+  focusedDeviceSelect: document.getElementById("focusedDeviceSelect"),
+  viewModeHint: document.getElementById("viewModeHint"),
   layoutSelect: document.getElementById("layoutSelect"),
   layoutPresetSelect: document.getElementById("layoutPresetSelect"),
   editLayoutBtn: document.getElementById("editLayoutBtn"),
@@ -55,6 +60,7 @@ const store = createStore({
   deviceList: [],
   focusedDeviceId: null,
   globalDeviceFilter: "",
+  viewMode: "focused",
   statesByDevice: {},
   runConfigsByDevice: {},
   sessionConfig: clone(DEFAULT_RUN_CONFIG),
@@ -119,6 +125,7 @@ function init() {
       list: s.deviceList,
       focused: s.focusedDeviceId,
       filter: s.globalDeviceFilter,
+      viewMode: s.viewMode,
       states: s.statesByDevice
     }),
     () => {
@@ -149,7 +156,7 @@ function updateGlobalStatusBar() {
   const st = store.getState();
   const onlineCount = (st.deviceList || []).filter((d) => d?.connected !== false).length;
 
-  const selectedId = st.globalDeviceFilter || st.focusedDeviceId || "";
+  const selectedId = st.viewMode === "all" ? "" : (st.globalDeviceFilter || st.focusedDeviceId || "");
   const selectedState = selectedId ? st.statesByDevice?.[selectedId] : null;
   let imuHz = Number(selectedState?.net?.imu_hz);
   let camFps = Number(selectedState?.net?.camera_fps);
@@ -296,6 +303,7 @@ function widgetModality(widgetType) {
   if (widgetType === "imu_plot") return "imu";
   if (widgetType === "camera_preview") return "cam";
   if (widgetType === "audio_live") return "audio";
+  if (widgetType === "gps_live") return "gps";
   return null;
 }
 
@@ -307,8 +315,8 @@ function panelRecBadgeHtml(instance) {
   const rec = st.recordByDevice?.[deviceId];
   const on = !!rec?.recording && !!rec?.modalities?.[modality];
   return on
-    ? ' <span class="panel-rec rec-on">REC</span>'
-    : ' <span class="panel-rec rec-off">OFF</span>';
+    ? ' <span class="panel-rec rec-on" title="Recording to disk">REC ON</span>'
+    : ' <span class="panel-rec rec-off" title="Not recording to disk">REC OFF</span>';
 }
 function bindTopUi() {
   if (els.advancedLayoutBtn && els.advancedLayoutPanel) {
@@ -319,17 +327,42 @@ function bindTopUi() {
     });
   }
   els.themeToggleBtn.addEventListener("click", toggleTheme);
+
+  const setViewMode = (mode) => {
+    const normalized = mode === "all" ? "all" : "focused";
+    const st = store.getState();
+    store.setState({
+      viewMode: normalized,
+      globalDeviceFilter: normalized === "all" ? "" : (st.globalDeviceFilter || st.focusedDeviceId || "")
+    });
+    if (els.viewModeSelect) els.viewModeSelect.value = normalized;
+    renderDeviceFilter();
+    renderDashboard();
+  };
+
+  els.viewModeSelect?.addEventListener("change", () => setViewMode(els.viewModeSelect.value));
+  els.modeFocusedBtn?.addEventListener("click", () => setViewMode("focused"));
+  els.modeAllBtn?.addEventListener("click", () => setViewMode("all"));
+
+  els.focusedDeviceSelect?.addEventListener("change", () => {
+    const id = els.focusedDeviceSelect.value || "";
+    store.setState({ globalDeviceFilter: id, viewMode: "focused" });
+    if (els.viewModeSelect) els.viewModeSelect.value = "focused";
+    if (id) sendJson({ type: "set_focus", device_id: id });
+    renderDashboard();
+  });
   els.globalDeviceFilter.addEventListener("change", () => {
     const id = els.globalDeviceFilter.value || "";
-    store.setState({ globalDeviceFilter: id });
+    store.setState({ globalDeviceFilter: id, viewMode: "focused" });
+    if (els.viewModeSelect) els.viewModeSelect.value = "focused";
     if (id) sendJson({ type: "set_focus", device_id: id });
+    renderDashboard();
   });
 
   els.editLayoutBtn.addEventListener("click", () => {
     store.setState({ editMode: !store.getState().editMode });
     renderDashboard();
   });
-
   els.layoutSelect.addEventListener("change", () => {
     const name = els.layoutSelect.value;
     if (!name) return;
@@ -589,21 +622,90 @@ function renderLayoutSelectors() {
   if (st.layouts[st.activeLayoutName]) els.layoutSelect.value = st.activeLayoutName;
 }
 
+
+function computeFleetActiveCounts(st, freshnessMs = 4000) {
+  const now = Date.now();
+  const connected = (st.deviceList || []).filter((d) => d?.connected !== false);
+  let imu = 0;
+  let cam = 0;
+  let audio = 0;
+  let gps = 0;
+
+  for (const d of connected) {
+    const s = st.statesByDevice?.[d.device_id] || {};
+    const imuTs = Number(s.imu_latest?.t_recv_ms || 0);
+    const camTs = Number(s.camera_latest_ts || 0);
+    const audioTs = Number(s.audio_latest?.t_recv_ms || 0);
+    const gpsTs = Number(s.gps_latest?.t_recv_ms || 0);
+    if (imuTs && (now - imuTs) <= freshnessMs) imu += 1;
+    if (camTs && (now - camTs) <= freshnessMs) cam += 1;
+    if (audioTs && (now - audioTs) <= freshnessMs) audio += 1;
+    if (gpsTs && (now - gpsTs) <= freshnessMs) gps += 1;
+  }
+
+  return { total: connected.length, imu, cam, audio, gps };
+}
+
 function renderDeviceFilter() {
   const st = store.getState();
-  els.globalDeviceFilter.innerHTML = "";
-  const auto = document.createElement("option");
-  auto.value = "";
-  auto.textContent = "Auto (focused)";
-  els.globalDeviceFilter.appendChild(auto);
-  for (const d of st.deviceList) {
-    const opt = document.createElement("option");
-    opt.value = d.device_id;
-    const name = d.deviceName ? `${d.deviceName} (${d.device_id})` : d.device_id;
-    opt.textContent = name;
-    els.globalDeviceFilter.appendChild(opt);
+
+  const fillDeviceSelect = (sel, includeAuto) => {
+    if (!sel) return;
+    sel.innerHTML = "";
+    if (includeAuto) {
+      const auto = document.createElement("option");
+      auto.value = "";
+      auto.textContent = "Auto (focused)";
+      sel.appendChild(auto);
+    }
+    for (const d of st.deviceList) {
+      const opt = document.createElement("option");
+      opt.value = d.device_id;
+      const name = d.deviceName ? `${d.deviceName} (${d.device_id})` : d.device_id;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+  };
+
+  fillDeviceSelect(els.globalDeviceFilter, true);
+  fillDeviceSelect(els.focusedDeviceSelect, false);
+
+  if (els.focusedDeviceSelect) {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "No device selected";
+    els.focusedDeviceSelect.insertBefore(placeholder, els.focusedDeviceSelect.firstChild);
   }
-  els.globalDeviceFilter.value = st.globalDeviceFilter || "";
+
+  if (els.viewModeSelect) els.viewModeSelect.value = st.viewMode || "focused";
+  if (els.modeFocusedBtn && els.modeAllBtn) {
+    const focused = (st.viewMode || "focused") !== "all";
+    els.modeFocusedBtn.classList.toggle("active", focused);
+    els.modeAllBtn.classList.toggle("active", !focused);
+    els.modeFocusedBtn.setAttribute("aria-pressed", focused ? "true" : "false");
+    els.modeAllBtn.setAttribute("aria-pressed", !focused ? "true" : "false");
+  }
+
+  if (els.viewModeHint) {
+    const on = (st.viewMode === "all");
+    els.viewModeHint.hidden = !on;
+    if (on) {
+      const c = computeFleetActiveCounts(st);
+      els.viewModeHint.textContent = "All Devices mode active | IMU " + c.imu + "/" + c.total + " | Camera " + c.cam + "/" + c.total + " | Audio " + c.audio + "/" + c.total + " | GPS " + c.gps + "/" + c.total;
+    } else {
+      els.viewModeHint.textContent = "";
+    }
+  }
+
+  const selectedId = st.globalDeviceFilter || st.focusedDeviceId || "";
+  if (els.globalDeviceFilter) {
+    els.globalDeviceFilter.value = selectedId;
+    els.globalDeviceFilter.disabled = (st.viewMode === "all");
+  }
+  if (els.focusedDeviceSelect) {
+    els.focusedDeviceSelect.value = selectedId;
+    els.focusedDeviceSelect.disabled = (st.viewMode === "all");
+  }
 }
 
 function renderDashboard() {
@@ -643,7 +745,7 @@ function renderDashboard() {
 
     const title = document.createElement("div");
     title.className = "widget-title";
-    title.innerHTML = `${def.title}${panelRecBadgeHtml(instance)}${instance.pinned ? ' <span class="pin-badge">PIN</span>' : ""}`;
+    title.innerHTML = `${def.title}${panelRecBadgeHtml(instance)}${instance.pinned && st.editMode ? ' <span class="pin-badge">PIN</span>' : ""}`;
 
     const actions = document.createElement("div");
     actions.className = "widget-actions";
@@ -1056,6 +1158,17 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_KEY, theme);
   els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 

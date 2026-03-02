@@ -5,6 +5,7 @@ export function deviceSettingSchema() {
 }
 
 export function resolveWidgetDevice(settings, state) {
+  if (state.viewMode === "all") return "";
   const val = settings?.device_id;
   if (val && val !== "global") return val;
   return state.globalDeviceFilter || state.focusedDeviceId || "";
@@ -26,6 +27,47 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
       }
     },
 
+
+    fleet_sensor_matrix: {
+      title: "Fleet Sensor Matrix",
+      defaults: { w: 12, h: 3, pinned: true, settings: {} },
+      render(content) {
+        const table = document.createElement("table");
+        table.className = "fleet-matrix";
+        table.innerHTML = "<thead><tr><th>Device</th><th>IMU</th><th>GPS</th><th>Audio</th><th>Camera</th></tr></thead><tbody></tbody>";
+        const tbody = table.querySelector("tbody");
+        content.appendChild(table);
+
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, viewMode: s.viewMode }), () => {
+          const st = store.getState();
+          tbody.innerHTML = "";
+          for (const d of st.deviceList || []) {
+            const s = st.statesByDevice?.[d.device_id] || {};
+            const imu = Number(d.imuHz ?? d.imu_hz ?? s.net?.imu_hz ?? 0);
+            const cam = Number(d.camFps ?? d.cameraFps ?? d.camera_fps ?? s.net?.camera_fps ?? 0);
+            const gps = s.gps_latest;
+            const audio = s.audio_latest;
+
+            const imuTxt = imu > 0 ? `${imu.toFixed(1)} Hz` : "idle";
+            const gpsTxt = gps ? `${Number(gps.lat).toFixed(5)}, ${Number(gps.lon).toFixed(5)}` : "no fix";
+            const audTxt = audio ? `${Math.round(20 * Math.log10(Math.max(1e-6, Number(audio.amplitude || 0))))} dB` : "idle";
+            const camTxt = cam > 0 ? `${cam.toFixed(1)} FPS` : "idle";
+
+            const tr = document.createElement("tr");
+            tr.className = st.viewMode === "focused" && (st.globalDeviceFilter || st.focusedDeviceId) === d.device_id ? "row-active" : "";
+            tr.innerHTML = `<td>${escapeHtml(String(d.deviceName || d.device_id))}<div class="device-sub">${escapeHtml(d.device_id)}</div></td><td>${escapeHtml(imuTxt)}</td><td>${escapeHtml(gpsTxt)}</td><td>${escapeHtml(audTxt)}</td><td>${escapeHtml(camTxt)}</td>`;
+            tr.style.cursor = "pointer";
+            tr.addEventListener("click", () => {
+              store.setState({ viewMode: "focused", globalDeviceFilter: d.device_id });
+              sendJson({ type: "set_focus", device_id: d.device_id });
+            });
+            tbody.appendChild(tr);
+          }
+        });
+
+        return () => unsub();
+      }
+    },
     device_list: {
       title: "Devices",
       defaults: { w: 3, h: 5, pinned: true, settings: {} },
@@ -38,6 +80,12 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         const unsub = store.subscribe((s) => ({ list: s.deviceList, sel: s.globalDeviceFilter, focused: s.focusedDeviceId }), () => {
           const st = store.getState();
           tbody.innerHTML = "";
+          if (!st.deviceList || !st.deviceList.length) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = "<td colspan=\"6\" class=\"empty-state\">No devices connected<br><span class=\"muted\">Waiting for phones to join the session</span></td>";
+            tbody.appendChild(tr);
+            return;
+          }
           for (const d of st.deviceList) {
             const imu = Number(d.imuHz ?? d.imu_hz ?? 0);
             const cam = Number(d.camFps ?? d.cameraFps ?? d.camera_fps ?? 0);
@@ -57,7 +105,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${cam.toFixed(1)}</td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
             tr.style.cursor = "pointer";
             tr.addEventListener("click", () => {
-              store.setState({ globalDeviceFilter: d.device_id });
+              store.setState({ globalDeviceFilter: d.device_id, viewMode: "focused" });
               sendJson({ type: "set_focus", device_id: d.device_id });
             });
             tbody.appendChild(tr);
@@ -78,17 +126,22 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
         const recRow = document.createElement("div");
         recRow.className = "row session-cta-row";
-        const startBtn = mkBtn("Start Session Recording", () => {
-          sendJson({
-            type: "session_start",
-            session_name: `session_${new Date().toISOString().replace(/[:.]/g, "-")}`
-          });
-        }, "btn-success");
-        const stopBtn = mkBtn("Stop Session", () => {
+        const ctaBtn = mkBtn("Start Session Recording", () => {
           const st = store.getState();
-          sendJson({ type: "session_stop", session_id: st.recording?.session_id || null });
-        }, "btn-danger");
-        recRow.append(startBtn, stopBtn);
+          const isActiveNow = (st.sessionState || "draft") === "active" || !!st.recording?.active;
+          if (isActiveNow) {
+            sendJson({ type: "session_stop", session_id: st.recording?.session_id || null });
+          } else {
+            sendJson({
+              type: "session_start",
+              session_name: `session_${new Date().toISOString().replace(/[:.]/g, "-")}`
+            });
+          }
+        }, "btn-success");
+        const timer = document.createElement("span");
+        timer.className = "session-rec-timer mono";
+        timer.textContent = "Recording idle";
+        recRow.append(ctaBtn, timer);
 
         const form = document.createElement("div");
         form.className = "session-form";
@@ -110,8 +163,14 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
           kv(summary, "Bandwidth Estimate", `${estimates.bandwidthMbps.toFixed(2)} Mbps/device`);
           kv(summary, "Storage Estimate", `${estimates.storageMbPerMin.toFixed(1)} MB/min/device`);
 
-          startBtn.disabled = isActive;
-          stopBtn.disabled = !isActive;
+          const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
+          const isStopping = phase === "STOPPING";
+          ctaBtn.disabled = isStopping;
+          ctaBtn.textContent = isActive ? "Stop Session Recording" : "Start Session Recording";
+          ctaBtn.className = isActive ? "btn btn-danger" : "btn btn-success";
+          timer.textContent = isStopping
+            ? "Stopping and flushing buffers..."
+            : (isActive ? "Recording - " + formatElapsed(st.recording?.elapsed_sec || 0) + " elapsed" : "Recording idle");
 
           const formKey = JSON.stringify({
             active: isActive,
@@ -121,7 +180,9 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             cam_mode: String(cfg.streams.camera.mode || "off"),
             cam_fps: Number(cfg.streams.camera.fps || 10),
             audio_enabled: !!cfg.streams.audio.enabled,
-            audio_rate: Number(cfg.streams.audio.rate_hz || 10)
+            audio_rate: Number(cfg.streams.audio.rate_hz || 10),
+            gps_enabled: !!cfg.streams.gps.enabled,
+            gps_rate: Number(cfg.streams.gps.rate_hz || 1)
           });
           if (formKey === lastFormKey) return;
           lastFormKey = formKey;
@@ -147,7 +208,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
               c.streams.camera.mode = v;
               c.streams.camera.record = v === "stream";
             }), isActive);
-            addSelect(camBody, "Camera FPS", String(cfg.streams.camera.fps || 10), ["5", "10", "15"], (v) => updateSessionCfg(cfg, (c) => c.streams.camera.fps = Number(v)), isActive);
+            addSelect(camBody, "Camera FPS", String(cfg.streams.camera.fps || 10), ["5", "10", "15", "30"], (v) => updateSessionCfg(cfg, (c) => c.streams.camera.fps = Number(v)), isActive);
           }
 
           const audioBody = addFormSection(form, "Audio");
@@ -157,6 +218,15 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
           }), isActive);
           if (cfg.streams.audio.enabled) {
             addSelect(audioBody, "Audio rate", String(cfg.streams.audio.rate_hz || 10), ["5", "10", "20"], (v) => updateSessionCfg(cfg, (c) => c.streams.audio.rate_hz = Number(v)), isActive);
+          }
+          
+          const gpsBody = addFormSection(form, "GPS");
+          addToggle(gpsBody, "Enable GPS", cfg.streams.gps.enabled, (v) => updateSessionCfg(cfg, (c) => {
+            c.streams.gps.enabled = v;
+            c.streams.gps.record = v;
+          }), isActive);
+          if (cfg.streams.gps.enabled) {
+            addSelect(gpsBody, "GPS rate", String(cfg.streams.gps.rate_hz || 1), ["1", "2", "5"], (v) => updateSessionCfg(cfg, (c) => c.streams.gps.rate_hz = Number(v)), isActive);
           }
         });
 
@@ -235,7 +305,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
         const accelTitle = document.createElement("p");
         accelTitle.className = "mono muted";
-        accelTitle.textContent = "Accelerometer (m/s²)";
+        accelTitle.textContent = "Accelerometer (m/s?)";
         content.appendChild(accelTitle);
         content.appendChild(makeAxisLegend());
 
@@ -319,22 +389,158 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
       defaults: { w: 6, h: 3, pinned: false, settings: { device_id: "global" } },
       settingsSchema: [deviceSettingSchema()],
       render(content, ctx) {
+        const viewport = document.createElement("div");
+        viewport.className = "camera-viewport";
+
+        const overlay = document.createElement("div");
+        overlay.className = "camera-overlay";
+        const badge = document.createElement("span");
+        badge.className = "camera-badge offline";
+        badge.textContent = "OFFLINE";
+        const meta = document.createElement("span");
+        meta.className = "camera-meta";
+        meta.textContent = "0.0 FPS | --x--";
+        overlay.append(badge, meta);
+
         const img = document.createElement("img");
         img.className = "widget-image";
         img.alt = "latest camera frame";
-        content.appendChild(img);
+
+        const placeholder = document.createElement("div");
+        placeholder.className = "camera-placeholder";
+        placeholder.textContent = "Camera Offline - Waiting for device stream";
+
+        const footer = document.createElement("div");
+        footer.className = "camera-footer mono";
+        footer.textContent = "Device: - | RTT: -- ms";
+
+        viewport.append(overlay, img, placeholder);
+        content.append(viewport, footer);
+
+        let resolutionText = "--x--";
+        img.addEventListener("load", () => {
+          if (img.naturalWidth && img.naturalHeight) {
+            resolutionText = `${img.naturalWidth}x${img.naturalHeight}`;
+          }
+        });
+
         const unsub = store.subscribe((s) => s, () => {
           const st = store.getState();
           const deviceId = resolveWidgetDevice(ctx.instance.settings, st);
-          const camTs = st.statesByDevice[deviceId]?.camera_latest_ts;
-          if (camTs) img.src = `/latest.jpg?device_id=${encodeURIComponent(deviceId)}&ts=${camTs}`;
+          const state = deviceId ? st.statesByDevice[deviceId] : null;
+          const camTs = Number(state?.camera_latest_ts || 0);
+          const summary = (st.deviceList || []).find((d) => d.device_id === deviceId) || null;
+          const connected = summary ? summary.connected !== false : false;
+          const fresh = camTs > 0 && (Date.now() - camTs) < 4000;
+          const fps = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
+          const rtt = Number(summary?.rttMs ?? state?.net?.rtt_ms);
+          const rec = st.recordByDevice?.[deviceId];
+          const isCamRecording = !!rec?.recording && !!rec?.modalities?.cam;
+
+          if (deviceId && fresh) {
+            img.src = `/latest.jpg?device_id=${encodeURIComponent(deviceId)}&ts=${camTs}`;
+          } else if (!fresh) {
+            img.removeAttribute("src");
+            resolutionText = "--x--";
+          }
+
+          if (!deviceId || !connected || !fresh) {
+            badge.className = "camera-badge offline";
+            badge.textContent = "OFFLINE";
+          } else if (isCamRecording) {
+            badge.className = "camera-badge rec";
+            badge.textContent = "REC";
+          } else {
+            badge.className = "camera-badge live";
+            badge.textContent = "LIVE";
+          }
+
+          meta.textContent = `${fps > 0 ? fps.toFixed(1) : "0.0"} FPS | ${resolutionText}`;
+          placeholder.style.display = fresh ? "none" : "flex";
+
+          const deviceLabel = summary?.deviceName || deviceId || "No focused device";
+          const rttText = Number.isFinite(rtt) ? `${Math.round(rtt)} ms` : "-- ms";
+          footer.textContent = `Device: ${deviceLabel} | RTT: ${rttText}`;
         });
-        const unbus = bus.on("preview_image", (src) => { img.src = src; });
+
+        const unbus = bus.on("preview_image", (src) => {
+          img.src = src;
+          placeholder.style.display = "none";
+        });
         return () => { unsub(); unbus(); };
       }
     },
 
-    events_timeline: {
+
+    gps_live: {
+      title: "GPS Live",
+      defaults: { w: 4, h: 3, pinned: false, settings: { device_id: "global" } },
+      settingsSchema: [deviceSettingSchema()],
+      render(content, ctx) {
+        const note = document.createElement("div");
+        note.className = "mono muted";
+        content.appendChild(note);
+
+        const box = document.createElement("div");
+        box.className = "kv-grid";
+        content.appendChild(box);
+
+        const table = document.createElement("table");
+        table.style.display = "none";
+        table.innerHTML = "<thead><tr><th>Device</th><th>Lat</th><th>Lon</th><th>Acc(m)</th><th>Age(ms)</th></tr></thead><tbody></tbody>";
+        const tbody = table.querySelector("tbody");
+        content.appendChild(table);
+
+        const unsub = store.subscribe((s) => s, () => {
+          const st = store.getState();
+          const now = Date.now();
+
+          if (st.viewMode === "all") {
+            box.style.display = "none";
+            table.style.display = "table";
+            tbody.innerHTML = "";
+            const list = st.deviceList || [];
+            if (!list.length) {
+              const tr = document.createElement("tr");
+              tr.innerHTML = '<td colspan="5" class="empty-state">No devices connected</td>';
+              tbody.appendChild(tr);
+              note.textContent = "All Devices mode";
+              return;
+            }
+
+            let active = 0;
+            for (const d of list) {
+              const g = st.statesByDevice?.[d.device_id]?.gps_latest;
+              const age = g?.t_recv_ms ? Math.max(0, now - Number(g.t_recv_ms)) : null;
+              if (age != null && age < 4000) active += 1;
+              const tr = document.createElement("tr");
+              tr.innerHTML = `<td>${escapeHtml(String(d.deviceName || d.device_id))}</td><td>${g ? Number(g.lat).toFixed(6) : "-"}</td><td>${g ? Number(g.lon).toFixed(6) : "-"}</td><td>${g ? Number(g.accuracy_m).toFixed(1) : "-"}</td><td>${age == null ? "-" : String(age)}</td>`;
+              tbody.appendChild(tr);
+            }
+            note.textContent = `All Devices mode | GPS active ${active}/${list.length}`;
+            return;
+          }
+
+          table.style.display = "none";
+          box.style.display = "grid";
+          const deviceId = resolveWidgetDevice(ctx.instance.settings, st);
+          const g = deviceId ? st.statesByDevice?.[deviceId]?.gps_latest : null;
+          const age = g?.t_recv_ms ? Math.max(0, now - Number(g.t_recv_ms)) : null;
+          note.textContent = `Device: ${deviceId || "none"}`;
+          box.innerHTML = "";
+          kv(box, "Status", age != null && age < 4000 ? "LIVE" : "OFFLINE");
+          kv(box, "Latitude", g ? Number(g.lat).toFixed(6) : "-");
+          kv(box, "Longitude", g ? Number(g.lon).toFixed(6) : "-");
+          kv(box, "Accuracy (m)", g ? Number(g.accuracy_m).toFixed(1) : "-");
+          kv(box, "Speed (m/s)", g ? Number(g.speed_mps).toFixed(2) : "-");
+          kv(box, "Heading (deg)", g ? Number(g.heading_deg).toFixed(1) : "-");
+          kv(box, "Altitude (m)", g ? Number(g.altitude_m).toFixed(1) : "-");
+          kv(box, "Last Seen", age == null ? "-" : `${age} ms ago`);
+        });
+
+        return () => unsub();
+      }
+    },    events_timeline: {
       title: "Events",
       defaults: { w: 6, h: 2, pinned: false, settings: { device_id: "global" } },
       settingsSchema: [deviceSettingSchema()],
@@ -344,6 +550,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         const input = document.createElement("input");
         input.type = "text";
         input.placeholder = "event label";
+        const allModeNote = makeAllDevicesNotice();
         const mark = mkBtn("? Tag Event", () => {
           const st = store.getState();
           const deviceId = resolveWidgetDevice(ctx.instance.settings, st);
@@ -382,7 +589,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         const reload = mkBtn("Reload", () => loadReplaySessions());
         const sel = document.createElement("select");
         const play = mkBtn("? Play", onPlay, "btn-success");
-        const stop = mkBtn("¦ Stop", onStop, "btn-danger");
+        const stop = mkBtn("? Stop", onStop, "btn-danger");
         row.append(reload, sel, play, stop);
         content.appendChild(row);
 
@@ -481,6 +688,19 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
   };
 }
 
+
+function makeAllDevicesNotice() {
+  const el = document.createElement("p");
+  el.className = "all-mode-note muted mono";
+  el.textContent = "All Devices mode active - select Focused mode to inspect a single device.";
+  el.style.display = "none";
+  return el;
+}
+
+function setAllDevicesModeNotice(el, enabled) {
+  if (!el) return;
+  el.style.display = enabled ? "block" : "none";
+}
 function render(box, ctx) {
   const st = ctx.store.getState();
   const deviceId = resolveWidgetDevice(ctx.instance.settings, st);
@@ -686,6 +906,19 @@ function addSelect(parent, label, value, options, onChange, disabled = false) {
   wrap.appendChild(sel);
   parent.appendChild(wrap);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

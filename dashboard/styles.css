@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   --plot-grid: #d4d4de;
   --plot-line: #6c74c9;
 }
@@ -1015,4 +1015,259 @@ th {
   .session-setup-panel .session-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+.mode-bar {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+.mode-bar label {
+  min-width: 220px;
+  margin: 0;
+}
+
+.fleet-matrix td,
+.fleet-matrix th {
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .mode-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .mode-bar label {
+    min-width: 0;
+  }
+}
+.mode-hint {
+  margin-left: auto;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in oklab, var(--accent) 55%, var(--line));
+  background: linear-gradient(135deg, rgba(143, 125, 231, 0.2), rgba(111, 116, 201, 0.12));
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.camera-viewport {
+  position: relative;
+  min-height: 220px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: radial-gradient(circle at 30% 20%, #121826 0%, #090c15 68%);
+}
+
+.camera-viewport .widget-image {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  object-fit: contain;
+  background: transparent;
+}
+
+.camera-overlay {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(5, 8, 14, 0.68);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(4px);
+}
+
+.camera-badge {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.camera-badge.rec {
+  color: #ffd8d8;
+  background: rgba(209, 75, 75, 0.28);
+  border-color: rgba(209, 75, 75, 0.75);
+}
+
+.camera-badge.live {
+  color: #dcffe9;
+  background: rgba(46, 204, 113, 0.2);
+  border-color: rgba(46, 204, 113, 0.72);
+}
+
+.camera-badge.offline {
+  color: #eceff9;
+  background: rgba(130, 138, 158, 0.2);
+  border-color: rgba(130, 138, 158, 0.55);
+}
+
+.camera-meta {
+  font-size: 0.75rem;
+  color: #d8deee;
+  font-family: "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+
+.camera-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 18px;
+  color: #d3dae9;
+  font-weight: 600;
+  background: linear-gradient(180deg, rgba(8, 12, 20, 0.65), rgba(8, 12, 20, 0.85));
+}
+
+.camera-footer {
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+/* March 2026 UI polish pass */
+.status-bar {
+  gap: 8px;
+}
+
+.status-signal {
+  min-height: 52px;
+  padding: 8px 10px;
+}
+
+.status-signal .status-k {
+  font-size: 0.69rem;
+}
+
+.status-signal .status-v {
+  font-size: 0.96rem;
+  line-height: 1.1;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 16px 10px;
+  font-weight: 700;
+}
+
+.session-rec-timer {
+  margin-left: 4px;
+  font-size: 0.86rem;
+  color: var(--muted);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  filter: grayscale(0.2);
+}
+
+.motion-pill {
+  letter-spacing: 0.01em;
+}
+
+.motion-pill:not(.motion-active) {
+  background: linear-gradient(135deg, #687084, #545c70);
+}
+
+.motion-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.motion-pill::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #9aa2b8;
+  box-shadow: 0 0 8px rgba(154, 162, 184, 0.5);
+}
+
+.motion-pill.motion-active::before {
+  background: #34d27a;
+  box-shadow: 0 0 8px rgba(52, 210, 122, 0.55);
+}
+
+.mode-group {
+  display: grid;
+  gap: 6px;
+  min-width: 280px;
+}
+
+.mode-label {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.mode-segment {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--input-bg);
+}
+
+.mode-seg-btn {
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-weight: 700;
+  padding: 8px 12px;
+  cursor: pointer;
+  min-width: 130px;
+}
+
+.mode-seg-btn + .mode-seg-btn {
+  border-left: 1px solid var(--line);
+}
+
+.mode-seg-btn.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #fff;
+}
+
+.mode-seg-btn:not(.active):hover {
+  background: color-mix(in oklab, var(--input-bg) 75%, var(--accent) 25%);
+}
+
+.mode-select-hidden {
+  display: none;
+}
+
+.mode-device-label {
+  min-width: 260px;
+}
+
+/* Fix segmented view mode fill */
+.mode-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 100%;
+}
+
+.mode-seg-btn {
+  width: 100%;
+  min-width: 0;
+  border-radius: 0;
 }
