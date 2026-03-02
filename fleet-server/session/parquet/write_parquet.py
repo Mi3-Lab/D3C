@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -31,7 +32,6 @@ def parse_simple_csv_rows(rows):
 
 
 def parse_events_csv_rows(rows):
-    import csv
     return list(csv.reader(rows))
 
 
@@ -45,6 +45,13 @@ def to_int(v, default=0):
 def to_float(v, default=0.0):
     try:
         return float(v)
+    except Exception:
+        return default
+
+
+def to_ns_from_ms(v, default=None):
+    try:
+        return int(float(v) * 1_000_000)
     except Exception:
         return default
 
@@ -63,14 +70,103 @@ def write_table(pa, pq, columns: dict, out_path: Path, codec="zstd"):
     raise RuntimeError(f"failed to write parquet: {out_path}")
 
 
-def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
+def load_sync_models(session_dir: Path):
+    report_path = session_dir / "sync_report.json"
+    if not report_path.exists():
+        return {}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+    devices = payload.get("devices") if isinstance(payload, dict) else None
+    if not isinstance(devices, dict):
+        return {}
+
+    models = {}
+    for device_id, info in devices.items():
+        sync = info.get("sync") if isinstance(info, dict) else None
+        if not isinstance(sync, dict):
+            continue
+
+        mapping = sync.get("mapping") if isinstance(sync.get("mapping"), dict) else None
+        global_fit = None
+        if mapping and "a_ms" in mapping and "b" in mapping:
+            global_fit = {"a_ms": float(mapping["a_ms"]), "b": float(mapping["b"])}
+
+        segments = []
+        raw_segments = sync.get("segments") if isinstance(sync.get("segments"), list) else []
+        for seg in raw_segments:
+            if not isinstance(seg, dict):
+                continue
+            fit = seg.get("fit") if isinstance(seg.get("fit"), dict) else None
+            if not fit or "a_ms" not in fit or "b" not in fit:
+                continue
+            try:
+                segments.append({
+                    "start_ms": float(seg.get("start_server_ms", 0)),
+                    "end_ms": float(seg.get("end_server_ms", 0)),
+                    "a_ms": float(fit["a_ms"]),
+                    "b": float(fit["b"]),
+                })
+            except Exception:
+                continue
+
+        models[device_id] = {
+            "global": global_fit,
+            "segments": segments,
+        }
+
+    return models
+
+
+def pick_fit(model, t_server_rx_ns):
+    if not model:
+        return None
+
+    t_server_ms = None
+    if t_server_rx_ns not in (None, "", 0):
+        try:
+            t_server_ms = float(t_server_rx_ns) / 1_000_000.0
+        except Exception:
+            t_server_ms = None
+
+    if t_server_ms is not None:
+        for seg in model.get("segments", []):
+            if seg["start_ms"] <= t_server_ms <= seg["end_ms"]:
+                return seg
+
+    return model.get("global")
+
+
+def align_utc_ns(models, device_id, t_device_ms, t_server_rx_ns):
+    if t_device_ms in (None, ""):
+        return None
+    try:
+        x = float(t_device_ms)
+    except Exception:
+        return None
+
+    model = models.get(device_id)
+    fit = pick_fit(model, t_server_rx_ns)
+    if not fit:
+        return None
+
+    try:
+        y_ms = float(fit["a_ms"]) + float(fit["b"]) * x
+        return int(y_ms * 1_000_000.0)
+    except Exception:
+        return None
+
+
+def convert_streams(session_dir: Path, device_id: str, streams_dir: Path, sync_models: dict):
     converted = []
     session_id = session_dir.name
 
     imu_rows = parse_simple_csv_rows(read_csv_lines(streams_dir / "imu.csv"))
     if imu_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [], "t_server_rx_ns": [], "t_aligned_utc_ns": [],
             "accel_x": [], "accel_y": [], "accel_z": [],
             "gyro_x": [], "gyro_y": [], "gyro_z": [],
             "mag_x": [], "mag_y": [], "mag_z": [],
@@ -79,10 +175,15 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
         for r in imu_rows:
             if len(r) < 8:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_device_ms = to_int(r[1], 0)
+            t_server_rx_ns = to_int(r[8], 0) if len(r) > 8 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_device_ns"].append(to_int(r[1], 0) * 1_000_000)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_device_ns"].append(t_device_ms * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
+            cols["t_aligned_utc_ns"].append(align_utc_ns(sync_models, device_id, t_device_ms, t_server_rx_ns))
             cols["accel_x"].append(to_float(r[2], 0.0))
             cols["accel_y"].append(to_float(r[3], 0.0))
             cols["accel_z"].append(to_float(r[4], 0.0))
@@ -101,16 +202,21 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
     gps_rows = parse_simple_csv_rows(read_csv_lines(streams_dir / "gps.csv"))
     if gps_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [], "t_server_rx_ns": [], "t_aligned_utc_ns": [],
             "lat": [], "lon": [], "accuracy_m": [], "speed_mps": [], "heading_deg": [], "altitude_m": []
         }
         for r in gps_rows:
             if len(r) < 8:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_device_ms = to_int(r[1], 0)
+            t_server_rx_ns = to_int(r[8], 0) if len(r) > 8 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_device_ns"].append(to_int(r[1], 0) * 1_000_000)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_device_ns"].append(t_device_ms * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
+            cols["t_aligned_utc_ns"].append(align_utc_ns(sync_models, device_id, t_device_ms, t_server_rx_ns))
             cols["lat"].append(to_float(r[2], 0.0))
             cols["lon"].append(to_float(r[3], 0.0))
             cols["accuracy_m"].append(to_float(r[4], -1.0))
@@ -124,16 +230,21 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
     event_rows = parse_events_csv_rows(read_csv_lines(streams_dir / "events.csv"))
     if event_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [], "t_server_rx_ns": [], "t_aligned_utc_ns": [],
             "label": [], "meta_json": []
         }
         for r in event_rows:
             if len(r) < 4:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_device_ms = to_int(r[1], 0)
+            t_server_rx_ns = to_int(r[4], 0) if len(r) > 4 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_device_ns"].append(to_int(r[1], 0) * 1_000_000)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_device_ns"].append(t_device_ms * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
+            cols["t_aligned_utc_ns"].append(align_utc_ns(sync_models, device_id, t_device_ms, t_server_rx_ns))
             cols["label"].append(r[2])
             cols["meta_json"].append(r[3])
         out = streams_dir / "events.parquet"
@@ -143,15 +254,18 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
     net_rows = parse_simple_csv_rows(read_csv_lines(streams_dir / "net.csv"))
     if net_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_wall_utc_ns": [], "t_server_rx_ns": [],
             "fps": [], "dropped_frames": [], "rtt_ms": []
         }
         for r in net_rows:
             if len(r) < 4:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_server_rx_ns = to_int(r[4], 0) if len(r) > 4 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
             cols["fps"].append(to_float(r[1], 0.0))
             cols["dropped_frames"].append(to_float(r[2], 0.0))
             cols["rtt_ms"].append(to_float(r[3], -1.0))
@@ -162,16 +276,21 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
     audio_rows = parse_simple_csv_rows(read_csv_lines(streams_dir / "audio.csv"))
     if audio_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [], "t_server_rx_ns": [], "t_aligned_utc_ns": [],
             "amplitude": [], "noise_level": []
         }
         for r in audio_rows:
             if len(r) < 4:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_device_ms = to_int(r[1], 0)
+            t_server_rx_ns = to_int(r[4], 0) if len(r) > 4 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_device_ns"].append(to_int(r[1], 0) * 1_000_000)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_device_ns"].append(t_device_ms * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
+            cols["t_aligned_utc_ns"].append(align_utc_ns(sync_models, device_id, t_device_ms, t_server_rx_ns))
             cols["amplitude"].append(to_float(r[2], 0.0))
             cols["noise_level"].append(to_float(r[3], 0.0))
         out = streams_dir / "audio.parquet"
@@ -181,16 +300,21 @@ def convert_streams(session_dir: Path, device_id: str, streams_dir: Path):
     device_rows = parse_simple_csv_rows(read_csv_lines(streams_dir / "device.csv"))
     if device_rows:
         cols = {
-            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [],
+            "session_id": [], "device_id": [], "t_device_ns": [], "t_wall_utc_ns": [], "t_server_rx_ns": [], "t_aligned_utc_ns": [],
             "battery_level": [], "charging": [], "orientation": []
         }
         for r in device_rows:
             if len(r) < 5:
                 continue
+            t_recv_ms = to_int(r[0], 0)
+            t_device_ms = to_int(r[1], 0)
+            t_server_rx_ns = to_int(r[5], 0) if len(r) > 5 else None
             cols["session_id"].append(session_id)
             cols["device_id"].append(device_id)
-            cols["t_device_ns"].append(to_int(r[1], 0) * 1_000_000)
-            cols["t_wall_utc_ns"].append(to_int(r[0], 0) * 1_000_000)
+            cols["t_device_ns"].append(t_device_ms * 1_000_000)
+            cols["t_wall_utc_ns"].append(t_recv_ms * 1_000_000)
+            cols["t_server_rx_ns"].append(t_server_rx_ns)
+            cols["t_aligned_utc_ns"].append(align_utc_ns(sync_models, device_id, t_device_ms, t_server_rx_ns))
             cols["battery_level"].append(to_float(r[2], -1.0))
             cols["charging"].append(str(r[3]).lower() == "true")
             cols["orientation"].append(r[4])
@@ -239,6 +363,8 @@ def main():
         print(json.dumps({"ok": True, "converted": {}, "note": "no devices dir"}))
         return 0
 
+    sync_models = load_sync_models(session_dir)
+
     converted = {}
     for device_dir in devices_root.iterdir():
         if not device_dir.is_dir():
@@ -246,11 +372,11 @@ def main():
         streams = device_dir / "streams"
         if not streams.exists():
             continue
-        files = convert_streams(session_dir, device_dir.name, streams)
+        files = convert_streams(session_dir, device_dir.name, streams, sync_models)
         if files:
             converted[device_dir.name] = files
 
-    print(json.dumps({"ok": True, "converted": converted}))
+    print(json.dumps({"ok": True, "converted": converted, "sync_devices": list(sync_models.keys())}))
     return 0
 
 

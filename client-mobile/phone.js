@@ -58,6 +58,7 @@
   let lastGpsSent = 0;
   let heartbeatTimer = null;
   let wakeLock = null;
+  const deviceMonoOriginWallMs = Date.now() - performance.now();
   let silentAudio = null;
 
   renderDeviceId();
@@ -127,13 +128,30 @@
           applyConfig();
           return;
         }
+        if (msg.type === "sync_ping") {
+          const t2Mono = getDeviceMonoMs();
+          const t2Wall = getDeviceWallUtcMs();
+          const t3Mono = getDeviceMonoMs();
+          const t3Wall = getDeviceWallUtcMs();
+          queueJson({
+            type: "sync_pong",
+            device_id: runConfig.device_id,
+            ping_id: msg.ping_id,
+            t1_server_send_ms: Number(msg.t1_server_send_ms || 0),
+            t2_device_recv_mono_ms: t2Mono,
+            t3_device_send_mono_ms: t3Mono,
+            t2_wall_utc_ms: t2Wall,
+            t3_wall_utc_ms: t3Wall
+          });
+          return;
+        }
         if (msg.type === "ping") {
           queueJson({
             type: "pong",
             device_id: runConfig.device_id,
-            t_device_ms: performance.now(),
+            t_device_ms: getDeviceMonoMs(),
             ping_id: msg.ping_id,
-            t_ping_recv_ms: performance.now()
+            t_ping_recv_ms: getDeviceMonoMs()
           });
         }
       }
@@ -222,7 +240,7 @@
       queueJson({
         type: "camera_header",
         device_id: runConfig.device_id,
-        t_device_ms: performance.now(),
+        t_device_ms: getDeviceMonoMs(),
         frame_id: "phone_camera",
         format: "jpeg",
         lighting_score: lightingScore
@@ -305,7 +323,7 @@
       queueJson({
         type: "audio",
         device_id: runConfig.device_id,
-        t_device_ms: performance.now(),
+        t_device_ms: getDeviceMonoMs(),
         amplitude: Number(peak.toFixed(4)),
         noise_level: Number(Math.sqrt(sum / arr.length).toFixed(4))
       });
@@ -346,7 +364,7 @@
     queueJson({
       type: "audio_pcm",
       device_id: runConfig.device_id,
-      t_device_ms: performance.now(),
+      t_device_ms: getDeviceMonoMs(),
       sample_rate: Number(sampleRate || audioCtx?.sampleRate || 48000),
       channels: 1,
       encoding: "pcm_s16le",
@@ -402,7 +420,7 @@
       queueJson({
         type: "device",
         device_id: runConfig.device_id,
-        t_device_ms: performance.now(),
+        t_device_ms: getDeviceMonoMs(),
         battery_level: batteryManager ? Number((batteryManager.level * 100).toFixed(1)) : -1,
         charging: batteryManager ? !!batteryManager.charging : false,
         orientation: String(screen.orientation?.type || "unknown")
@@ -417,7 +435,7 @@
       queueJson({
         type: "heartbeat",
         device_id: runConfig.device_id,
-        t_device_ms: performance.now(),
+        t_device_ms: getDeviceMonoMs(),
         timestamp: Date.now()
       });
     }, interval);
@@ -500,6 +518,14 @@
   }
 function queueJson(obj) {
     wsClient?.sendJson(obj);
+  }
+
+  function getDeviceMonoMs() {
+    return performance.now();
+  }
+
+  function getDeviceWallUtcMs() {
+    return Date.now();
   }
 
   function estimateLighting(ctx, w, h) {
@@ -672,6 +698,8 @@ function mergeRunConfig(input) {
 
   connectWs();
 })();
+
+
 
 
 

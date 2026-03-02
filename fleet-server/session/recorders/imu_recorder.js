@@ -10,7 +10,7 @@ class ImuRecorder {
     if (this.initialized) return;
     fs.writeFileSync(
       this.filePath,
-      "t_recv_ms,t_device_ms,ax,ay,az,gx,gy,gz\n",
+      "t_recv_ms,t_device_ms,ax,ay,az,gx,gy,gz,t_server_rx_ns\n",
       "utf8"
     );
     this.initialized = true;
@@ -26,7 +26,8 @@ class ImuRecorder {
       sample.az,
       sample.gx,
       sample.gy,
-      sample.gz
+      sample.gz,
+      sample.t_server_rx_ns ?? ""
     ].join(",");
     fs.appendFileSync(this.filePath, `${row}\n`, "utf8");
   }

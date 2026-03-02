@@ -1,4 +1,4 @@
-﻿const fs = require("fs");
+const fs = require("fs");
 
 class GpsRecorder {
   constructor(filePath) {
@@ -10,7 +10,7 @@ class GpsRecorder {
     if (this.initialized) return;
     fs.writeFileSync(
       this.filePath,
-      "t_recv_ms,t_device_ms,lat,lon,accuracy_m,speed_mps,heading_deg,altitude_m\n",
+      "t_recv_ms,t_device_ms,lat,lon,accuracy_m,speed_mps,heading_deg,altitude_m,t_server_rx_ns\n",
       "utf8"
     );
     this.initialized = true;
@@ -26,7 +26,8 @@ class GpsRecorder {
       sample.accuracy_m,
       sample.speed_mps,
       sample.heading_deg,
-      sample.altitude_m
+      sample.altitude_m,
+      sample.t_server_rx_ns ?? ""
     ].join(",");
     fs.appendFileSync(this.filePath, `${row}\n`, "utf8");
   }

@@ -19,11 +19,11 @@ class CameraRecorder {
     if (this.initialized) return;
     this.mode = mode;
     fs.mkdirSync(this.cameraDir, { recursive: true });
-    fs.writeFileSync(this.timestampsPath, "index,filename,t_device_ms,t_recv_ms\n", "utf8");
+    fs.writeFileSync(this.timestampsPath, "index,filename,t_device_ms,t_recv_ms,t_server_rx_ns\n", "utf8");
     this.initialized = true;
   }
 
-  writeFrame({ jpegBuffer, t_device_ms, t_recv_ms, record_mode = "jpg", encode_timing = "post_session", fps = 10, bitrate = "2M", crf = 23, ffmpegBin = "ffmpeg" }) {
+  writeFrame({ jpegBuffer, t_device_ms, t_recv_ms, t_server_rx_ns = "", record_mode = "jpg", encode_timing = "post_session", fps = 10, bitrate = "2M", crf = 23, ffmpegBin = "ffmpeg" }) {
     this.ensureInit(record_mode);
     this.frameIndex += 1;
     const filename = `${String(this.frameIndex).padStart(6, "0")}.jpg`;
@@ -31,7 +31,7 @@ class CameraRecorder {
     fs.writeFileSync(jpgPath, jpegBuffer);
     fs.appendFileSync(
       this.timestampsPath,
-      `${this.frameIndex},${filename},${t_device_ms},${t_recv_ms}\n`,
+      `${this.frameIndex},${filename},${t_device_ms},${t_recv_ms},${t_server_rx_ns}\n`,
       "utf8"
     );
 
@@ -193,3 +193,4 @@ function safeRemoveDir(dirPath) {
 module.exports = {
   CameraRecorder
 };
+

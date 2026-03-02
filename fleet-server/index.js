@@ -1,4 +1,4 @@
-const fs = require("fs");
+﻿const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const https = require("https");
@@ -8,6 +8,7 @@ const { WebSocketServer, WebSocket } = require("ws");
 const { DEFAULT_RUN_CONFIG, STATE_BROADCAST_HZ, DATASETS_ROOT } = require("./config");
 const { sanitizeRunConfig, WS_ROLES } = require("./shared/schema");
 const { MotionState } = require("./compute/motion_state");
+const { SyncTracker } = require("./compute/sync_tracker");
 const { SessionManager } = require("./session/session_manager");
 
 const args = parseArgs(process.argv.slice(2));
@@ -159,7 +160,6 @@ const sessionManager = new SessionManager();
 const devices = new Map(); // device_id -> device entry
 const dashboardSockets = new Set();
 const pendingCameraHeaderBySocket = new Map(); // ws -> header
-const pendingPingsByDevice = new Map(); // device_id -> ping map
 
 let focusedDeviceId = null;
 let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
@@ -245,6 +245,7 @@ setInterval(() => {
     if (recording.active && sessionManager.shouldRecordDevice(id)) {
       sessionManager.writeNet(id, {
         t_recv_ms: Date.now(),
+        t_server_rx_ns: nowServerRxNs(),
         fps: d.stats.camera_fps,
         dropped_frames: d.stats.dropped_frames,
         rtt_ms: d.stats.rtt_ms ?? -1
@@ -266,12 +267,12 @@ setInterval(() => {
 setInterval(() => {
   for (const [deviceId, d] of devices.entries()) {
     if (!d.connected || !d.ws || d.ws.readyState !== WebSocket.OPEN) continue;
-    const ping_id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    pendingPingsByDevice.get(deviceId).set(ping_id, Date.now());
-    d.stats.sync.ping_sent += 1;
-    sendWs(d.ws, { type: "ping", ping_id, t_sent_ms: Date.now() }, { critical: true });
+    const pingId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const t1 = Date.now();
+    d.syncTracker?.recordPingSent(pingId, t1);
+    sendWs(d.ws, { type: "sync_ping", ping_id: pingId, t1_server_send_ms: t1 }, { critical: true });
   }
-}, 2000);
+}, 1000);
 
 const stateIntervalMs = Math.round(1000 / STATE_BROADCAST_HZ);
 setInterval(() => {
@@ -318,10 +319,15 @@ function handleHello(ws, msg) {
   }
 
   const requested = String(msg.deviceId || msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
-  const unique = uniqueDeviceId(requested);
+  const { assigned, reused, renamed } = resolvePhoneDeviceId(requested, ws);
+  const unique = assigned;
   ws.device_id = unique;
 
   const existing = devices.get(unique) || newDeviceEntry(unique);
+  const hadPriorSocket = !!existing.ws && existing.ws !== ws;
+  if (hadPriorSocket) {
+    try { existing.ws.close(4001, "replaced by reconnect"); } catch {}
+  }
   existing.ws = ws;
   existing.connected = true;
   existing.connectedAt = Date.now();
@@ -332,16 +338,17 @@ function handleHello(ws, msg) {
     ? { ...msg.capabilities }
     : (existing.capabilities || {});
   existing.config = clone(sessionConfig);
+  if (reused) existing.syncTracker?.startSegment(Date.now(), "reconnect");
   devices.set(unique, existing);
 
-  if (!pendingPingsByDevice.has(unique)) pendingPingsByDevice.set(unique, new Map());
   if (!focusedDeviceId) focusedDeviceId = unique;
 
   connectionStats.phones_connected += 1;
   sendWs(ws, {
     type: "hello_ack",
     device_id: unique,
-    renamed_from: unique !== requested ? requested : null
+    renamed_from: renamed ? requested : null,
+    reused_device_id: !!reused
   });
   console.log("[ws] phone registered", {
     requested,
@@ -359,6 +366,7 @@ function handlePhoneJson(ws, msg) {
   const d = devices.get(deviceId);
   if (!d) return;
   d.lastSeenTs = Date.now();
+
   if (msg.type === "imu") {
     if (!allowByRate(d, "imu", d.config.streams.imu.rate_hz)) return;
     const ax = Number(msg.accel_mps2?.[0] || 0);
@@ -368,18 +376,19 @@ function handlePhoneJson(ws, msg) {
     const gy = Number(msg.gyro_rads?.[1] || 0);
     const gz = Number(msg.gyro_rads?.[2] || 0);
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     const mag = Math.sqrt(ax * ax + ay * ay + az * az);
     const motion = d.motion.update(ax, ay, az);
-    if (motion.motion_state === "STILL") {
-      d.stillSinceMs ||= tRecvMs;
-    } else {
-      d.stillSinceMs = null;
-    }
+
+    if (motion.motion_state === "STILL") d.stillSinceMs ||= tRecvMs;
+    else d.stillSinceMs = null;
+
     d.state.motion_state = motion.motion_state;
     d.state.motion_conf = motion.confidence;
     d.state.inactivity_duration_sec = d.stillSinceMs ? Number(((tRecvMs - d.stillSinceMs) / 1000).toFixed(1)) : 0;
     d.state.imu_latest = {
       t_recv_ms: tRecvMs,
+      t_server_rx_ns: tServerRxNs,
       t_device_ms: Number(msg.t_device_ms || 0),
       accel_mps2: [ax, ay, az],
       gyro_rads: [gx, gy, gz],
@@ -387,16 +396,19 @@ function handlePhoneJson(ws, msg) {
     };
     d.stats.imu_count += 1;
     trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
+
     if (recording.active) {
       sessionManager.writeImu(deviceId, {
         t_recv_ms: tRecvMs,
         t_device_ms: Number(msg.t_device_ms || 0),
-        ax, ay, az, gx, gy, gz
+        ax, ay, az, gx, gy, gz,
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
+
   if (msg.type === "camera_header") {
     if (!allowByRate(d, "camera", d.config.streams.camera.fps || 10)) return;
     pendingCameraHeaderBySocket.set(ws, {
@@ -407,30 +419,36 @@ function handlePhoneJson(ws, msg) {
     });
     return;
   }
+
   if (msg.type === "audio") {
     if (!allowByRate(d, "audio", d.config.streams.audio.rate_hz || 10)) return;
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     d.state.audio_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
       amplitude: Number(msg.amplitude || 0),
-      noise_level: Number(msg.noise_level || 0)
+      noise_level: Number(msg.noise_level || 0),
+      t_server_rx_ns: tServerRxNs
     };
     if (recording.active) {
       sessionManager.writeAudio(deviceId, {
         t_recv_ms: tRecvMs,
         t_device_ms: Number(msg.t_device_ms || 0),
         amplitude: Number(msg.amplitude || 0),
-        noise_level: Number(msg.noise_level || 0)
+        noise_level: Number(msg.noise_level || 0),
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
+
   if (msg.type === "gps") {
     if (!allowByRate(d, "gps", d.config.streams.gps.rate_hz || 1)) return;
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     const lat = Number(msg.lat || 0);
     const lon = Number(msg.lon || 0);
     const accuracy_m = Number(msg.accuracy_m || -1);
@@ -441,18 +459,21 @@ function handlePhoneJson(ws, msg) {
     d.state.gps_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
-      lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m
+      lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m,
+      t_server_rx_ns: tServerRxNs
     };
     if (recording.active) {
       sessionManager.writeGps(deviceId, {
         t_recv_ms: tRecvMs,
         t_device_ms: Number(msg.t_device_ms || 0),
-        lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m
+        lat, lon, accuracy_m, speed_mps, heading_deg, altitude_m,
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
+
   if (msg.type === "audio_pcm") {
     if (!d.config.streams.audio.enabled) return;
     if (!recording.active) return;
@@ -477,16 +498,19 @@ function handlePhoneJson(ws, msg) {
     markDeviceWrite(deviceId, Date.now());
     return;
   }
+
   if (msg.type === "device") {
     if (!allowByRate(d, "device", d.config.streams.device.rate_hz || 1)) return;
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     trackDeviceClockSample(d, Number(msg.t_device_ms || 0), tRecvMs);
     d.state.device_latest = {
       t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
       battery_level: Number(msg.battery_level ?? -1),
       charging: !!msg.charging,
-      orientation: String(msg.orientation || "unknown")
+      orientation: String(msg.orientation || "unknown"),
+      t_server_rx_ns: tServerRxNs
     };
     if (recording.active) {
       sessionManager.writeDevice(deviceId, {
@@ -494,18 +518,22 @@ function handlePhoneJson(ws, msg) {
         t_device_ms: Number(msg.t_device_ms || 0),
         battery_level: Number(msg.battery_level ?? -1),
         charging: !!msg.charging,
-        orientation: String(msg.orientation || "unknown")
+        orientation: String(msg.orientation || "unknown"),
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
+
   if (msg.type === "heartbeat") {
     d.lastSeenTs = Date.now();
     return;
   }
+
   if (msg.type === "event") {
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     const entry = { t_recv_ms: tRecvMs, label: String(msg.label || ""), source: "phone", device_id: deviceId };
     d.state.event_timeline.push(entry);
     if (d.state.event_timeline.length > 50) d.state.event_timeline.shift();
@@ -514,31 +542,34 @@ function handlePhoneJson(ws, msg) {
         t_recv_ms: tRecvMs,
         t_device_ms: Number(msg.t_device_ms || 0),
         label: entry.label,
-        meta: { source: "phone" }
+        meta: { source: "phone" },
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
     return;
   }
-  if (msg.type === "pong") {
-    const pingMap = pendingPingsByDevice.get(deviceId);
-    const sent = pingMap?.get(String(msg.ping_id || ""));
-    if (!sent) return;
-    const recvMs = Date.now();
-    const rtt = recvMs - sent;
-    d.stats.rtt_ms = rtt;
-    d.stats.sync.ping_acked += 1;
-    d.stats.sync.rtt_samples += 1;
-    d.stats.sync.rtt_sum_ms += rtt;
-    d.stats.sync.rtt_min_ms = d.stats.sync.rtt_min_ms == null ? rtt : Math.min(d.stats.sync.rtt_min_ms, rtt);
-    d.stats.sync.rtt_max_ms = d.stats.sync.rtt_max_ms == null ? rtt : Math.max(d.stats.sync.rtt_max_ms, rtt);
 
+  if (msg.type === "sync_pong") {
+    const recvMs = Date.now();
+    const syncSample = d.syncTracker?.recordPong(msg, recvMs);
+    if (syncSample && Number.isFinite(syncSample.rtt)) {
+      d.stats.rtt_ms = Number(syncSample.rtt.toFixed(2));
+    }
+    const t3 = Number(msg.t3_device_send_mono_ms);
+    if (Number.isFinite(t3) && t3 > 0) {
+      trackDeviceClockSample(d, t3, recvMs);
+    }
+    return;
+  }
+
+  if (msg.type === "pong") {
+    const recvMs = Date.now();
     const tPingRecvMs = Number(msg.t_ping_recv_ms);
     if (Number.isFinite(tPingRecvMs) && tPingRecvMs > 0) {
       trackDeviceClockSample(d, tPingRecvMs, recvMs);
     }
-
-    pingMap.delete(String(msg.ping_id || ""));
+    return;
   }
 }
 
@@ -549,6 +580,7 @@ function handlePhoneBinary(ws, data) {
   if (!header) return;
   pendingCameraHeaderBySocket.delete(ws);
   const tRecvMs = Date.now();
+  const tServerRxNs = nowServerRxNs();
   d.latestCameraBuffer = Buffer.from(data);
   d.latestCameraMime = header.format === "jpeg" ? "image/jpeg" : "application/octet-stream";
   d.state.camera_latest_ts = tRecvMs;
@@ -559,7 +591,8 @@ function handlePhoneBinary(ws, data) {
     sessionManager.writeCamera(ws.device_id, {
       jpegBuffer: d.latestCameraBuffer,
       t_device_ms: header.t_device_ms,
-      t_recv_ms: tRecvMs
+      t_recv_ms: tRecvMs,
+      t_server_rx_ns: tServerRxNs
     });
     markDeviceWrite(ws.device_id, tRecvMs);
   }
@@ -668,6 +701,7 @@ function handleDashboardJson(ws, msg) {
     if (!deviceId || !devices.has(deviceId)) return;
     const d = devices.get(deviceId);
     const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     const entry = { t_recv_ms: tRecvMs, label: String(msg.label || ""), source: "dashboard", device_id: deviceId };
     d.state.event_timeline.push(entry);
     if (d.state.event_timeline.length > 50) d.state.event_timeline.shift();
@@ -676,7 +710,8 @@ function handleDashboardJson(ws, msg) {
         t_recv_ms: tRecvMs,
         t_device_ms: 0,
         label: entry.label,
-        meta: { source: "dashboard" }
+        meta: { source: "dashboard" },
+        t_server_rx_ns: tServerRxNs
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
@@ -1007,6 +1042,25 @@ function computeFusion(d) {
   return { connection_quality, sensing_confidence };
 }
 
+function isSocketOpen(sock) {
+  return !!sock && sock.readyState === WebSocket.OPEN;
+}
+
+function resolvePhoneDeviceId(requested, incomingWs) {
+  const existing = devices.get(requested);
+  if (!existing) return { assigned: requested, reused: false, renamed: false };
+  if (!existing.connected || !isSocketOpen(existing.ws) || existing.ws === incomingWs) {
+    return { assigned: requested, reused: true, renamed: false };
+  }
+  const staleMs = Date.now() - Number(existing.lastSeenTs || 0);
+  if (staleMs > 7000) {
+    try { existing.ws?.close(4001, "replaced by reconnect"); } catch {}
+    existing.ws = null;
+    existing.connected = false;
+    return { assigned: requested, reused: true, renamed: false };
+  }
+  return { assigned: uniqueDeviceId(requested), reused: false, renamed: true };
+}
 function uniqueDeviceId(requested) {
   if (!devices.has(requested) || !devices.get(requested).connected) return requested;
   let n = 2;
@@ -1028,6 +1082,7 @@ function newDeviceEntry(deviceId) {
     capabilities: {},
     config: clone(DEFAULT_RUN_CONFIG),
     motion: new MotionState(60),
+    syncTracker: new SyncTracker({ windowMs: 120000, minFitSamples: 8, lowRttFraction: 0.35 }),
     stillSinceMs: null,
     latestCameraBuffer: null,
     latestCameraMime: "image/jpeg",
@@ -1172,56 +1227,24 @@ function allowByRate(deviceEntry, streamKey, targetHz) {
   return true;
 }
 
-function trackDeviceClockSample(deviceEntry, tDeviceMs, tRecvMs) {
-  if (!Number.isFinite(tDeviceMs) || tDeviceMs <= 0 || !Number.isFinite(tRecvMs) || tRecvMs <= 0) return;
-  const sync = deviceEntry?.stats?.sync;
-  if (!sync) return;
-  if (!Number.isFinite(sync.anchor_device_ms) || !Number.isFinite(sync.anchor_recv_ms)) {
-    sync.anchor_device_ms = tDeviceMs;
-    sync.anchor_recv_ms = tRecvMs;
-  }
-  const offset = (tRecvMs - sync.anchor_recv_ms) - (tDeviceMs - sync.anchor_device_ms);
-  if (!Number.isFinite(offset)) return;
-  sync.offset_samples += 1;
-  sync.offset_sum_ms += offset;
-  sync.offset_sq_sum_ms += offset * offset;
-  sync.offset_min_ms = sync.offset_min_ms == null ? offset : Math.min(sync.offset_min_ms, offset);
-  sync.offset_max_ms = sync.offset_max_ms == null ? offset : Math.max(sync.offset_max_ms, offset);
-  sync.last_offset_ms = offset;
-  sync.last_sync_recv_ms = tRecvMs;
+function trackDeviceClockSample(deviceEntry, tDeviceMs, _tRecvMs) {
+  if (!deviceEntry || !Number.isFinite(tDeviceMs) || tDeviceMs <= 0) return;
+  deviceEntry.lastDeviceMonoMs = Number(tDeviceMs);
 }
-
 function summarizeSyncStats(d) {
-  const sync = d?.stats?.sync || {};
-  const rttMean = sync.rtt_samples ? (sync.rtt_sum_ms / sync.rtt_samples) : null;
-  const offsetMean = sync.offset_samples ? (sync.offset_sum_ms / sync.offset_samples) : null;
-  const variance = sync.offset_samples ? Math.max(0, (sync.offset_sq_sum_ms / sync.offset_samples) - Math.pow(offsetMean || 0, 2)) : null;
-  const offsetStd = variance == null ? null : Math.sqrt(variance);
-  const pingSent = Number(sync.ping_sent || 0);
-  const pingAcked = Number(sync.ping_acked || 0);
-  const pingLoss = pingSent > 0 ? Math.max(0, ((pingSent - pingAcked) / pingSent) * 100) : 0;
+  if (!d?.syncTracker) {
+    return { ping_sent: 0, ping_acked: 0, ping_loss_pct: 0, mapping: null, quality: null, segments: [] };
+  }
+  const rep = d.syncTracker.buildReport(Date.now());
   return {
-    ping_sent: pingSent,
-    ping_acked: pingAcked,
-    ping_loss_pct: Number(pingLoss.toFixed(2)),
-    rtt_ms: {
-      last: d?.stats?.rtt_ms ?? null,
-      mean: rttMean == null ? null : Number(rttMean.toFixed(2)),
-      min: sync.rtt_min_ms == null ? null : Number(sync.rtt_min_ms.toFixed(2)),
-      max: sync.rtt_max_ms == null ? null : Number(sync.rtt_max_ms.toFixed(2)),
-      samples: Number(sync.rtt_samples || 0)
-    },
-    clock_offset_ms: {
-      last: sync.last_offset_ms == null ? null : Number(sync.last_offset_ms.toFixed(2)),
-      mean: offsetMean == null ? null : Number(offsetMean.toFixed(2)),
-      std: offsetStd == null ? null : Number(offsetStd.toFixed(2)),
-      min: sync.offset_min_ms == null ? null : Number(sync.offset_min_ms.toFixed(2)),
-      max: sync.offset_max_ms == null ? null : Number(sync.offset_max_ms.toFixed(2)),
-      samples: Number(sync.offset_samples || 0)
-    }
+    ping_sent: rep.ping_sent,
+    ping_acked: rep.ping_acked,
+    ping_loss_pct: rep.ping_loss_pct,
+    mapping: rep.mapping,
+    quality: rep.quality,
+    segments: rep.segments
   };
 }
-
 function computeDeviceAlerts(d) {
   const alerts = [];
   const now = Date.now();
@@ -1306,6 +1329,10 @@ function writeSyncReport(sessionDir, sessionId, targetDeviceIds, extra = {}) {
     console.error("[sync-report] failed", err?.message || err);
   }
 }
+function nowServerRxNs() {
+  return (BigInt(Date.now()) * 1000000n).toString();
+}
+
 function classifyConnection({ connected, rttMs, droppedPackets, lastSeenMs }) {
   if (!connected) return "disconnected";
   const age = Date.now() - Number(lastSeenMs || 0);
@@ -1443,6 +1470,13 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
+
+
+
+
+
+
+
 
 
 

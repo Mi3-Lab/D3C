@@ -1,4 +1,4 @@
-# D3C - Distributed Driving Data Collective
+﻿# D3C - Distributed Driving Data Collective
 
 D3C is a distributed driving data research platform where personal smartphones act as fleet nodes.
 Each node contributes multimodal driving data to a coordinated fleet session managed by the laptop fleet server.
@@ -44,6 +44,7 @@ d3c/
   datasets/
   docs/
     migration-map.md
+    sync-model.md
   certs/
     cert.pem
     key.pem
@@ -101,7 +102,7 @@ Overlay also shows FPS and resolution, with footer device + RTT.
 - Global banner shows `OFFLINE`, `DEVICES CONNECTING`, `SYSTEM READY`, `RECORDING`, or `DEVICES FLUSHING`.
 - `Session Setup` includes inline recording timer text (`Recording - mm:ss elapsed`).
 - Sensor panels show modality badges (`REC`/`OFF`) based on writer ACK state.
-- Session stop writes sync_report.json with per-device RTT/loss and clock-offset stats for alignment QA.
+- Session stop writes sync_report.json with per-device RTT/loss and clock offset+drift stats for alignment QA.
 ## Modalities
 
 - Motion & Pose: `imu`
@@ -132,9 +133,13 @@ Per device under `datasets/session_.../devices/<device_id>/streams/`:
 
 ### IMU Parquet Schema
 
+See `docs/sync-model.md` for continuous offset+drift fitting and reconnect segments.
+
 - `session_id`, `device_id`
 - `t_device_ns` (int64)
 - `t_wall_utc_ns` (int64)
+- `t_server_rx_ns` (int64)
+- `t_aligned_utc_ns` (int64, from sync model)
 - `accel_x`, `accel_y`, `accel_z`
 - `gyro_x`, `gyro_y`, `gyro_z`
 - optional placeholders: `mag_x`, `mag_y`, `mag_z`, `sample_rate_hz`, `sensor_frame`
@@ -333,5 +338,8 @@ Key fields:
   - set FFmpeg path if needed:
     - `$env:FFMPEG_BIN = "C:\path\to\ffmpeg.exe"`
   - confirm `streams.camera.auto_mp4_on_stop` is `true` and camera mode is `stream` during recording
+
+
+
 
 
