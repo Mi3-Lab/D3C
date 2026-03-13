@@ -211,6 +211,7 @@ sessions/
 certs/
 .env
 .env.*
+!.env.example
 *.log
 .DS_Store
 Thumbs.db
@@ -219,6 +220,7 @@ Thumbs.db
 # Keep raw collected data out of git
 sessions/
 datasets/
+fleet-server/auth_state.json
 
 # Local cert material
 certs/

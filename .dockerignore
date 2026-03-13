@@ -1,0 +1,10 @@
+node_modules/
+datasets/
+certs/
+server.stdout.log
+server.stderr.log
+*.log
+.git/
+.gitignore
+.env
+.env.*

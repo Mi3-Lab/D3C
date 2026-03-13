@@ -59,7 +59,9 @@ const MOTION_THRESHOLDS = {
   movingVar: 1.5
 };
 
-const DATASETS_ROOT = path.join(process.cwd(), "datasets");
+const DATASETS_ROOT = process.env.DATASETS_ROOT
+  ? path.resolve(process.env.DATASETS_ROOT)
+  : path.join(process.cwd(), "datasets");
 
 module.exports = {
   DEFAULT_RUN_CONFIG,
@@ -68,6 +70,5 @@ module.exports = {
   MOTION_THRESHOLDS,
   DATASETS_ROOT
 };
-
 
 

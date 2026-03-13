@@ -12,7 +12,9 @@ const { MotionState } = require("./compute/motion_state");
 const { SyncTracker } = require("./compute/sync_tracker");
 const { SessionManager } = require("./session/session_manager");
 
-const AUTH_STATE_PATH = path.join(process.cwd(), "fleet-server", "auth_state.json");
+const AUTH_STATE_PATH = process.env.AUTH_STATE_PATH
+  ? path.resolve(process.env.AUTH_STATE_PATH)
+  : path.join(process.cwd(), "fleet-server", "auth_state.json");
 const PHONE_JOIN_TOKEN_TTL_MS = 5 * 60 * 1000;
 const AUTH_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const AUTH_RATE_LIMIT_MAX_ATTEMPTS = 10;
@@ -1645,7 +1647,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
 
 
 

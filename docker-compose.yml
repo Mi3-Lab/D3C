@@ -1,0 +1,27 @@
+services:
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATASETS_ROOT: /var/lib/d3c/datasets
+      AUTH_STATE_PATH: /var/lib/d3c/auth/auth_state.json
+      PARQUET_PYTHON_BIN: python3
+      FFMPEG_BIN: ffmpeg
+    expose:
+      - "3000"
+    volumes:
+      - d3c_datasets:/var/lib/d3c/datasets
+      - d3c_auth:/var/lib/d3c/auth
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - app
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+
+volumes:
+  d3c_datasets:
+  d3c_auth:
