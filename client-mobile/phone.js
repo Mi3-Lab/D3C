@@ -5,6 +5,9 @@
   const connStatus = document.getElementById("connStatus");
   const deviceIdPill = document.getElementById("deviceIdPill");
   const statusList = document.getElementById("statusList");
+  const deviceNameInput = document.getElementById("deviceNameInput");
+  const joinCodeInput = document.getElementById("joinCodeInput");
+  const joinStatus = document.getElementById("joinStatus");
   const previewEl = document.getElementById("preview");
   const phoneConnCard = document.getElementById("phoneConnCard");
   const phoneConnText = document.getElementById("phoneConnText");
@@ -37,6 +40,7 @@
   let started = false;
   let wsClient = null;
   let ws = null;
+  let authState = null;
 
   let imuLastSent = 0;
   let cameraStream = null;
@@ -62,32 +66,54 @@
   let silentAudio = null;
 
   renderDeviceId();
+  renderJoinFields();
   initTheme();
   renderStatus();
   setConnectionUi(false, "Disconnected");
+  setJoinStatus("Waiting for join details");
 
   themeToggleBtn?.addEventListener("click", toggleTheme);
 
   disconnectBtn?.addEventListener("click", () => {
-    if (!wsClient) return;
+    if (!wsClient || !started) return;
     if (wsClient.isConnected()) {
       wsClient.disconnect(true);
       setConnectionUi(false, "Disconnected");
+      setJoinStatus("Disconnected");
       return;
     }
-    wsClient.reconnect();
-    setConnectionUi(false, "Connecting...");
+    void reconnectWithAuth();
   });
 
   startBtn.addEventListener("click", async () => {
     if (started) return;
+    const deviceName = sanitizeDeviceNameInput(deviceNameInput?.value);
+    const joinCode = normalizeJoinCode(joinCodeInput?.value);
+    if (!deviceName || !joinCode) {
+      setJoinStatus("Enter a device name and join code");
+      return;
+    }
     started = true;
     startBtn.disabled = true;
-    await requestPermissionsAndStart();
-    await applyConfig();
+    setJoinStatus("Authorizing...");
+    try {
+      authState = await authorizePhoneJoin({ deviceName, joinCode, deviceId: runConfig.device_id });
+      runConfig.device_id = authState.deviceId;
+      renderDeviceId();
+      setJoinStatus(`Authorized as ${authState.deviceName}`);
+      persistJoinFields(deviceName, joinCode);
+      await requestPermissionsAndStart();
+      connectWs();
+      await applyConfig();
+    } catch (err) {
+      started = false;
+      startBtn.disabled = false;
+      setJoinStatus(String(err?.message || "Authorization failed"));
+    }
   });
 
   function connectWs() {
+    if (!authState?.joinToken) return;
     const wsScheme = location.protocol === "https:" ? "wss" : "ws";
     wsClient = new ResilientWs(`${wsScheme}://${location.host}/ws`, {
       maxReconnectDelayMs: runConfig.network?.max_reconnect_delay_ms || 30000,
@@ -96,12 +122,14 @@
       onOpen(sock) {
         ws = sock;
         setConnectionUi(true, "Connected");
+        setJoinStatus(`Connected as ${authState.deviceName}`);
         queueJson({
           type: "hello",
           role: "phone",
           device_id: runConfig.device_id,
           deviceId: runConfig.device_id,
-          deviceName: resolveDeviceName(),
+          deviceName: authState.deviceName,
+          join_token: authState.joinToken,
           capabilities: resolveCapabilities(),
           user_agent: navigator.userAgent
         });
@@ -109,6 +137,7 @@
       onClose() {
         ws = null;
         setConnectionUi(false, "Disconnected");
+        if (started) setJoinStatus("Disconnected - retrying");
       },
       onMessage(data) {
         if (typeof data !== "string") return;
@@ -118,7 +147,16 @@
         if (msg.type === "hello_ack" && msg.device_id) {
           runConfig.device_id = String(msg.device_id);
           localStorage.setItem("d3c_phone_device_id", runConfig.device_id);
+          if (msg.device_name) {
+            authState = { ...(authState || {}), deviceName: String(msg.device_name) };
+            if (deviceNameInput) deviceNameInput.value = authState.deviceName;
+          }
           renderDeviceId();
+          return;
+        }
+        if (msg.type === "auth_required") {
+          setJoinStatus("Join token expired - tap Start again");
+          wsClient?.disconnect(true);
           return;
         }
         if (msg.type === "config") {
@@ -498,6 +536,22 @@
     deviceIdPill.textContent = runConfig.device_id;
   }
 
+  function renderJoinFields() {
+    const savedName = localStorage.getItem("d3c_phone_device_name") || "";
+    const savedCode = localStorage.getItem("d3c_phone_join_code") || "";
+    if (deviceNameInput) deviceNameInput.value = savedName;
+    if (joinCodeInput) joinCodeInput.value = savedCode;
+  }
+
+  function persistJoinFields(deviceName, joinCode) {
+    localStorage.setItem("d3c_phone_device_name", deviceName);
+    localStorage.setItem("d3c_phone_join_code", joinCode);
+  }
+
+  function setJoinStatus(text) {
+    if (joinStatus) joinStatus.textContent = text;
+  }
+
     function setConnectionUi(isConnected, shortLabel) {
     if (connStatus) {
       connStatus.textContent = isConnected ? "Connected" : "Disconnected";
@@ -551,7 +605,68 @@ function queueJson(obj) {
     return generated;
   }
 
+  async function authorizePhoneJoin({ deviceName, joinCode, deviceId }) {
+    const res = await fetch("/api/phone/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_name: deviceName,
+        join_code: joinCode,
+        device_id: deviceId
+      })
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok || !payload?.ok) {
+      throw new Error(formatAuthError(payload?.error || "authorization_failed"));
+    }
+    return {
+      joinToken: String(payload.join_token || ""),
+      expiresAtMs: Number(payload.expires_at_ms || 0),
+      deviceName: String(payload.device_name || deviceName),
+      deviceId: String(payload.device_id || deviceId || runConfig.device_id)
+    };
+  }
+
+  async function reconnectWithAuth() {
+    if (!started) return;
+    const deviceName = sanitizeDeviceNameInput(deviceNameInput?.value || authState?.deviceName);
+    const joinCode = normalizeJoinCode(joinCodeInput?.value);
+    if (!deviceName || !joinCode) {
+      setJoinStatus("Enter a device name and join code");
+      return;
+    }
+    setJoinStatus("Authorizing...");
+    try {
+      authState = await authorizePhoneJoin({ deviceName, joinCode, deviceId: runConfig.device_id });
+      runConfig.device_id = authState.deviceId;
+      renderDeviceId();
+      setJoinStatus(`Authorized as ${authState.deviceName}`);
+      persistJoinFields(deviceName, joinCode);
+      wsClient?.reconnect();
+      setConnectionUi(false, "Connecting...");
+    } catch (err) {
+      setJoinStatus(String(err?.message || "Authorization failed"));
+    }
+  }
+
+  function normalizeJoinCode(value) {
+    return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  }
+
+  function sanitizeDeviceNameInput(value) {
+    return String(value || "").trim().replace(/\s+/g, " ").slice(0, 40);
+  }
+
+  function formatAuthError(code) {
+    if (code === "device_name_required") return "Device name is required";
+    if (code === "join_code_required") return "Join code is required";
+    if (code === "invalid_join_code") return "Join code was rejected";
+    return "Authorization failed";
+  }
+
     function resolveDeviceName() {
+    const manual = sanitizeDeviceNameInput(deviceNameInput?.value);
+    if (manual) return manual;
     const model = navigator.platform || "iPhone";
     const short = String(runConfig.device_id || "node").slice(0, 8);
     return `${model}-${short}`;
@@ -695,15 +810,7 @@ function mergeRunConfig(input) {
       }
     }
   }
-
-  connectWs();
 })();
-
-
-
-
-
-
 
 
 

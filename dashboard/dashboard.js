@@ -64,6 +64,7 @@ const store = createStore({
   statesByDevice: {},
   runConfigsByDevice: {},
   sessionConfig: clone(DEFAULT_RUN_CONFIG),
+  sessionJoinCode: "",
   sessionState: "draft",
   recording: { active: false, phase: "IDLE", mode: "focused", session_id: null, session_dir: null, started_at_utc_ms: null, elapsed_sec: 0, devices_recording: 0, devices_online: 0 },
   recordByDevice: {},
@@ -494,6 +495,7 @@ function connectWs() {
       const st = store.getState();
       store.setState({
         sessionConfig: mergeRunConfig(msg.sessionConfig || st.sessionConfig || DEFAULT_RUN_CONFIG),
+        sessionJoinCode: String(msg.joinCode || st.sessionJoinCode || ""),
         sessionState: msg.sessionState || (st.recording?.active ? "active" : "draft")
       });
       return;
@@ -1159,7 +1161,6 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_KEY, theme);
   els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
 }
-
 
 
 

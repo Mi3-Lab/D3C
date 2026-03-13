@@ -19,7 +19,20 @@
         <button id="phoneThemeToggleBtn" class="btn btn-alt">Dark Mode</button>
       </div>
     </div>
-    <p class="muted">Tap Start once to grant permissions and begin live streaming.</p>
+    <p class="muted">Enter your device name and join code, then tap Start to grant permissions and begin live streaming.</p>
+
+    <section class="card phone-join-card">
+      <h2>Join Session</h2>
+      <div class="phone-join-grid">
+        <label>Device Name
+          <input id="deviceNameInput" type="text" maxlength="40" placeholder="e.g. Alex iPhone" />
+        </label>
+        <label>Join Code
+          <input id="joinCodeInput" type="text" maxlength="12" placeholder="e.g. A1B2C3" />
+        </label>
+      </div>
+      <div id="joinStatus" class="muted mono phone-join-status">Waiting for join details</div>
+    </section>
 
     <section class="status-bar phone-status-bar">
       <div id="phoneConnCard" class="status-signal is-bad">

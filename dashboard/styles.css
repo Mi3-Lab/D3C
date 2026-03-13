@@ -713,6 +713,20 @@ th {
   font-weight: 600;
 }
 
+.phone-join-card {
+  margin-bottom: 14px;
+}
+
+.phone-join-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.phone-join-status {
+  margin-top: 8px;
+}
+
 .phone-hidden-status {
   display: none;
 }
@@ -1009,6 +1023,12 @@ th {
 
 .session-section-body label select {
   margin-top: 6px;
+}
+
+.session-info-line {
+  grid-column: 1 / -1;
+  font-size: 0.82rem;
+  padding: 2px 4px;
 }
 
 @media (max-width: 1100px) {

@@ -187,10 +187,11 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         content.append(summary, recRow, form);
 
         let lastFormKey = "";
-        const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState }), () => {
+        const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode }), () => {
           const st = store.getState();
           const cfg = mergeRunConfig(st.sessionConfig || defaultRunConfig);
           const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
+          const joinCode = String(st.sessionJoinCode || "");
 
           const online = (st.deviceList || []).filter((d) => d?.connected !== false).length;
           const estimates = computeSessionEstimates(cfg);
@@ -198,6 +199,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
           summary.innerHTML = "";
           kv(summary, "Session State", isActive ? "Active" : "Draft");
           kv(summary, "Devices Online", String(online));
+          kv(summary, "Join Code", joinCode || "Not set");
           kv(summary, "Bandwidth Estimate", `${estimates.bandwidthMbps.toFixed(2)} Mbps/device`);
           kv(summary, "Storage Estimate", `${estimates.storageMbPerMin.toFixed(1)} MB/min/device`);
 
@@ -220,12 +222,17 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             audio_enabled: !!cfg.streams.audio.enabled,
             audio_rate: Number(cfg.streams.audio.rate_hz || 10),
             gps_enabled: !!cfg.streams.gps.enabled,
-            gps_rate: Number(cfg.streams.gps.rate_hz || 1)
+            gps_rate: Number(cfg.streams.gps.rate_hz || 1),
+            join_code: joinCode
           });
           if (formKey === lastFormKey) return;
           lastFormKey = formKey;
 
           form.innerHTML = "";
+
+          const authBody = addFormSection(form, "Phone Access");
+          addTextInput(authBody, "Join code", joinCode, (v) => updateJoinCode(v), isActive, "e.g. A1B2C3");
+          addInfoLine(authBody, "Phones must enter this code before they can join.");
 
           const imuBody = addFormSection(form, "IMU");
           addToggle(imuBody, "Enable IMU", cfg.streams.imu.enabled, (v) => updateSessionCfg(cfg, (c) => {
@@ -276,6 +283,15 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
           mutator(next);
           store.setState({ sessionConfig: next, sessionState: "draft" });
           sendJson({ type: "session_config_update", sessionConfig: next });
+        }
+
+        function updateJoinCode(value) {
+          const st = store.getState();
+          const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
+          if (isActive) return;
+          const next = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+          store.setState({ sessionJoinCode: next });
+          sendJson({ type: "session_auth_update", joinCode: next });
         }
 
         return () => unsub();
@@ -945,7 +961,29 @@ function addSelect(parent, label, value, options, onChange, disabled = false) {
   parent.appendChild(wrap);
 }
 
+function addTextInput(parent, label, value, onChange, disabled = false, placeholder = "") {
+  const wrap = document.createElement("label");
+  wrap.textContent = label;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = String(value || "");
+  input.placeholder = placeholder;
+  input.disabled = !!disabled;
+  input.maxLength = 12;
+  input.addEventListener("change", () => {
+    input.value = String(input.value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    onChange(input.value);
+  });
+  wrap.appendChild(input);
+  parent.appendChild(wrap);
+}
 
+function addInfoLine(parent, text) {
+  const line = document.createElement("div");
+  line.className = "session-info-line muted";
+  line.textContent = text;
+  parent.appendChild(line);
+}
 
 
 

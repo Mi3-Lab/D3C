@@ -3,6 +3,7 @@ const path = require("path");
 const http = require("http");
 const https = require("https");
 const os = require("os");
+const crypto = require("crypto");
 const express = require("express");
 const { WebSocketServer, WebSocket } = require("ws");
 const { DEFAULT_RUN_CONFIG, STATE_BROADCAST_HZ, DATASETS_ROOT } = require("./config");
@@ -10,6 +11,11 @@ const { sanitizeRunConfig, WS_ROLES } = require("./shared/schema");
 const { MotionState } = require("./compute/motion_state");
 const { SyncTracker } = require("./compute/sync_tracker");
 const { SessionManager } = require("./session/session_manager");
+
+const AUTH_STATE_PATH = path.join(process.cwd(), "fleet-server", "auth_state.json");
+const PHONE_JOIN_TOKEN_TTL_MS = 5 * 60 * 1000;
+const AUTH_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_RATE_LIMIT_MAX_ATTEMPTS = 10;
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -26,6 +32,40 @@ app.use("/sessions", express.static(DATASETS_ROOT));
 app.get("/phone", (_req, res) => res.sendFile(path.join(process.cwd(), "client-mobile", "phone.html")));
 app.get("/dashboard", (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.post("/api/phone/auth", express.json(), (req, res) => {
+  pruneAuthRateLimit();
+  prunePhoneAuthTokens();
+  const clientIp = getClientIp(req);
+  const rateState = registerAuthAttempt(clientIp);
+  if (rateState.blocked) {
+    return res.status(429).json({
+      ok: false,
+      error: "rate_limited",
+      retry_after_sec: Math.max(1, Math.ceil((rateState.retry_at_ms - Date.now()) / 1000))
+    });
+  }
+  const joinCode = normalizeJoinCode(req.body?.join_code);
+  const deviceName = sanitizeDeviceName(req.body?.device_name);
+  const requestedDeviceId = sanitizeDeviceId(String(req.body?.device_id || "").trim());
+  if (!deviceName) return res.status(400).json({ ok: false, error: "device_name_required" });
+  if (!joinCode) return res.status(400).json({ ok: false, error: "join_code_required" });
+  if (joinCode !== sessionAuth.joinCode) return res.status(403).json({ ok: false, error: "invalid_join_code" });
+  const deviceId = requestedDeviceId || `iphone-${crypto.randomBytes(3).toString("hex")}`;
+  const joinToken = crypto.randomBytes(24).toString("hex");
+  const expiresAtMs = Date.now() + PHONE_JOIN_TOKEN_TTL_MS;
+  phoneAuthTokens.set(joinToken, {
+    device_id: deviceId,
+    device_name: deviceName,
+    expires_at_ms: expiresAtMs
+  });
+  res.json({
+    ok: true,
+    join_token: joinToken,
+    expires_at_ms: expiresAtMs,
+    device_id: deviceId,
+    device_name: deviceName
+  });
+});
 app.get("/latest.jpg", (req, res) => {
   const deviceId = typeof req.query.device_id === "string" ? req.query.device_id : focusedDeviceId;
   if (!deviceId || !devices.has(deviceId)) return res.status(404).send("No frame");
@@ -163,6 +203,9 @@ const pendingCameraHeaderBySocket = new Map(); // ws -> header
 
 let focusedDeviceId = null;
 let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
+const sessionAuth = loadAuthState();
+const phoneAuthTokens = new Map();
+const phoneAuthRateLimit = new Map();
 const connectionStats = { sockets_connected: 0, sockets_closed: 0, phones_connected: 0, phones_disconnected: 0, dashboards_connected: 0, dashboards_disconnected: 0 };
 
 const recording = {
@@ -226,6 +269,8 @@ wss.on("connection", (ws) => {
 });
 
 setInterval(() => {
+  pruneAuthRateLimit();
+  prunePhoneAuthTokens();
   for (const [id, d] of devices.entries()) {
     const expectedImu = d.config.streams.imu.enabled ? d.config.streams.imu.rate_hz : 0;
     const expectedCam = d.config.streams.camera.mode === "stream" ? d.config.streams.camera.fps : 0;
@@ -307,7 +352,7 @@ function handleHello(ws, msg) {
     dashboardSockets.add(ws);
     sendWs(ws, { type: "device_list", devices: deviceSummaries() });
     sendWs(ws, { type: "focus", focused_device_id: focusedDeviceId });
-    sendWs(ws, { type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    sendWs(ws, buildSessionConfigPayload());
     if (focusedDeviceId && devices.has(focusedDeviceId)) {
       sendWs(ws, { type: "config", device_id: focusedDeviceId, runConfig: devices.get(focusedDeviceId).config });
     }
@@ -318,7 +363,13 @@ function handleHello(ws, msg) {
     return;
   }
 
-  const requested = String(msg.deviceId || msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
+  const authGrant = validatePhoneAuthGrant(msg.join_token);
+  if (!authGrant) {
+    sendWs(ws, { type: "auth_required", error: "invalid_or_expired_join_token" }, { critical: true });
+    try { ws.close(4401, "unauthorized"); } catch {}
+    return;
+  }
+  const requested = authGrant.device_id || String(msg.deviceId || msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
   const { assigned, reused, renamed } = resolvePhoneDeviceId(requested, ws);
   const unique = assigned;
   ws.device_id = unique;
@@ -333,7 +384,7 @@ function handleHello(ws, msg) {
   existing.connectedAt = Date.now();
   existing.lastSeenTs = Date.now();
   existing.user_agent = msg.user_agent || null;
-  existing.device_name = typeof msg.deviceName === "string" ? msg.deviceName : (existing.device_name || unique);
+  existing.device_name = authGrant.device_name || existing.device_name || unique;
   existing.capabilities = msg.capabilities && typeof msg.capabilities === "object"
     ? { ...msg.capabilities }
     : (existing.capabilities || {});
@@ -347,6 +398,7 @@ function handleHello(ws, msg) {
   sendWs(ws, {
     type: "hello_ack",
     device_id: unique,
+    device_name: existing.device_name,
     renamed_from: renamed ? requested : null,
     reused_device_id: !!reused
   });
@@ -603,7 +655,7 @@ function handleDashboardJson(ws, msg) {
     const id = String(msg.device_id || "");
     if (devices.has(id)) focusedDeviceId = id;
     sendWs(ws, { type: "focus", focused_device_id: focusedDeviceId });
-    sendWs(ws, { type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    sendWs(ws, buildSessionConfigPayload());
     if (focusedDeviceId && devices.has(focusedDeviceId)) {
       sendWs(ws, {
         type: "config",
@@ -629,8 +681,26 @@ function handleDashboardJson(ws, msg) {
       sessionManager.updateDeviceConfig(id, d.config);
       sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
     }
-    broadcastToDashboards({ type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    broadcastToDashboards(buildSessionConfigPayload());
     broadcastState();
+    return;
+  }
+
+  if (msg.type === "session_auth_update") {
+    const nextJoinCode = normalizeJoinCode(msg.joinCode);
+    if (recording.active && msg.force !== true) {
+      sendWs(ws, { type: "session_auth_rejected", reason: "session_active", sessionState: "active" });
+      return;
+    }
+    if (!nextJoinCode || nextJoinCode.length < 4) {
+      sendWs(ws, { type: "session_auth_rejected", reason: "invalid_join_code", sessionState: recording.active ? "active" : "draft" });
+      return;
+    }
+    sessionAuth.joinCode = nextJoinCode;
+    sessionAuth.updated_at_ms = Date.now();
+    phoneAuthTokens.clear();
+    persistAuthState(sessionAuth);
+    broadcastToDashboards(buildSessionConfigPayload());
     return;
   }
 
@@ -646,7 +716,7 @@ function handleDashboardJson(ws, msg) {
       sessionManager.updateDeviceConfig(id, d.config);
       sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
     }
-    broadcastToDashboards({ type: "session_config", sessionConfig, sessionState: recording.active ? "active" : "draft" });
+    broadcastToDashboards(buildSessionConfigPayload());
     broadcastState();
     return;
   }
@@ -1161,6 +1231,111 @@ function broadcastToDashboards(payload) {
   }
 }
 
+function buildSessionConfigPayload() {
+  return {
+    type: "session_config",
+    sessionConfig,
+    sessionState: recording.active ? "active" : "draft",
+    joinCode: sessionAuth.joinCode
+  };
+}
+
+function createJoinCode() {
+  return crypto.randomBytes(3).toString("hex").toUpperCase();
+}
+
+function loadAuthState() {
+  try {
+    if (fs.existsSync(AUTH_STATE_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(AUTH_STATE_PATH, "utf8"));
+      const joinCode = normalizeJoinCode(parsed?.joinCode);
+      if (joinCode) {
+        return {
+          joinCode,
+          updated_at_ms: Number(parsed?.updated_at_ms || Date.now())
+        };
+      }
+    }
+  } catch {}
+  const state = { joinCode: createJoinCode(), updated_at_ms: Date.now() };
+  persistAuthState(state);
+  return state;
+}
+
+function persistAuthState(state) {
+  try {
+    fs.mkdirSync(path.dirname(AUTH_STATE_PATH), { recursive: true });
+    fs.writeFileSync(AUTH_STATE_PATH, JSON.stringify({
+      joinCode: normalizeJoinCode(state?.joinCode),
+      updated_at_ms: Number(state?.updated_at_ms || Date.now())
+    }, null, 2), "utf8");
+  } catch {}
+}
+
+function normalizeJoinCode(value) {
+  const normalized = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return normalized || "";
+}
+
+function sanitizeDeviceName(value) {
+  const trimmed = String(value || "").trim().replace(/\s+/g, " ");
+  if (!trimmed) return "";
+  return trimmed.slice(0, 40);
+}
+
+function prunePhoneAuthTokens() {
+  const now = Date.now();
+  for (const [token, grant] of phoneAuthTokens.entries()) {
+    if (!grant || Number(grant.expires_at_ms || 0) <= now) {
+      phoneAuthTokens.delete(token);
+    }
+  }
+}
+
+function validatePhoneAuthGrant(token) {
+  if (typeof token !== "string" || !token) return null;
+  const grant = phoneAuthTokens.get(token);
+  if (!grant) return null;
+  if (Number(grant.expires_at_ms || 0) <= Date.now()) {
+    phoneAuthTokens.delete(token);
+    return null;
+  }
+  return grant;
+}
+
+function getClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || String(req.socket?.remoteAddress || "unknown");
+}
+
+function registerAuthAttempt(clientIp) {
+  const now = Date.now();
+  const key = String(clientIp || "unknown");
+  const existing = phoneAuthRateLimit.get(key);
+  if (!existing || now >= existing.window_start_ms + AUTH_RATE_LIMIT_WINDOW_MS) {
+    const fresh = { window_start_ms: now, attempts: 1, retry_at_ms: now + AUTH_RATE_LIMIT_WINDOW_MS };
+    phoneAuthRateLimit.set(key, fresh);
+    return { blocked: false, ...fresh };
+  }
+  existing.attempts += 1;
+  existing.retry_at_ms = existing.window_start_ms + AUTH_RATE_LIMIT_WINDOW_MS;
+  if (existing.attempts > AUTH_RATE_LIMIT_MAX_ATTEMPTS) {
+    phoneAuthRateLimit.set(key, existing);
+    return { blocked: true, ...existing };
+  }
+  phoneAuthRateLimit.set(key, existing);
+  return { blocked: false, ...existing };
+}
+
+function pruneAuthRateLimit() {
+  const now = Date.now();
+  for (const [key, value] of phoneAuthRateLimit.entries()) {
+    if (!value || now >= Number(value.window_start_ms || 0) + AUTH_RATE_LIMIT_WINDOW_MS) {
+      phoneAuthRateLimit.delete(key);
+    }
+  }
+}
+
 function parseArgs(argv) {
   const out = { port: 3000, cert: null, key: null, host: "0.0.0.0", lanIp: "" };
   for (let i = 0; i < argv.length; i += 1) {
@@ -1470,14 +1645,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
-
-
-
-
-
-
 
 
 

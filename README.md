@@ -66,6 +66,8 @@ d3c/
 ### Session-level controls (global)
 
 - `Session Setup` is global for the fleet session.
+- `Phone Access` includes a join code that phones must enter before they can connect.
+- Join code is persisted across server restarts in `fleet-server/auth_state.json`.
 - Camera/IMU/Audio toggles and rates are applied to all connected devices via server broadcast.
 - Session state is `draft` or `active`.
 - While active, config controls are locked and Start/Stop button states are enforced:
@@ -190,6 +192,12 @@ Browsers may show warnings with self-signed certs.
 node fleet-server\index.js --cert certs\cert.pem --key certs\key.pem --port 8443
 ```
 
+For local desktop-only testing without HTTPS:
+
+```powershell
+node fleet-server\index.js --port 8443
+```
+
 If `node` is not in PATH:
 
 ```powershell
@@ -202,6 +210,18 @@ If `node` is not in PATH:
 - Mobile node page: `https://<laptop-ip>:8443/phone`
 - Explicit node ID: `https://<laptop-ip>:8443/phone?device_id=iphone-AB12`
 - WebSocket endpoint: `wss://<host>:8443/ws`
+
+If you run without certs for local testing, use `http://` and `ws://` instead.
+
+## Phone Join Flow
+
+- Open the dashboard and check `Session Setup` -> `Phone Access` for the current join code.
+- On the phone page, enter:
+  - `Device Name`
+  - `Join Code`
+- Tap `Start`.
+- Phone auth uses a short-lived join token after the code is validated.
+- `POST /api/phone/auth` is rate-limited per client IP to slow repeated guess attempts.
 
 ## Dataset APIs
 
@@ -338,7 +358,6 @@ Key fields:
   - set FFmpeg path if needed:
     - `$env:FFMPEG_BIN = "C:\path\to\ffmpeg.exe"`
   - confirm `streams.camera.auto_mp4_on_stop` is `true` and camera mode is `stream` during recording
-
 
 
 
