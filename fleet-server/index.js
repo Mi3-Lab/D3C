@@ -18,6 +18,10 @@ const AUTH_STATE_PATH = process.env.AUTH_STATE_PATH
 const PHONE_JOIN_TOKEN_TTL_MS = 5 * 60 * 1000;
 const AUTH_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const AUTH_RATE_LIMIT_MAX_ATTEMPTS = 10;
+const DASHBOARD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DASHBOARD_AUTH_COOKIE = "d3c_dashboard_auth";
+const DASHBOARD_PASSWORD = String(process.env.DASHBOARD_PASSWORD || "");
+const DASHBOARD_AUTH_ENABLED = DASHBOARD_PASSWORD.trim().length > 0;
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -28,12 +32,38 @@ if ((args.cert && !args.key) || (!args.cert && args.key)) {
 
 const app = express();
 app.use(express.static(path.join(process.cwd(), "client-mobile")));
-app.use(express.static(path.join(process.cwd(), "dashboard")));
-app.use("/datasets", express.static(DATASETS_ROOT));
-app.use("/sessions", express.static(DATASETS_ROOT));
 app.get("/phone", (_req, res) => res.sendFile(path.join(process.cwd(), "client-mobile", "phone.html")));
-app.get("/dashboard", (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/styles.css", (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "styles.css")));
+app.get("/dashboard/login", (req, res) => {
+  if (isDashboardRequestAuthorized(req)) {
+    return res.redirect(302, "/dashboard");
+  }
+  res.type("html").send(buildDashboardLoginPage(getDashboardRedirectTarget(req.query.next)));
+});
+app.post("/api/dashboard/login", express.json(), (req, res) => {
+  if (!DASHBOARD_AUTH_ENABLED) return res.json({ ok: true, auth_enabled: false });
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!verifyDashboardPassword(password)) {
+    return res.status(401).json({ ok: false, error: "invalid_dashboard_password" });
+  }
+  const token = createDashboardSession();
+  setDashboardAuthCookie(res, token);
+  res.json({ ok: true, auth_enabled: true });
+});
+app.post("/api/dashboard/logout", (req, res) => {
+  const token = getDashboardAuthToken(req);
+  if (token) dashboardSessions.delete(token);
+  clearDashboardAuthCookie(res);
+  res.json({ ok: true });
+});
+app.use("/datasets", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
+app.use("/sessions", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
+app.get("/dashboard", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
+app.get("/dashboard.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.js")));
+app.get("/layouts.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "layouts.js")));
+app.get("/store.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "store.js")));
+app.get("/widgets.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "widgets.js")));
 app.post("/api/phone/auth", express.json(), (req, res) => {
   pruneAuthRateLimit();
   prunePhoneAuthTokens();
@@ -68,7 +98,7 @@ app.post("/api/phone/auth", express.json(), (req, res) => {
     device_name: deviceName
   });
 });
-app.get("/latest.jpg", (req, res) => {
+app.get("/latest.jpg", requireDashboardAuth("api"), (req, res) => {
   const deviceId = typeof req.query.device_id === "string" ? req.query.device_id : focusedDeviceId;
   if (!deviceId || !devices.has(deviceId)) return res.status(404).send("No frame");
   const d = devices.get(deviceId);
@@ -84,7 +114,7 @@ app.all("/api/sessions*", (req, res) => {
   res.redirect(307, target);
 });
 
-app.get("/api/datasets", (_req, res) => {
+app.get("/api/datasets", requireDashboardAuth("api"), (_req, res) => {
   try {
     if (!fs.existsSync(DATASETS_ROOT)) return res.json({ sessions: [] });
     const sessions = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
@@ -97,7 +127,7 @@ app.get("/api/datasets", (_req, res) => {
     res.status(500).json({ sessions: [] });
   }
 });
-app.get("/api/storage", (_req, res) => {
+app.get("/api/storage", requireDashboardAuth("api"), (_req, res) => {
   try {
     const sessionsSize = dirSizeBytes(DATASETS_ROOT);
     const freeBytes = getDiskFreeBytes(process.cwd());
@@ -114,7 +144,7 @@ app.get("/api/storage", (_req, res) => {
     res.status(500).json({ error: "storage query failed" });
   }
 });
-app.post("/api/datasets/:id/encode", express.json(), async (req, res) => {
+app.post("/api/datasets/:id/encode", requireDashboardAuth("api"), express.json(), async (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
   const root = path.join(DATASETS_ROOT, id);
@@ -134,7 +164,7 @@ app.post("/api/datasets/:id/encode", express.json(), async (req, res) => {
   if (!result.ok) return res.status(500).json(result);
   res.json(result);
 });
-app.delete("/api/datasets/:id", (req, res) => {
+app.delete("/api/datasets/:id", requireDashboardAuth("api"), (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
   const root = path.join(DATASETS_ROOT, id);
@@ -147,7 +177,7 @@ app.delete("/api/datasets/:id", (req, res) => {
   }
 });
 
-app.get("/api/datasets/:id/manifest", (req, res) => {
+app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
   const root = path.join(DATASETS_ROOT, id);
@@ -202,6 +232,7 @@ const sessionManager = new SessionManager();
 const devices = new Map(); // device_id -> device entry
 const dashboardSockets = new Set();
 const pendingCameraHeaderBySocket = new Map(); // ws -> header
+const dashboardSessions = new Map();
 
 let focusedDeviceId = null;
 let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
@@ -222,11 +253,12 @@ const recording = {
   stop_requested_at_ms: null
 };
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   connectionStats.sockets_connected += 1;
   console.log("[ws] socket connected", { sockets_connected: connectionStats.sockets_connected, sockets_closed: connectionStats.sockets_closed });
   ws.role = null;
   ws.device_id = null;
+  ws.dashboardAuthorized = isDashboardRequestAuthorized(req);
 
   ws.on("message", (data, isBinary) => {
     if (isBinary) {
@@ -342,9 +374,14 @@ server.listen(args.port, args.host, () => {
 
 function handleHello(ws, msg) {
   if (!WS_ROLES.includes(msg.role)) return;
-  ws.role = msg.role;
 
-  if (ws.role === "dashboard") {
+  if (msg.role === "dashboard") {
+    if (DASHBOARD_AUTH_ENABLED && !ws.dashboardAuthorized) {
+      sendWs(ws, { type: "auth_required", error: "dashboard_auth_required" }, { critical: true });
+      try { ws.close(4401, "unauthorized"); } catch {}
+      return;
+    }
+    ws.role = "dashboard";
     ws.client_id = `dash_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     connectionStats.dashboards_connected += 1;
     console.log("[ws] dashboard registered", {
@@ -365,6 +402,7 @@ function handleHello(ws, msg) {
     return;
   }
 
+  ws.role = "phone";
   const authGrant = validatePhoneAuthGrant(msg.join_token);
   if (!authGrant) {
     sendWs(ws, { type: "auth_required", error: "invalid_or_expired_join_token" }, { critical: true });
@@ -1242,6 +1280,164 @@ function buildSessionConfigPayload() {
   };
 }
 
+function requireDashboardAuth(mode = "api") {
+  return (req, res, next) => {
+    if (!DASHBOARD_AUTH_ENABLED) return next();
+    if (isDashboardRequestAuthorized(req)) return next();
+    if (mode === "page") {
+      return res.redirect(302, `/dashboard/login?next=${encodeURIComponent(req.originalUrl || "/dashboard")}`);
+    }
+    res.status(401).json({ ok: false, error: "dashboard_auth_required" });
+  };
+}
+
+function verifyDashboardPassword(password) {
+  const input = Buffer.from(String(password || ""), "utf8");
+  const expected = Buffer.from(DASHBOARD_PASSWORD, "utf8");
+  if (input.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(input, expected);
+  } catch {
+    return false;
+  }
+}
+
+function createDashboardSession() {
+  pruneDashboardSessions();
+  const token = crypto.randomBytes(32).toString("hex");
+  dashboardSessions.set(token, { expires_at_ms: Date.now() + DASHBOARD_SESSION_TTL_MS });
+  return token;
+}
+
+function pruneDashboardSessions() {
+  const now = Date.now();
+  for (const [token, session] of dashboardSessions.entries()) {
+    if (!session || Number(session.expires_at_ms || 0) <= now) {
+      dashboardSessions.delete(token);
+    }
+  }
+}
+
+function parseCookies(req) {
+  const raw = String(req?.headers?.cookie || "");
+  const out = {};
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (!key) continue;
+    out[key] = decodeURIComponent(value);
+  }
+  return out;
+}
+
+function getDashboardAuthToken(req) {
+  const cookies = parseCookies(req);
+  const token = cookies[DASHBOARD_AUTH_COOKIE];
+  return typeof token === "string" && token ? token : null;
+}
+
+function isDashboardRequestAuthorized(req) {
+  if (!DASHBOARD_AUTH_ENABLED) return true;
+  pruneDashboardSessions();
+  const token = getDashboardAuthToken(req);
+  if (!token) return false;
+  const session = dashboardSessions.get(token);
+  if (!session) return false;
+  if (Number(session.expires_at_ms || 0) <= Date.now()) {
+    dashboardSessions.delete(token);
+    return false;
+  }
+  session.expires_at_ms = Date.now() + DASHBOARD_SESSION_TTL_MS;
+  dashboardSessions.set(token, session);
+  return true;
+}
+
+function setDashboardAuthCookie(res, token) {
+  const parts = [
+    `${DASHBOARD_AUTH_COOKIE}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${Math.floor(DASHBOARD_SESSION_TTL_MS / 1000)}`
+  ];
+  if (useHttps) parts.push("Secure");
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function clearDashboardAuthCookie(res) {
+  const parts = [
+    `${DASHBOARD_AUTH_COOKIE}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0"
+  ];
+  if (useHttps) parts.push("Secure");
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function getDashboardRedirectTarget(raw) {
+  const target = typeof raw === "string" ? raw : "/dashboard";
+  if (!target.startsWith("/")) return "/dashboard";
+  if (target.startsWith("//")) return "/dashboard";
+  return target;
+}
+
+function buildDashboardLoginPage(nextPath) {
+  const escapedNext = JSON.stringify(nextPath);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>D3C / Dashboard Login</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="dash-wrap">
+    <section class="card" style="max-width: 28rem; margin: 4rem auto;">
+      <h1>D3C Dashboard Login</h1>
+      <form id="loginForm" class="toolbar-row" style="display:block;">
+        <label>Dashboard Password
+          <input id="passwordInput" type="password" autocomplete="current-password" />
+        </label>
+        <button class="btn" type="submit" style="margin-top: 1rem;">Sign In</button>
+        <div id="loginStatus" class="muted mono" style="margin-top: 0.75rem;"></div>
+      </form>
+    </section>
+  </main>
+  <script>
+    const nextPath = ${escapedNext};
+    const form = document.getElementById("loginForm");
+    const passwordInput = document.getElementById("passwordInput");
+    const loginStatus = document.getElementById("loginStatus");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      loginStatus.textContent = "Signing in...";
+      try {
+        const res = await fetch("/api/dashboard/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: passwordInput.value })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          loginStatus.textContent = "Invalid password";
+          return;
+        }
+        location.assign(nextPath);
+      } catch {
+        loginStatus.textContent = "Login failed";
+      }
+    });
+    passwordInput.focus();
+  </script>
+</body>
+</html>`;
+}
+
 function createJoinCode() {
   return crypto.randomBytes(3).toString("hex").toUpperCase();
 }
@@ -1647,10 +1843,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
-
-
 
 
 

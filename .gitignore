@@ -239,6 +239,7 @@ tmp/
 node_modules/
 coverage/
 .nyc_output/
+.local/
 
 # Editor / OS
 .vscode/

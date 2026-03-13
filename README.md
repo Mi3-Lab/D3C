@@ -98,6 +98,13 @@ Supported flags:
 - `--host <addr>`: default `0.0.0.0`
 - `--lan-ip <addr>`: override the LAN IP shown in startup logs
 
+Environment variables:
+
+- `DASHBOARD_PASSWORD`: when set, `/dashboard`, dashboard assets, dashboard WebSocket access, dataset APIs, `/latest.jpg`, and dataset file downloads require dashboard login
+- `AUTH_STATE_PATH`: override persisted join-code state path
+- `DATASETS_ROOT`: override dataset output root
+- `FFMPEG_BIN`: override the ffmpeg binary used for MP4 encoding
+
 ## Open
 
 With HTTP on port `3000`:
@@ -113,6 +120,14 @@ With HTTPS on port `8443`:
 - Phone client: `https://<laptop-ip>:8443/phone`
 - Health check: `https://localhost:8443/health`
 - WebSocket: `wss://<host>:8443/ws`
+
+If `DASHBOARD_PASSWORD` is set, browsing to `/dashboard` redirects to `/dashboard/login` until you sign in. `/phone` stays public.
+
+Quick Tunnel example with dashboard auth enabled:
+
+```bash
+DASHBOARD_PASSWORD='replace-with-a-strong-password' ./scripts/start-quick-tunnel.sh
+```
 
 ## Phone Join Flow
 

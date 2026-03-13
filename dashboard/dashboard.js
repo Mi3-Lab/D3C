@@ -20,6 +20,7 @@ const DEFAULT_RUN_CONFIG = {
 
 const els = {
   themeToggleBtn: document.getElementById("themeToggleBtn"),
+  logoutBtn: document.getElementById("logoutBtn"),
   statusConn: document.getElementById("statusConn"),
   statusRec: document.getElementById("statusRec"),
   statusDevices: document.getElementById("statusDevices"),
@@ -445,6 +446,13 @@ function bindTopUi() {
     });
     renderDashboard();
   });
+
+  els.logoutBtn?.addEventListener("click", async () => {
+    try {
+      await fetch("/api/dashboard/logout", { method: "POST" });
+    } catch {}
+    window.location.assign("/dashboard/login");
+  });
 }
 
 function connectWs() {
@@ -462,6 +470,11 @@ function connectWs() {
     let msg = null;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (!msg) return;
+
+    if (msg.type === "auth_required") {
+      window.location.assign(`/dashboard/login?next=${encodeURIComponent(location.pathname + location.search)}`);
+      return;
+    }
 
     if (msg.type === "device_list") {
       const st = store.getState();
@@ -1149,7 +1162,8 @@ function sendJson(obj) {
 }
 
 function initTheme() {
-  applyTheme(localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light");
+  const savedTheme = localStorage.getItem(THEME_KEY);
+  applyTheme(savedTheme === "light" ? "light" : "dark");
 }
 
 function toggleTheme() {
@@ -1161,8 +1175,6 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_KEY, theme);
   els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
 }
-
-
 
 
 
