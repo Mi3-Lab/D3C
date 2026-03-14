@@ -15,6 +15,10 @@
   const phoneCameraMode = document.getElementById("phoneCameraMode");
   const phoneAudioCard = document.getElementById("phoneAudioCard");
   const phoneAudioMode = document.getElementById("phoneAudioMode");
+  const phoneReadySummary = document.getElementById("phoneReadySummary");
+  const phoneReadinessList = document.getElementById("phoneReadinessList");
+  const phoneGuidanceList = document.getElementById("phoneGuidanceList");
+  const RECONNECT_KEY_STORAGE = "d3c_phone_reconnect_key";
 
   const DEFAULT_RUN_CONFIG = {
     device_id: resolveDeviceId(),
@@ -41,6 +45,18 @@
   let wsClient = null;
   let ws = null;
   let authState = null;
+  const reconnectKey = resolveReconnectKey();
+  let motionPermissionState = "unknown";
+  let motionEventsSeen = false;
+  let motionWarningTimer = null;
+  let cameraPermissionState = "unknown";
+  let audioPermissionState = "unknown";
+  let gpsPermissionState = "unknown";
+  let reconnectState = "stable";
+  let lastImuEventMs = 0;
+  let lastCameraFrameMs = 0;
+  let lastAudioEventMs = 0;
+  let lastGpsEventMs = 0;
 
   let imuLastSent = 0;
   let cameraStream = null;
@@ -99,6 +115,7 @@
     try {
       authState = await authorizePhoneJoin({ deviceName, joinCode, deviceId: runConfig.device_id });
       runConfig.device_id = authState.deviceId;
+      persistReconnectKey(authState.reconnectKey || reconnectKey);
       renderDeviceId();
       setJoinStatus(`Authorized as ${authState.deviceName}`);
       persistJoinFields(deviceName, joinCode);
@@ -130,6 +147,7 @@
           deviceId: runConfig.device_id,
           deviceName: authState.deviceName,
           join_token: authState.joinToken,
+          reconnect_key: reconnectKey,
           capabilities: resolveCapabilities(),
           user_agent: navigator.userAgent
         });
@@ -145,13 +163,16 @@
         try { msg = JSON.parse(data); } catch { return; }
         if (!msg) return;
         if (msg.type === "hello_ack" && msg.device_id) {
+          reconnectState = msg.renamed_from ? "remapped" : (msg.reused_device_id ? "reused" : "stable");
           runConfig.device_id = String(msg.device_id);
           localStorage.setItem("d3c_phone_device_id", runConfig.device_id);
+          if (msg.reconnect_key) persistReconnectKey(String(msg.reconnect_key));
           if (msg.device_name) {
             authState = { ...(authState || {}), deviceName: String(msg.device_name) };
             if (deviceNameInput) deviceNameInput.value = authState.deviceName;
           }
           renderDeviceId();
+          renderStatus();
           return;
         }
         if (msg.type === "auth_required") {
@@ -198,10 +219,24 @@
   }
 
   async function requestPermissionsAndStart() {
+    motionPermissionState = "unknown";
+    motionEventsSeen = false;
+    clearMotionWarningTimer();
     if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
-      try { await DeviceMotionEvent.requestPermission(); } catch {}
+      try {
+        const permission = await DeviceMotionEvent.requestPermission();
+        motionPermissionState = permission === "granted" ? "granted" : "denied";
+      } catch {
+        motionPermissionState = "error";
+      }
+    } else if (typeof DeviceMotionEvent !== "undefined") {
+      motionPermissionState = "implicit";
+    } else {
+      motionPermissionState = "unsupported";
     }
     window.addEventListener("devicemotion", onDeviceMotion);
+    scheduleMotionWarning();
+    renderStatus();
     if (navigator.getBattery) {
       try { batteryManager = await navigator.getBattery(); } catch {}
     }
@@ -214,12 +249,16 @@
     const mode = runConfig.streams.camera.mode === "preview" ? "stream" : runConfig.streams.camera.mode;
     if (mode === "off") {
       stopCamera();
+      cameraPermissionState = runConfig.streams.camera.record || runConfig.streams.camera.mode !== "off" ? cameraPermissionState : "idle";
     } else {
       if (!cameraStream) {
         try {
           cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+          cameraPermissionState = "granted";
           previewEl.srcObject = cameraStream;
-        } catch {}
+        } catch {
+          cameraPermissionState = "denied";
+        }
       }
       if (mode === "stream") startFrameLoop();
     }
@@ -227,10 +266,21 @@
     applyGpsConfig();
     applyDeviceConfig();
     startHeartbeat();
+    renderStatus();
   }
 
   function onDeviceMotion(ev) {
     if (!started || !runConfig.streams.imu.enabled) return;
+    if (!motionEventsSeen) {
+      motionEventsSeen = true;
+      clearMotionWarningTimer();
+      if (motionPermissionState === "unknown") motionPermissionState = "implicit";
+      renderStatus();
+      if (joinStatus?.textContent === "Waiting for IMU events...") {
+        setJoinStatus(`Connected as ${authState?.deviceName || runConfig.device_id}`);
+      }
+    }
+    lastImuEventMs = Date.now();
     const hz = Math.max(1, Number(runConfig.streams.imu.rate_hz || 30));
     const now = performance.now();
     if (now - imuLastSent < 1000 / hz) return;
@@ -275,6 +325,7 @@
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", q));
       if (!blob) return;
       const buffer = await blob.arrayBuffer();
+      lastCameraFrameMs = Date.now();
       queueJson({
         type: "camera_header",
         device_id: runConfig.device_id,
@@ -322,7 +373,14 @@
       return;
     }
     if (!micStream) {
-      try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); } catch { return; }
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        audioPermissionState = "granted";
+      } catch {
+        audioPermissionState = "denied";
+        renderStatus();
+        return;
+      }
     }
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -365,6 +423,7 @@
         amplitude: Number(peak.toFixed(4)),
         noise_level: Number(Math.sqrt(sum / arr.length).toFixed(4))
       });
+      lastAudioEventMs = Date.now();
     }, Math.floor(1000 / hz));
   }
 
@@ -426,10 +485,12 @@
     if (gpsWatchId != null) return;
     gpsWatchId = navigator.geolocation.watchPosition(
       (pos) => {
+        gpsPermissionState = "granted";
         const hz = Math.max(0.2, Number(runConfig.streams.gps?.rate_hz || 1));
         const now = performance.now();
         if (now - lastGpsSent < 1000 / hz) return;
         lastGpsSent = now;
+        lastGpsEventMs = Date.now();
         queueJson({
           type: "gps",
           device_id: runConfig.device_id,
@@ -442,7 +503,10 @@
           altitude_m: Number(pos.coords?.altitude ?? -1)
         });
       },
-      () => {},
+      () => {
+        gpsPermissionState = "denied";
+        renderStatus();
+      },
       { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
     );
   }
@@ -507,6 +571,8 @@
   function renderStatus() {
     const s = runConfig.streams;
     statusList.innerHTML = "";
+    renderReadiness();
+    renderGuidance();
 
     const imuLabel = s.imu.enabled ? `ON ${s.imu.rate_hz} Hz` : "OFF";
     const camLabel = String(s.camera.mode || "off").toUpperCase();
@@ -514,6 +580,7 @@
 
     const lines = [
       `IMU stream: ${imuLabel}`,
+      `IMU permission: ${describeMotionStatus()}`,
       `Camera: ${camLabel} @ ${s.camera.fps} FPS`,
       `Audio stream: ${audLabel}`,
       `GPS stream: ${s.gps.enabled ? "ON " + s.gps.rate_hz + " Hz" : "OFF"}`,
@@ -530,6 +597,50 @@
     if (phoneAudioMode) phoneAudioMode.textContent = audLabel;
     setSignalState(phoneCameraCard, s.camera.mode === "stream" ? "ok" : "bad");
     setSignalState(phoneAudioCard, s.audio.enabled ? "ok" : "warn");
+  }
+
+  function renderReadiness() {
+    if (!phoneReadinessList || !phoneReadySummary) return;
+    const now = Date.now();
+    const items = [
+      readinessItem("Authorized", !!authState?.joinToken, authState?.joinToken ? "Join token issued" : "Tap Start to authorize"),
+      readinessItem("WebSocket", !!(ws && ws.readyState === WebSocket.OPEN), ws && ws.readyState === WebSocket.OPEN ? "Connected to server" : "Waiting for connection"),
+      readinessItem("Reconnect Identity", reconnectState !== "remapped", reconnectState === "reused" ? "Previous device identity reused" : reconnectState === "remapped" ? "Server assigned a new logical device" : "Stable local identity"),
+      readinessItem("IMU", !runConfig.streams.imu.enabled || motionEventsSeen, !runConfig.streams.imu.enabled ? "Disabled in session config" : motionEventsSeen ? "Motion events flowing" : describeMotionStatus()),
+      readinessItem("Camera", runConfig.streams.camera.mode === "off" || (cameraPermissionState === "granted" && ageFresh(lastCameraFrameMs, now, 6000)), runConfig.streams.camera.mode === "off" ? "Disabled in session config" : cameraPermissionState === "granted" ? (ageFresh(lastCameraFrameMs, now, 6000) ? "Frames streaming" : "Permission granted, waiting for frames") : cameraPermissionState),
+      readinessItem("Audio", !runConfig.streams.audio.enabled || (audioPermissionState === "granted" && ageFresh(lastAudioEventMs, now, 6000)), !runConfig.streams.audio.enabled ? "Disabled in session config" : audioPermissionState === "granted" ? (ageFresh(lastAudioEventMs, now, 6000) ? "Levels streaming" : "Permission granted, waiting for audio") : audioPermissionState),
+      readinessItem("GPS", !runConfig.streams.gps.enabled || (gpsPermissionState === "granted" && ageFresh(lastGpsEventMs, now, 12000)), !runConfig.streams.gps.enabled ? "Disabled in session config" : gpsPermissionState === "granted" ? (ageFresh(lastGpsEventMs, now, 12000) ? "Fix updates flowing" : "Permission granted, waiting for GPS fix") : gpsPermissionState)
+    ];
+
+    const readyCount = items.filter((item) => item.ok).length;
+    phoneReadySummary.textContent = `${readyCount}/${items.length} checks ready`;
+    phoneReadinessList.innerHTML = "";
+    for (const item of items) {
+      const li = document.createElement("li");
+      li.className = `phone-check-item ${item.ok ? "ok" : "warn"}`;
+      li.innerHTML = `<strong>${item.label}</strong><span>${item.detail}</span>`;
+      phoneReadinessList.appendChild(li);
+    }
+  }
+
+  function renderGuidance() {
+    if (!phoneGuidanceList) return;
+    const guidance = [
+      "Use Safari on iPhone if motion sensors do not start.",
+      "Keep this page in the foreground while recording.",
+      "Leave the screen awake and avoid Low Power Mode.",
+      "If reconnect remaps the device, refresh once and reconnect."
+    ];
+    if (motionPermissionState === "denied") guidance.unshift("Motion access is denied. Enable Motion & Orientation access and reload.");
+    if (runConfig.streams.camera.mode !== "off" && cameraPermissionState === "denied") guidance.unshift("Camera access was denied. Allow camera access to stream video.");
+    if (runConfig.streams.audio.enabled && audioPermissionState === "denied") guidance.unshift("Microphone access was denied. Allow microphone access to capture audio.");
+    if (runConfig.streams.gps.enabled && gpsPermissionState === "denied") guidance.unshift("Location access was denied. Allow location access for GPS capture.");
+    phoneGuidanceList.innerHTML = "";
+    for (const line of guidance.slice(0, 5)) {
+      const li = document.createElement("li");
+      li.textContent = line;
+      phoneGuidanceList.appendChild(li);
+    }
   }
 
   function renderDeviceId() {
@@ -605,6 +716,20 @@ function queueJson(obj) {
     return generated;
   }
 
+  function resolveReconnectKey() {
+    const existing = localStorage.getItem(RECONNECT_KEY_STORAGE);
+    if (existing) return existing;
+    const generated = `phone-${createUuidV4()}`;
+    localStorage.setItem(RECONNECT_KEY_STORAGE, generated);
+    return generated;
+  }
+
+  function persistReconnectKey(value) {
+    const normalized = String(value || "").trim();
+    if (!normalized) return;
+    localStorage.setItem(RECONNECT_KEY_STORAGE, normalized);
+  }
+
   async function authorizePhoneJoin({ deviceName, joinCode, deviceId }) {
     const res = await fetch("/api/phone/auth", {
       method: "POST",
@@ -612,7 +737,8 @@ function queueJson(obj) {
       body: JSON.stringify({
         device_name: deviceName,
         join_code: joinCode,
-        device_id: deviceId
+        device_id: deviceId,
+        reconnect_key: reconnectKey
       })
     });
     const payload = await res.json().catch(() => ({}));
@@ -623,7 +749,8 @@ function queueJson(obj) {
       joinToken: String(payload.join_token || ""),
       expiresAtMs: Number(payload.expires_at_ms || 0),
       deviceName: String(payload.device_name || deviceName),
-      deviceId: String(payload.device_id || deviceId || runConfig.device_id)
+      deviceId: String(payload.device_id || deviceId || runConfig.device_id),
+      reconnectKey: String(payload.reconnect_key || reconnectKey)
     };
   }
 
@@ -639,6 +766,7 @@ function queueJson(obj) {
     try {
       authState = await authorizePhoneJoin({ deviceName, joinCode, deviceId: runConfig.device_id });
       runConfig.device_id = authState.deviceId;
+      persistReconnectKey(authState.reconnectKey || reconnectKey);
       renderDeviceId();
       setJoinStatus(`Authorized as ${authState.deviceName}`);
       persistJoinFields(deviceName, joinCode);
@@ -674,7 +802,7 @@ function queueJson(obj) {
 
   function resolveCapabilities() {
     return {
-      imu: true,
+      imu: typeof DeviceMotionEvent !== "undefined",
       camera: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
       audio: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
       gps: !!navigator.geolocation,
@@ -723,8 +851,7 @@ function mergeRunConfig(input) {
       applyTheme(saved);
       return;
     }
-    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    applyTheme(prefersDark ? "dark" : "light");
+    applyTheme("dark");
   }
 
   function toggleTheme() {
@@ -810,14 +937,47 @@ function mergeRunConfig(input) {
       }
     }
   }
+
+  function scheduleMotionWarning() {
+    clearMotionWarningTimer();
+    if (!runConfig.streams.imu.enabled) return;
+    motionWarningTimer = setTimeout(() => {
+      if (motionEventsSeen || !runConfig.streams.imu.enabled) return;
+      renderStatus();
+      if (motionPermissionState === "denied") {
+        setJoinStatus("Motion access denied. Allow Motion & Orientation access and try again.");
+        return;
+      }
+      if (motionPermissionState === "unsupported") {
+        setJoinStatus("This browser is not exposing motion sensors.");
+        return;
+      }
+      setJoinStatus("Waiting for IMU events...");
+    }, 4000);
+  }
+
+  function clearMotionWarningTimer() {
+    if (!motionWarningTimer) return;
+    clearTimeout(motionWarningTimer);
+    motionWarningTimer = null;
+  }
+
+  function describeMotionStatus() {
+    if (!runConfig.streams.imu.enabled) return "OFF";
+    if (motionEventsSeen) return "OK";
+    if (motionPermissionState === "granted") return "granted, waiting";
+    if (motionPermissionState === "implicit") return "waiting";
+    if (motionPermissionState === "denied") return "denied";
+    if (motionPermissionState === "unsupported") return "unsupported";
+    if (motionPermissionState === "error") return "request failed";
+    return "unknown";
+  }
+
+  function readinessItem(label, ok, detail) {
+    return { label, ok: !!ok, detail: String(detail || (ok ? "ready" : "waiting")) };
+  }
+
+  function ageFresh(ts, now, maxAgeMs) {
+    return Number(ts || 0) > 0 && (now - Number(ts || 0)) <= maxAgeMs;
+  }
 })();
-
-
-
-
-
-
-
-
-
-

@@ -79,6 +79,7 @@ app.post("/api/phone/auth", express.json(), (req, res) => {
   const joinCode = normalizeJoinCode(req.body?.join_code);
   const deviceName = sanitizeDeviceName(req.body?.device_name);
   const requestedDeviceId = sanitizeDeviceId(String(req.body?.device_id || "").trim());
+  const reconnectKey = sanitizeReconnectKey(req.body?.reconnect_key);
   if (!deviceName) return res.status(400).json({ ok: false, error: "device_name_required" });
   if (!joinCode) return res.status(400).json({ ok: false, error: "join_code_required" });
   if (joinCode !== sessionAuth.joinCode) return res.status(403).json({ ok: false, error: "invalid_join_code" });
@@ -88,6 +89,7 @@ app.post("/api/phone/auth", express.json(), (req, res) => {
   phoneAuthTokens.set(joinToken, {
     device_id: deviceId,
     device_name: deviceName,
+    reconnect_key: reconnectKey,
     expires_at_ms: expiresAtMs
   });
   res.json({
@@ -95,7 +97,8 @@ app.post("/api/phone/auth", express.json(), (req, res) => {
     join_token: joinToken,
     expires_at_ms: expiresAtMs,
     device_id: deviceId,
-    device_name: deviceName
+    device_name: deviceName,
+    reconnect_key: reconnectKey || null
   });
 });
 app.get("/latest.jpg", requireDashboardAuth("api"), (req, res) => {
@@ -410,7 +413,12 @@ function handleHello(ws, msg) {
     return;
   }
   const requested = authGrant.device_id || String(msg.deviceId || msg.device_id || "").trim() || `iphone-${Math.random().toString(36).slice(2, 6)}`;
-  const { assigned, reused, renamed } = resolvePhoneDeviceId(requested, ws);
+  const reconnectKey = sanitizeReconnectKey(msg.reconnect_key || authGrant.reconnect_key);
+  const { assigned, reused, renamed } = resolvePhoneDeviceId({
+    requested,
+    reconnectKey,
+    incomingWs: ws
+  });
   const unique = assigned;
   ws.device_id = unique;
 
@@ -425,6 +433,7 @@ function handleHello(ws, msg) {
   existing.lastSeenTs = Date.now();
   existing.user_agent = msg.user_agent || null;
   existing.device_name = authGrant.device_name || existing.device_name || unique;
+  existing.reconnect_key = reconnectKey || existing.reconnect_key || null;
   existing.capabilities = msg.capabilities && typeof msg.capabilities === "object"
     ? { ...msg.capabilities }
     : (existing.capabilities || {});
@@ -440,7 +449,8 @@ function handleHello(ws, msg) {
     device_id: unique,
     device_name: existing.device_name,
     renamed_from: renamed ? requested : null,
-    reused_device_id: !!reused
+    reused_device_id: !!reused,
+    reconnect_key: existing.reconnect_key || null
   });
   console.log("[ws] phone registered", {
     requested,
@@ -1156,7 +1166,24 @@ function isSocketOpen(sock) {
   return !!sock && sock.readyState === WebSocket.OPEN;
 }
 
-function resolvePhoneDeviceId(requested, incomingWs) {
+function resolvePhoneDeviceId({ requested, reconnectKey, incomingWs }) {
+  const byReconnectKey = reconnectKey ? findDeviceIdByReconnectKey(reconnectKey) : null;
+  if (byReconnectKey) {
+    const existingByKey = devices.get(byReconnectKey);
+    if (existingByKey && (!existingByKey.connected || !isSocketOpen(existingByKey.ws) || existingByKey.ws === incomingWs)) {
+      return { assigned: byReconnectKey, reused: true, renamed: byReconnectKey !== requested };
+    }
+    if (existingByKey) {
+      const staleMs = Date.now() - Number(existingByKey.lastSeenTs || 0);
+      if (staleMs > 7000) {
+        try { existingByKey.ws?.close(4001, "replaced by reconnect"); } catch {}
+        existingByKey.ws = null;
+        existingByKey.connected = false;
+        return { assigned: byReconnectKey, reused: true, renamed: byReconnectKey !== requested };
+      }
+    }
+  }
+
   const existing = devices.get(requested);
   if (!existing) return { assigned: requested, reused: false, renamed: false };
   if (!existing.connected || !isSocketOpen(existing.ws) || existing.ws === incomingWs) {
@@ -1171,6 +1198,16 @@ function resolvePhoneDeviceId(requested, incomingWs) {
   }
   return { assigned: uniqueDeviceId(requested), reused: false, renamed: true };
 }
+
+function findDeviceIdByReconnectKey(reconnectKey) {
+  const key = sanitizeReconnectKey(reconnectKey);
+  if (!key) return null;
+  for (const [deviceId, entry] of devices.entries()) {
+    if (sanitizeReconnectKey(entry?.reconnect_key) === key) return deviceId;
+  }
+  return null;
+}
+
 function uniqueDeviceId(requested) {
   if (!devices.has(requested) || !devices.get(requested).connected) return requested;
   let n = 2;
@@ -1189,6 +1226,7 @@ function newDeviceEntry(deviceId) {
     lastSeenTs: null,
     user_agent: null,
     device_name: null,
+    reconnect_key: null,
     capabilities: {},
     config: clone(DEFAULT_RUN_CONFIG),
     motion: new MotionState(60),
@@ -1393,19 +1431,252 @@ function buildDashboardLoginPage(nextPath) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>D3C / Dashboard Login</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg-a: #11151d;
+      --bg-b: #181d27;
+      --panel: rgba(24, 30, 40, 0.9);
+      --panel-2: rgba(34, 41, 54, 0.9);
+      --line: rgba(156, 170, 196, 0.18);
+      --text: #f3f6fb;
+      --muted: #a3adbf;
+      --accent: #7cc7ff;
+      --accent-2: #4b8dff;
+      --warn: #ffb366;
+      --shadow: 0 30px 80px rgba(0, 0, 0, 0.42);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Manrope", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 10% 0%, rgba(76, 141, 255, 0.18), transparent 60%),
+        radial-gradient(700px 420px at 100% 100%, rgba(124, 199, 255, 0.12), transparent 58%),
+        linear-gradient(160deg, var(--bg-a), var(--bg-b));
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .login-shell {
+      width: min(100%, 980px);
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      overflow: hidden;
+      background: linear-gradient(160deg, rgba(20, 25, 34, 0.96), rgba(15, 19, 27, 0.98));
+      box-shadow: var(--shadow);
+    }
+
+    .login-brand {
+      padding: 40px 36px;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(124, 199, 255, 0.14), transparent 35%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
+        linear-gradient(160deg, rgba(34, 41, 54, 0.94), rgba(19, 24, 32, 0.92));
+      border-right: 1px solid var(--line);
+      display: grid;
+      align-content: space-between;
+      gap: 28px;
+      min-height: 520px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: clamp(2rem, 4vw, 3rem);
+      line-height: 1.02;
+      letter-spacing: -0.03em;
+    }
+
+    .brand-copy,
+    .brand-note,
+    .login-copy {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .brand-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .brand-stat {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 16px;
+      background: rgba(255, 255, 255, 0.03);
+      backdrop-filter: blur(10px);
+    }
+
+    .brand-stat strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 4px;
+    }
+
+    .brand-stat span {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .login-panel {
+      padding: 40px 36px;
+      display: grid;
+      align-content: center;
+      gap: 18px;
+      background: linear-gradient(180deg, rgba(19, 24, 33, 0.96), rgba(14, 18, 26, 0.98));
+    }
+
+    .login-head h2 {
+      margin: 0 0 8px;
+      font-size: 1.5rem;
+      color: var(--text);
+    }
+
+    form {
+      display: grid;
+      gap: 14px;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-size: 0.92rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 15px;
+      font-size: 1rem;
+      color: var(--text);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.03));
+      outline: none;
+      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+    }
+
+    input:focus {
+      border-color: rgba(124, 199, 255, 0.75);
+      box-shadow: 0 0 0 4px rgba(76, 141, 255, 0.16);
+      transform: translateY(-1px);
+    }
+
+    .btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-size: 0.98rem;
+      font-weight: 800;
+      color: #fff;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      cursor: pointer;
+      box-shadow: 0 12px 26px rgba(75, 141, 255, 0.28);
+    }
+
+    .btn:hover {
+      filter: brightness(1.05);
+    }
+
+    .login-status {
+      min-height: 1.3rem;
+      color: var(--warn);
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 0.86rem;
+    }
+
+    .login-foot {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    @media (max-width: 860px) {
+      .login-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .login-brand {
+        min-height: 0;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+
+    @media (max-width: 560px) {
+      body {
+        padding: 14px;
+      }
+
+      .login-brand,
+      .login-panel {
+        padding: 28px 22px;
+      }
+
+      .brand-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
 </head>
 <body>
-  <main class="dash-wrap">
-    <section class="card" style="max-width: 28rem; margin: 4rem auto;">
-      <h1>D3C Dashboard Login</h1>
-      <form id="loginForm" class="toolbar-row" style="display:block;">
+  <main class="login-shell">
+    <section class="login-brand">
+      <div>
+        <div class="eyebrow">Mission Control</div>
+        <h1>Secure dashboard access for the live fleet.</h1>
+        <p class="brand-copy">Use the dashboard password to enter the control surface for session setup, device monitoring, and recording operations.</p>
+      </div>
+
+      <div class="brand-grid">
+        <div class="brand-stat">
+          <strong>Live control</strong>
+          <span>Start sessions, watch devices, and review status in one place.</span>
+        </div>
+        <div class="brand-stat">
+          <strong>Protected routes</strong>
+          <span>Dashboard views, data tools, and admin actions stay behind login.</span>
+        </div>
+      </div>
+
+      <p class="brand-note">D3C dashboard access is session-based. After sign-in, the browser keeps an authenticated dashboard cookie until logout or server restart.</p>
+    </section>
+
+    <section class="login-panel">
+      <div class="login-head">
+        <div class="eyebrow">Dashboard Login</div>
+        <h2>Sign in</h2>
+        <p class="login-copy">Enter the dashboard password to continue.</p>
+      </div>
+
+      <form id="loginForm">
         <label>Dashboard Password
           <input id="passwordInput" type="password" autocomplete="current-password" />
         </label>
-        <button class="btn" type="submit" style="margin-top: 1rem;">Sign In</button>
-        <div id="loginStatus" class="muted mono" style="margin-top: 0.75rem;"></div>
+        <button class="btn" type="submit">Sign In</button>
+        <div id="loginStatus" class="login-status"></div>
       </form>
+      <div class="login-foot">If the password changed recently, refresh and sign in again.</div>
     </section>
   </main>
   <script>
@@ -1566,6 +1837,12 @@ function getLanIp(preferred) {
 
 function sanitizeDeviceId(deviceId) {
   return String(deviceId || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function sanitizeReconnectKey(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128);
 }
 
 function sanitizeSessionId(raw) {
@@ -1843,11 +2120,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
-
-
-
 
 
 

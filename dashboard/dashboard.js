@@ -1,4 +1,4 @@
-import { createStore, createEventBus, clamp, clone, formatElapsed } from "./store.js";
+import { createStore, createEventBus, clamp, clone, formatElapsed, escapeHtml } from "./store.js";
 import { ACTIVE_LAYOUT_KEY, defaultLayouts, loadLayouts, normalizeLayout, persistLayouts } from "./layouts.js";
 import { createWidgetRegistry, resolveWidgetDevice } from "./widgets.js";
 
@@ -27,6 +27,8 @@ const els = {
   statusImu: document.getElementById("statusImu"),
   statusCam: document.getElementById("statusCam"),
   recordingBanner: document.getElementById("recordingBanner"),
+  overviewStrip: document.getElementById("overviewStrip"),
+  alertStrip: document.getElementById("alertStrip"),
   statusAudio: document.getElementById("statusAudio"),
   advancedLayoutBtn: document.getElementById("advancedLayoutBtn"),
   advancedLayoutPanel: document.getElementById("advancedLayoutPanel"),
@@ -133,7 +135,9 @@ function init() {
     () => {
       renderDeviceFilter();
       updateGlobalStatusBar();
-  updateRecordingBanner();
+      updateRecordingBanner();
+      renderOverviewStrip();
+      renderAlertStrip();
     }
   );
 
@@ -146,6 +150,8 @@ function init() {
 
   updateGlobalStatusBar();
   updateRecordingBanner();
+  renderOverviewStrip();
+  renderAlertStrip();
 
   bus.on("preview_image", (src) => {
     const cameraWidget = [...mountedWidgets.values()].find((m) => m.type === "camera_preview");
@@ -292,6 +298,69 @@ function updateRecordingBanner() {
   banner.classList.add("idle");
   banner.textContent = `OFFLINE`;
 }
+
+function renderOverviewStrip() {
+  if (!els.overviewStrip) return;
+  const st = store.getState();
+  const connected = (st.deviceList || []).filter((d) => d?.connected !== false);
+  const recordByDevice = st.recordByDevice || {};
+  const counts = {
+    devices: connected.length,
+    imu: 0,
+    camera: 0,
+    gps: 0,
+    recording: 0
+  };
+
+  for (const device of connected) {
+    const id = device.device_id;
+    const state = st.statesByDevice?.[id] || {};
+    const imuHz = Number(device.imuHz ?? device.imu_hz ?? state.net?.imu_hz ?? 0);
+    const camFps = Number(device.camFps ?? device.camera_fps ?? state.net?.camera_fps ?? 0);
+    const gpsTs = Number(state.gps_latest?.t_recv_ms || 0);
+    if (imuHz > 0.5) counts.imu += 1;
+    if (camFps > 0.5) counts.camera += 1;
+    if (gpsTs && Date.now() - gpsTs < 12000) counts.gps += 1;
+    if (recordByDevice[id]?.recording) counts.recording += 1;
+  }
+
+  const cards = [
+    { label: "Devices Online", value: counts.devices, note: "Connected to the fleet right now" },
+    { label: "IMU Streaming", value: `${counts.imu}/${counts.devices || 0}`, note: "Devices actively sending motion data" },
+    { label: "Camera Streaming", value: `${counts.camera}/${counts.devices || 0}`, note: "Devices actively sending preview frames" },
+    { label: "GPS Active", value: `${counts.gps}/${counts.devices || 0}`, note: "Recent GPS fixes across the fleet" },
+    { label: "Recording", value: `${counts.recording}/${counts.devices || 0}`, note: "Devices currently writing data" }
+  ];
+
+  els.overviewStrip.innerHTML = cards.map((card) => (
+    `<div class="overview-card"><span>${card.label}</span><strong>${card.value}</strong><span>${card.note}</span></div>`
+  )).join("");
+}
+
+function renderAlertStrip() {
+  if (!els.alertStrip) return;
+  const st = store.getState();
+  const alerts = [];
+  for (const device of st.deviceList || []) {
+    for (const alert of device.healthAlerts || []) {
+      alerts.push({
+        severity: String(alert.severity || "warn"),
+        title: device.deviceName || device.device_id,
+        detail: String(alert.message || alert.code || "alert")
+      });
+    }
+  }
+  if (st.recording?.last_error) {
+    alerts.unshift({
+      severity: "error",
+      title: "Recording",
+      detail: String(st.recording.last_error.type || "recording_error")
+    });
+  }
+  els.alertStrip.innerHTML = alerts.slice(0, 4).map((alert) => (
+    `<div class="alert-card ${alert.severity === "error" ? "error" : "warn"}"><strong>${escapeHtml(alert.title)}</strong><span>${escapeHtml(alert.detail)}</span></div>`
+  )).join("");
+}
 function formatElapsedWide(totalSec) {
   const s = Math.max(0, Number(totalSec || 0));
   const hh = Math.floor(s / 3600);
@@ -325,7 +394,7 @@ function bindTopUi() {
     els.advancedLayoutBtn.addEventListener("click", () => {
       isAdvancedOpen = !isAdvancedOpen;
       els.advancedLayoutPanel.hidden = !isAdvancedOpen && !store.getState().editMode;
-      els.advancedLayoutBtn.textContent = isAdvancedOpen ? "Hide Advanced" : "Advanced Layout";
+      els.advancedLayoutBtn.textContent = isAdvancedOpen ? "Hide Workspace Tools" : "Workspace Tools";
     });
   }
   els.themeToggleBtn.addEventListener("click", toggleTheme);
@@ -671,7 +740,7 @@ function renderDeviceFilter() {
     if (includeAuto) {
       const auto = document.createElement("option");
       auto.value = "";
-      auto.textContent = "Auto (focused)";
+      auto.textContent = "Follow focused device";
       sel.appendChild(auto);
     }
     for (const d of st.deviceList) {
@@ -689,7 +758,7 @@ function renderDeviceFilter() {
   if (els.focusedDeviceSelect) {
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.textContent = "No device selected";
+    placeholder.textContent = "Choose a device";
     els.focusedDeviceSelect.insertBefore(placeholder, els.focusedDeviceSelect.firstChild);
   }
 
@@ -707,7 +776,7 @@ function renderDeviceFilter() {
     els.viewModeHint.hidden = !on;
     if (on) {
       const c = computeFleetActiveCounts(st);
-      els.viewModeHint.textContent = "All Devices mode active | IMU " + c.imu + "/" + c.total + " | Camera " + c.cam + "/" + c.total + " | Audio " + c.audio + "/" + c.total + " | GPS " + c.gps + "/" + c.total;
+      els.viewModeHint.textContent = "Fleet summary | IMU " + c.imu + "/" + c.total + " | Camera " + c.cam + "/" + c.total + " | Audio " + c.audio + "/" + c.total + " | GPS " + c.gps + "/" + c.total;
     } else {
       els.viewModeHint.textContent = "";
     }
@@ -1175,10 +1244,6 @@ function applyTheme(theme) {
   localStorage.setItem(THEME_KEY, theme);
   els.themeToggleBtn.textContent = theme === "light" ? "Dark Mode" : "Light Mode";
 }
-
-
-
-
 
 
 

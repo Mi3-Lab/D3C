@@ -183,8 +183,10 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
         const form = document.createElement("div");
         form.className = "session-form";
+        const preflight = document.createElement("div");
+        preflight.className = "session-preflight";
 
-        content.append(summary, recRow, form);
+        content.append(summary, recRow, preflight, form);
 
         let lastFormKey = "";
         const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode }), () => {
@@ -195,6 +197,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
           const online = (st.deviceList || []).filter((d) => d?.connected !== false).length;
           const estimates = computeSessionEstimates(cfg);
+          const preflightItems = computeSessionPreflight(st, cfg);
 
           summary.innerHTML = "";
           kv(summary, "Session State", isActive ? "Active" : "Draft");
@@ -205,12 +208,34 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
           const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
           const isStopping = phase === "STOPPING";
-          ctaBtn.disabled = isStopping;
+          ctaBtn.disabled = isStopping || (!isActive && online === 0);
           ctaBtn.textContent = isActive ? "Stop Session Recording" : "Start Session Recording";
           ctaBtn.className = isActive ? "btn btn-danger" : "btn btn-success";
           timer.textContent = isStopping
             ? "Stopping and flushing buffers..."
             : (isActive ? "Recording - " + formatElapsed(st.recording?.elapsed_sec || 0) + " elapsed" : "Recording idle");
+
+          preflight.innerHTML = "";
+          const preflightTitle = document.createElement("div");
+          preflightTitle.className = "session-preflight-title";
+          preflightTitle.textContent = "Preflight";
+          preflight.appendChild(preflightTitle);
+          const preflightList = document.createElement("div");
+          preflightList.className = "session-preflight-list";
+          if (!preflightItems.length) {
+            const ok = document.createElement("div");
+            ok.className = "session-preflight-item ok";
+            ok.textContent = online > 0 ? "Fleet looks ready for recording." : "No devices online yet.";
+            preflightList.appendChild(ok);
+          } else {
+            for (const item of preflightItems) {
+              const row = document.createElement("div");
+              row.className = `session-preflight-item ${item.severity}`;
+              row.textContent = item.message;
+              preflightList.appendChild(row);
+            }
+          }
+          preflight.appendChild(preflightList);
 
           const formKey = JSON.stringify({
             active: isActive,
@@ -651,6 +676,9 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         status.className = "mono muted";
         status.textContent = "Replay: idle";
         content.appendChild(status);
+        const summary = document.createElement("div");
+        summary.className = "kv-grid replay-summary";
+        content.appendChild(summary);
 
         let timer = null;
         function refresh() {
@@ -712,7 +740,30 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         }
 
         const unsub = store.subscribe((s) => s.replaySessions, refresh);
+        sel.addEventListener("change", async () => {
+          const id = sel.value;
+          if (!id) {
+            summary.innerHTML = "";
+            return;
+          }
+          const st = store.getState();
+          const deviceId = resolveWidgetDevice(ctx.instance.settings, st);
+          const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
+          try {
+            const manifest = await (await fetch(`/api/datasets/${encodeURIComponent(id)}/manifest${qs}`)).json();
+            summary.innerHTML = "";
+            kv(summary, "Dataset", id);
+            kv(summary, "Device", manifest.device_id || "-");
+            kv(summary, "IMU", manifest.imuCsv ? "yes" : "no");
+            kv(summary, "GPS", manifest.gpsCsv ? "yes" : "no");
+            kv(summary, "Audio", manifest.audioWav ? "wav" : (manifest.audioCsv ? "csv" : "no"));
+            kv(summary, "Camera", manifest.cameraVideo ? "mp4" : (manifest.cameraDir ? "frames" : "no"));
+          } catch {
+            summary.innerHTML = "";
+          }
+        });
         refresh();
+        sel.dispatchEvent(new Event("change"));
         return () => { onStop(); unsub(); };
       }
     },
@@ -917,6 +968,37 @@ function computeSessionEstimates(cfg) {
   const storageMbPerMin = (bytesPerSec * 60) / (1024 * 1024);
   return { bandwidthMbps, storageMbPerMin };
 }
+
+function computeSessionPreflight(st, cfg) {
+  const connected = (st.deviceList || []).filter((d) => d?.connected !== false);
+  const items = [];
+  if (!connected.length) {
+    items.push({ severity: "warn", message: "No devices are online. Recording cannot start until at least one phone is connected." });
+    return items;
+  }
+  const activeImu = connected.filter((d) => Number(d.imuHz ?? d.imu_hz ?? 0) > 0.5).length;
+  const activeCam = connected.filter((d) => Number(d.camFps ?? d.camera_fps ?? 0) > 0.5).length;
+  const gpsOk = connected.filter((d) => {
+    const gpsTs = Number(st.statesByDevice?.[d.device_id]?.gps_latest?.t_recv_ms || 0);
+    return gpsTs && (Date.now() - gpsTs) < 12000;
+  }).length;
+  const alertDevices = connected.filter((d) => Array.isArray(d.healthAlerts) && d.healthAlerts.length).length;
+
+  if (cfg.streams.imu.enabled && activeImu < connected.length) {
+    items.push({ severity: "warn", message: `IMU is enabled but only ${activeImu}/${connected.length} devices are sending motion data.` });
+  }
+  if (cfg.streams.camera.mode === "stream" && activeCam < connected.length) {
+    items.push({ severity: "warn", message: `Camera is enabled but only ${activeCam}/${connected.length} devices are sending preview frames.` });
+  }
+  if (cfg.streams.gps.enabled && gpsOk < connected.length) {
+    items.push({ severity: "warn", message: `GPS is enabled but only ${gpsOk}/${connected.length} devices have a recent fix.` });
+  }
+  if (alertDevices > 0) {
+    items.push({ severity: "warn", message: `${alertDevices} connected device${alertDevices > 1 ? "s" : ""} currently have active health alerts.` });
+  }
+  return items;
+}
+
 function kv(parent, k, v) {
   const d = document.createElement("div");
   d.className = "kv-item";
@@ -984,9 +1066,6 @@ function addInfoLine(parent, text) {
   line.textContent = text;
   parent.appendChild(line);
 }
-
-
-
 
 
 
