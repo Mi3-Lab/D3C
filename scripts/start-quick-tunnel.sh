@@ -7,10 +7,13 @@ PORT="${PORT:-3000}"
 HOST="${HOST:-0.0.0.0}"
 SERVER_URL="http://127.0.0.1:${PORT}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-$ROOT_DIR/.local/bin/cloudflared}"
+RUNTIME_DIR="$ROOT_DIR/tmp"
+PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH:-$RUNTIME_DIR/quick-tunnel-state.json}"
 SERVER_LOG="$(mktemp -t d3c-server.XXXXXX.log)"
 TUNNEL_LOG="$(mktemp -t d3c-tunnel.XXXXXX.log)"
 SERVER_PID=""
 TUNNEL_PID=""
+QUICK_TUNNEL_RETRIES="${QUICK_TUNNEL_RETRIES:-4}"
 
 cleanup() {
   local exit_code=$?
@@ -23,6 +26,7 @@ cleanup() {
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
+  rm -f "${PUBLIC_RUNTIME_STATE_PATH}"
   rm -f "${SERVER_LOG}" "${TUNNEL_LOG}"
   exit "${exit_code}"
 }
@@ -51,9 +55,10 @@ if [[ ! -d "${ROOT_DIR}/node_modules" ]]; then
 fi
 
 cd "${ROOT_DIR}"
+mkdir -p "${RUNTIME_DIR}"
 
 echo "Starting D3C server on ${SERVER_URL} ..."
-node fleet-server/index.js --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
+PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH}" node fleet-server/index.js --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 for _ in {1..30}; do
@@ -75,30 +80,51 @@ if ! curl -fsS "${SERVER_URL}/health" >/dev/null 2>&1; then
 fi
 
 echo "Opening Cloudflare Quick Tunnel ..."
-"${CLOUDFLARED_BIN}" tunnel --url "${SERVER_URL}" >"${TUNNEL_LOG}" 2>&1 &
-TUNNEL_PID=$!
-
 PUBLIC_URL=""
-for _ in {1..45}; do
-  if [[ -z "${PUBLIC_URL}" ]]; then
-    PUBLIC_URL="$(grep -o 'https://[-[:alnum:]]*\.trycloudflare\.com' "${TUNNEL_LOG}" | head -n 1 || true)"
-  fi
+for attempt in $(seq 1 "${QUICK_TUNNEL_RETRIES}"); do
+  : >"${TUNNEL_LOG}"
+  "${CLOUDFLARED_BIN}" tunnel --url "${SERVER_URL}" >"${TUNNEL_LOG}" 2>&1 &
+  TUNNEL_PID=$!
+
+  PUBLIC_URL=""
+  for _ in {1..45}; do
+    if [[ -z "${PUBLIC_URL}" ]]; then
+      PUBLIC_URL="$(grep -o 'https://[-[:alnum:]]*\.trycloudflare\.com' "${TUNNEL_LOG}" | head -n 1 || true)"
+    fi
+    if [[ -n "${PUBLIC_URL}" ]]; then
+      break
+    fi
+    if ! kill -0 "${TUNNEL_PID}" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
   if [[ -n "${PUBLIC_URL}" ]]; then
     break
   fi
-  if ! kill -0 "${TUNNEL_PID}" 2>/dev/null; then
-    echo "cloudflared exited during startup:" >&2
-    cat "${TUNNEL_LOG}" >&2
-    exit 1
+
+  if [[ -n "${TUNNEL_PID}" ]] && kill -0 "${TUNNEL_PID}" 2>/dev/null; then
+    kill "${TUNNEL_PID}" 2>/dev/null || true
+    wait "${TUNNEL_PID}" 2>/dev/null || true
   fi
-  sleep 1
+  TUNNEL_PID=""
+
+  if [[ "${attempt}" -lt "${QUICK_TUNNEL_RETRIES}" ]]; then
+    echo "Quick Tunnel attempt ${attempt}/${QUICK_TUNNEL_RETRIES} failed. Retrying..." >&2
+    sleep $((attempt * 2))
+  fi
 done
 
 if [[ -z "${PUBLIC_URL}" ]]; then
-  echo "Timed out waiting for a Quick Tunnel URL." >&2
+  echo "Quick Tunnel failed after ${QUICK_TUNNEL_RETRIES} attempt(s)." >&2
   cat "${TUNNEL_LOG}" >&2
   exit 1
 fi
+
+cat >"${PUBLIC_RUNTIME_STATE_PATH}" <<EOF
+{"mode":"quick_tunnel","started_at_ms":$(date +%s%3N),"public_url":"${PUBLIC_URL}"}
+EOF
 
 echo
 echo "Quick Tunnel is up:"

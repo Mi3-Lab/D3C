@@ -4,82 +4,87 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>D3C / Fleet Node</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
-  <main class="phone-wrap phone-shell">
-    <div class="row top-header">
-      <div>
-        <h1>D3C Fleet Node</h1>
-        <p class="muted compact">Distributed driving data capture client</p>
-      </div>
-      <div class="row header-actions">
-        <button id="startBtn" class="btn">Start</button>
-        <button id="disconnectBtn" class="btn btn-alt">Disconnect</button>
-        <button id="phoneThemeToggleBtn" class="btn btn-alt">Dark Mode</button>
-      </div>
+<body class="app-body">
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="topbar-logo">D3C</span>
+      <span class="topbar-title">Fleet Node</span>
     </div>
-    <p class="muted">Enter your device name and join code, then tap Start to grant permissions and begin live streaming.</p>
+    <div class="topbar-right">
+      <button id="disconnectBtn" class="btn btn-alt btn-small">Disconnect</button>
+    </div>
+  </header>
 
-    <section class="card phone-join-card">
-      <h2>Join Session</h2>
-      <div class="phone-join-grid">
-        <label>Device Name
-          <input id="deviceNameInput" type="text" maxlength="40" placeholder="e.g. Alex iPhone" />
-        </label>
-        <label>Join Code
-          <input id="joinCodeInput" type="text" maxlength="12" placeholder="e.g. A1B2C3" />
-        </label>
-      </div>
-      <div id="joinStatus" class="muted mono phone-join-status">Waiting for join details</div>
-    </section>
+  <main class="phone-main">
+    <div class="phone-stack">
 
-    <section class="status-bar phone-status-bar">
-      <div id="phoneConnCard" class="status-signal is-bad">
-        <div class="status-k">Websocket</div>
-        <div id="phoneConnText" class="status-v">Disconnected</div>
-      </div>
-      <div class="status-signal is-ok">
-        <div class="status-k">Device</div>
-        <div id="deviceIdPill" class="status-v mono">-</div>
-      </div>
-      <div id="phoneCameraCard" class="status-signal is-warn">
-        <div class="status-k">Camera</div>
-        <div id="phoneCameraMode" class="status-v">OFF</div>
-      </div>
-      <div id="phoneAudioCard" class="status-signal is-warn">
-        <div class="status-k">Audio</div>
-        <div id="phoneAudioMode" class="status-v">OFF</div>
-      </div>
-    </section>
-
-    <section class="grid two">
-      <section class="card">
-        <h2>Readiness Checklist</h2>
-        <div id="phoneReadySummary" class="phone-ready-summary">Waiting for setup</div>
-        <ul id="phoneReadinessList" class="phone-checklist"></ul>
+      <section class="card phone-join-card">
+        <h2>Join Session</h2>
+        <div class="phone-join-grid">
+          <label>Device Name
+            <input id="deviceNameInput" type="text" maxlength="40" placeholder="e.g. Alex iPhone" />
+          </label>
+          <label>Join Code
+            <input id="joinCodeInput" type="text" maxlength="6" placeholder="e.g. A1B2C3" />
+            <small class="muted">Get this from the D3C Dashboard</small>
+          </label>
+        </div>
+        <div id="joinValidation" class="phone-validation-message"></div>
+        <div id="joinStatus" class="muted mono phone-join-status">Waiting for join details</div>
       </section>
 
-      <section class="card">
-        <h2>Operator Guidance</h2>
-        <ul id="phoneGuidanceList" class="phone-guidance-list"></ul>
-      </section>
-    </section>
-
-    <section class="grid two">
-      <section class="card">
-        <h2>Active Streams</h2>
-        <ul id="statusList" class="phone-stream-list"></ul>
+      <section id="deviceIdentityCard" class="card phone-device-info">
+        <span class="label">Connected as</span>
+        <span id="deviceIdentityName" class="device-name">-</span>
+        <span id="deviceIdentityType" class="device-type">Phone</span>
       </section>
 
-      <section class="card">
-        <h2>Camera Preview</h2>
-        <video id="preview" playsinline autoplay muted></video>
+      <section class="card phone-action-card">
+        <div id="primaryActionArea">
+          <button id="startBtn" class="btn primary large phone-primary-btn">Start Device</button>
+        </div>
       </section>
-    </section>
 
-    <div id="connStatus" class="phone-hidden-status">Disconnected</div>
+      <section class="card phone-status-card">
+        <div class="status-summary">
+          <div>
+            <h2>Device Status</h2>
+            <div id="phoneReadySummary" class="progress muted">Waiting for setup</div>
+          </div>
+          <div id="phoneReadyMissing" class="phone-ready-missing muted"></div>
+        </div>
+        <ul id="phoneReadinessList" class="checklist"></ul>
+      </section>
+
+      <section class="card camera-section">
+        <div class="section-header phone-camera-header">
+          <h2>Camera</h2>
+          <div class="row">
+            <button id="cameraFlipBtn" class="btn btn-alt btn-small">Flip</button>
+          </div>
+        </div>
+        <div class="camera-preview">
+          <video id="preview" playsinline autoplay muted></video>
+          <div class="preview-overlay">
+            <span id="cameraPreviewBadge" class="badge">OFF</span>
+            <span id="cameraPreviewFps" class="fps">0 FPS</span>
+          </div>
+        </div>
+        <div id="cameraPreviewMeta" class="stream-stats">
+          <span>Camera off</span>
+        </div>
+      </section>
+
+    </div>
   </main>
+
+  <div id="connStatus" class="phone-hidden-status">Disconnected</div>
   <script src="/phone.js"></script>
 </body>
 </html>

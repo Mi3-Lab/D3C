@@ -22,6 +22,10 @@ const DASHBOARD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DASHBOARD_AUTH_COOKIE = "d3c_dashboard_auth";
 const DASHBOARD_PASSWORD = String(process.env.DASHBOARD_PASSWORD || "");
 const DASHBOARD_AUTH_ENABLED = DASHBOARD_PASSWORD.trim().length > 0;
+const PUBLIC_RUNTIME_STATE_PATH = process.env.PUBLIC_RUNTIME_STATE_PATH
+  ? path.resolve(process.env.PUBLIC_RUNTIME_STATE_PATH)
+  : "";
+const SERVER_STARTED_AT_MS = Date.now();
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -255,6 +259,7 @@ const recording = {
   last_error: null,
   stop_requested_at_ms: null
 };
+let publicRuntimeInfo = loadPublicRuntimeInfo();
 
 wss.on("connection", (ws, req) => {
   connectionStats.sockets_connected += 1;
@@ -308,6 +313,7 @@ wss.on("connection", (ws, req) => {
 setInterval(() => {
   pruneAuthRateLimit();
   prunePhoneAuthTokens();
+  publicRuntimeInfo = loadPublicRuntimeInfo();
   for (const [id, d] of devices.entries()) {
     const expectedImu = d.config.streams.imu.enabled ? d.config.streams.imu.rate_hz : 0;
     const expectedCam = d.config.streams.camera.mode === "stream" ? d.config.streams.camera.fps : 0;
@@ -320,7 +326,6 @@ setInterval(() => {
     d.connectionStatus = classifyConnection({
       connected: d.connected,
       rttMs: d.stats.rtt_ms,
-      droppedPackets: d.stats.dropped_packets,
       droppedPackets: d.stats.dropped_packets,
       lastSeenMs: d.lastSeenTs
     });
@@ -460,6 +465,7 @@ function handleHello(ws, msg) {
     phones_disconnected: connectionStats.phones_disconnected
   });
   sendWs(ws, { type: "config", device_id: unique, runConfig: sessionConfig });
+  sendWs(ws, { type: "recording_state", active: recording.active, session_id: recording.session_id || null });
   broadcastDeviceList();
   broadcastState();
 }
@@ -892,14 +898,15 @@ function startRecordingSession({ scope, session_name, modalities = ["imu", "cam"
       d.recordingStatus.writer = { last_write_utc_ms: null, dropped: 0 };
       d.recordingStatus.files = {};
       d.recordingStatus.error = null;
-    } else if (!recording.active) {
-      d.recordingStatus.recording = false;
     }
   }
 
   broadcastState();
   broadcastDeviceList();
   broadcastRecordStatuses();
+  for (const d of devices.values()) {
+    if (d.connected && isSocketOpen(d.ws)) sendWs(d.ws, { type: "recording_state", active: true, session_id: sid });
+  }
 }
 
 async function stopRecordingSession() {
@@ -964,6 +971,9 @@ async function stopRecordingSession() {
   broadcastState();
   broadcastDeviceList();
   broadcastRecordStatuses();
+  for (const d of devices.values()) {
+    if (d.connected && isSocketOpen(d.ws)) sendWs(d.ws, { type: "recording_state", active: false, session_id: null });
+  }
 }
 
 function broadcastRecordStatuses() {
@@ -1048,6 +1058,7 @@ function broadcastState() {
     devices: deviceSummaries(),
     sessionConfig,
     sessionState: recording.active ? "active" : "draft",
+    runtime: buildRuntimeInfo(),
     recording: {
       active: recording.active,
       phase: recording.phase,
@@ -1318,6 +1329,25 @@ function buildSessionConfigPayload() {
   };
 }
 
+function buildRuntimeInfo() {
+  const info = {
+    server_started_at_ms: SERVER_STARTED_AT_MS,
+    server_uptime_sec: Math.max(0, Math.floor((Date.now() - SERVER_STARTED_AT_MS) / 1000)),
+    public_started_at_ms: null,
+    public_uptime_sec: null,
+    public_url: null,
+    public_mode: null
+  };
+  const publicStart = Number(publicRuntimeInfo?.started_at_ms || 0);
+  if (publicStart > 0) {
+    info.public_started_at_ms = publicStart;
+    info.public_uptime_sec = Math.max(0, Math.floor((Date.now() - publicStart) / 1000));
+    info.public_url = typeof publicRuntimeInfo?.public_url === "string" ? publicRuntimeInfo.public_url : null;
+    info.public_mode = typeof publicRuntimeInfo?.mode === "string" ? publicRuntimeInfo.mode : "public";
+  }
+  return info;
+}
+
 function requireDashboardAuth(mode = "api") {
   return (req, res, next) => {
     if (!DASHBOARD_AUTH_ENABLED) return next();
@@ -1365,7 +1395,7 @@ function parseCookies(req) {
     const key = part.slice(0, idx).trim();
     const value = part.slice(idx + 1).trim();
     if (!key) continue;
-    out[key] = decodeURIComponent(value);
+    try { out[key] = decodeURIComponent(value); } catch { out[key] = value; }
   }
   return out;
 }
@@ -1430,254 +1460,108 @@ function buildDashboardLoginPage(nextPath) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>D3C / Dashboard Login</title>
+  <title>D3C / Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
   <style>
-    :root {
-      color-scheme: dark;
-      --bg-a: #11151d;
-      --bg-b: #181d27;
-      --panel: rgba(24, 30, 40, 0.9);
-      --panel-2: rgba(34, 41, 54, 0.9);
-      --line: rgba(156, 170, 196, 0.18);
-      --text: #f3f6fb;
-      --muted: #a3adbf;
-      --accent: #7cc7ff;
-      --accent-2: #4b8dff;
-      --warn: #ffb366;
-      --shadow: 0 30px 80px rgba(0, 0, 0, 0.42);
-    }
-
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      margin: 0;
       min-height: 100vh;
-      font-family: "Manrope", "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(900px 500px at 10% 0%, rgba(76, 141, 255, 0.18), transparent 60%),
-        radial-gradient(700px 420px at 100% 100%, rgba(124, 199, 255, 0.12), transparent 58%),
-        linear-gradient(160deg, var(--bg-a), var(--bg-b));
+      font-family: "Inter", -apple-system, "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+      color: #b0c3db;
+      background-color: #060919;
+      background-image: radial-gradient(ellipse 900px 480px at 50% 0%, rgba(68, 120, 245, 0.09) 0%, transparent 65%);
       display: grid;
       place-items: center;
       padding: 24px;
+      -webkit-font-smoothing: antialiased;
     }
 
-    .login-shell {
-      width: min(100%, 980px);
-      display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      overflow: hidden;
-      background: linear-gradient(160deg, rgba(20, 25, 34, 0.96), rgba(15, 19, 27, 0.98));
-      box-shadow: var(--shadow);
-    }
-
-    .login-brand {
-      padding: 40px 36px;
-      background:
-        radial-gradient(circle at 20% 20%, rgba(124, 199, 255, 0.14), transparent 35%),
-        linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent),
-        linear-gradient(160deg, rgba(34, 41, 54, 0.94), rgba(19, 24, 32, 0.92));
-      border-right: 1px solid var(--line);
-      display: grid;
-      align-content: space-between;
-      gap: 28px;
-      min-height: 520px;
-    }
-
-    .eyebrow {
-      display: inline-block;
-      font-size: 0.76rem;
-      font-weight: 800;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--accent);
-      margin-bottom: 12px;
+    .card {
+      width: min(100%, 380px);
+      background: #0c1424;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      padding: 32px 28px;
     }
 
     h1 {
-      margin: 0 0 14px;
-      font-size: clamp(2rem, 4vw, 3rem);
-      line-height: 1.02;
-      letter-spacing: -0.03em;
-    }
-
-    .brand-copy,
-    .brand-note,
-    .login-copy {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.55;
-    }
-
-    .brand-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-    }
-
-    .brand-stat {
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 14px 16px;
-      background: rgba(255, 255, 255, 0.03);
-      backdrop-filter: blur(10px);
-    }
-
-    .brand-stat strong {
-      display: block;
-      font-size: 1rem;
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: #b0c3db;
       margin-bottom: 4px;
     }
 
-    .brand-stat span {
-      color: var(--muted);
-      font-size: 0.88rem;
+    .subtitle {
+      font-size: 13px;
+      color: #42566e;
+      margin-bottom: 28px;
+      line-height: 1.5;
     }
 
-    .login-panel {
-      padding: 40px 36px;
-      display: grid;
-      align-content: center;
-      gap: 18px;
-      background: linear-gradient(180deg, rgba(19, 24, 33, 0.96), rgba(14, 18, 26, 0.98));
-    }
-
-    .login-head h2 {
-      margin: 0 0 8px;
-      font-size: 1.5rem;
-      color: var(--text);
-    }
-
-    form {
-      display: grid;
-      gap: 14px;
-    }
+    form { display: grid; gap: 12px; }
 
     label {
       display: grid;
-      gap: 8px;
-      font-size: 0.92rem;
-      font-weight: 700;
-      color: var(--text);
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: #b0c3db;
     }
 
     input {
       width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 14px 15px;
-      font-size: 1rem;
-      color: var(--text);
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.03));
+      height: 42px;
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      border-radius: 7px;
+      padding: 0 12px;
+      font-size: 14px;
+      font-family: inherit;
+      color: #b0c3db;
+      background: #101c33;
       outline: none;
-      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+      transition: border-color 140ms;
     }
 
-    input:focus {
-      border-color: rgba(124, 199, 255, 0.75);
-      box-shadow: 0 0 0 4px rgba(76, 141, 255, 0.16);
-      transform: translateY(-1px);
-    }
+    input:focus { border-color: rgba(68, 120, 245, 0.5); }
 
-    .btn {
-      border: 0;
-      border-radius: 14px;
-      padding: 14px 16px;
-      font-size: 0.98rem;
-      font-weight: 800;
+    button {
+      width: 100%;
+      height: 42px;
+      border: 1px solid #4478f5;
+      border-radius: 7px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: inherit;
       color: #fff;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      background: #4478f5;
       cursor: pointer;
-      box-shadow: 0 12px 26px rgba(75, 141, 255, 0.28);
+      transition: background 140ms, border-color 140ms;
     }
 
-    .btn:hover {
-      filter: brightness(1.05);
-    }
+    button:hover { background: #3366e8; border-color: #3366e8; }
 
-    .login-status {
-      min-height: 1.3rem;
-      color: var(--warn);
-      font-family: "JetBrains Mono", Consolas, monospace;
-      font-size: 0.86rem;
-    }
-
-    .login-foot {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 0.86rem;
-    }
-
-    @media (max-width: 860px) {
-      .login-shell {
-        grid-template-columns: 1fr;
-      }
-
-      .login-brand {
-        min-height: 0;
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
-      }
-    }
-
-    @media (max-width: 560px) {
-      body {
-        padding: 14px;
-      }
-
-      .login-brand,
-      .login-panel {
-        padding: 28px 22px;
-      }
-
-      .brand-grid {
-        grid-template-columns: 1fr;
-      }
+    .status {
+      min-height: 18px;
+      font-size: 12px;
+      color: #e85252;
     }
   </style>
 </head>
 <body>
-  <main class="login-shell">
-    <section class="login-brand">
-      <div>
-        <div class="eyebrow">Mission Control</div>
-        <h1>Secure dashboard access for the live fleet.</h1>
-        <p class="brand-copy">Use the dashboard password to enter the control surface for session setup, device monitoring, and recording operations.</p>
-      </div>
-
-      <div class="brand-grid">
-        <div class="brand-stat">
-          <strong>Live control</strong>
-          <span>Start sessions, watch devices, and review status in one place.</span>
-        </div>
-        <div class="brand-stat">
-          <strong>Protected routes</strong>
-          <span>Dashboard views, data tools, and admin actions stay behind login.</span>
-        </div>
-      </div>
-
-      <p class="brand-note">D3C dashboard access is session-based. After sign-in, the browser keeps an authenticated dashboard cookie until logout or server restart.</p>
-    </section>
-
-    <section class="login-panel">
-      <div class="login-head">
-        <div class="eyebrow">Dashboard Login</div>
-        <h2>Sign in</h2>
-        <p class="login-copy">Enter the dashboard password to continue.</p>
-      </div>
-
-      <form id="loginForm">
-        <label>Dashboard Password
-          <input id="passwordInput" type="password" autocomplete="current-password" />
-        </label>
-        <button class="btn" type="submit">Sign In</button>
-        <div id="loginStatus" class="login-status"></div>
-      </form>
-      <div class="login-foot">If the password changed recently, refresh and sign in again.</div>
-    </section>
+  <main class="card">
+    <h1>D3C Dashboard</h1>
+    <p class="subtitle">Enter your password to continue</p>
+    <form id="loginForm">
+      <label for="passwordInput">Password
+        <input id="passwordInput" type="password" autocomplete="current-password" />
+      </label>
+      <button type="submit">Sign in</button>
+      <div id="loginStatus" class="status"></div>
+    </form>
   </main>
   <script>
     const nextPath = ${escapedNext};
@@ -1713,20 +1597,27 @@ function createJoinCode() {
   return crypto.randomBytes(3).toString("hex").toUpperCase();
 }
 
+function getDeployId() {
+  try {
+    const stat = fs.statSync(__filename);
+    return `${stat.size}-${Math.round(stat.mtimeMs)}`;
+  } catch {
+    return null;
+  }
+}
+
 function loadAuthState() {
+  const currentDeployId = getDeployId();
   try {
     if (fs.existsSync(AUTH_STATE_PATH)) {
       const parsed = JSON.parse(fs.readFileSync(AUTH_STATE_PATH, "utf8"));
       const joinCode = normalizeJoinCode(parsed?.joinCode);
-      if (joinCode) {
-        return {
-          joinCode,
-          updated_at_ms: Number(parsed?.updated_at_ms || Date.now())
-        };
+      if (joinCode && parsed?.deployId === currentDeployId) {
+        return { joinCode, updated_at_ms: Number(parsed?.updated_at_ms || Date.now()), deployId: currentDeployId };
       }
     }
   } catch {}
-  const state = { joinCode: createJoinCode(), updated_at_ms: Date.now() };
+  const state = { joinCode: createJoinCode(), updated_at_ms: Date.now(), deployId: currentDeployId };
   persistAuthState(state);
   return state;
 }
@@ -1736,9 +1627,27 @@ function persistAuthState(state) {
     fs.mkdirSync(path.dirname(AUTH_STATE_PATH), { recursive: true });
     fs.writeFileSync(AUTH_STATE_PATH, JSON.stringify({
       joinCode: normalizeJoinCode(state?.joinCode),
-      updated_at_ms: Number(state?.updated_at_ms || Date.now())
+      updated_at_ms: Number(state?.updated_at_ms || Date.now()),
+      deployId: state?.deployId || null
     }, null, 2), "utf8");
   } catch {}
+}
+
+function loadPublicRuntimeInfo() {
+  if (!PUBLIC_RUNTIME_STATE_PATH) return null;
+  try {
+    if (!fs.existsSync(PUBLIC_RUNTIME_STATE_PATH)) return null;
+    const parsed = JSON.parse(fs.readFileSync(PUBLIC_RUNTIME_STATE_PATH, "utf8"));
+    const startedAtMs = Number(parsed?.started_at_ms || 0);
+    if (!startedAtMs || startedAtMs <= 0) return null;
+    return {
+      started_at_ms: startedAtMs,
+      public_url: typeof parsed?.public_url === "string" ? parsed.public_url : null,
+      mode: typeof parsed?.mode === "string" ? parsed.mode : "public"
+    };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeJoinCode(value) {
@@ -2120,14 +2029,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
-
-
-
-
-
-
 
 
 

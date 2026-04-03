@@ -4,149 +4,72 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>D3C / Fleet Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
-  <main class="dash-wrap">
-    <section class="dashboard-hero card">
-      <div class="dashboard-identity">
-        <div class="section-eyebrow">Mission Control</div>
-        <h1>D3C Fleet Dashboard</h1>
-        <p class="section-copy">Run the fleet from here: verify device health, choose your viewing scope, then start or stop recording from the session controls below.</p>
+<body class="app-body">
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="topbar-logo">D3C</span>
+      <span class="topbar-title">Fleet Dashboard</span>
+    </div>
+    <div class="status-bar" id="globalStatusBar" aria-label="Global status">
+      <div class="status-item" id="statusSystem">
+        <span class="indicator gray"></span>
+        <span class="status-text">System Ready</span>
       </div>
-      <div class="row header-actions">
-        <button id="advancedLayoutBtn" class="btn btn-alt">Workspace Tools</button>
-        <button id="themeToggleBtn" class="btn btn-alt">Switch Theme</button>
-        <button id="logoutBtn" class="btn btn-alt">Log Out</button>
+      <div class="status-item" id="statusConn">
+        <span class="indicator gray"></span>
+        <span class="status-text">Connected</span>
       </div>
-    </section>
-
-    <section class="dashboard-shell">
-      <section class="dashboard-main">
-        <section class="recording-banner-wrap">
-          <div id="recordingBanner" class="recording-banner idle">IDLE</div>
-        </section>
-
-        <section class="card status-bar" id="globalStatusBar" aria-label="Global status">
-          <div class="status-signal" id="statusConn">
-            <span class="status-k">Server Link</span>
-            <span class="status-v">Disconnected</span>
-          </div>
-          <div class="status-signal" id="statusRec">
-            <span class="status-k">Recording</span>
-            <span class="status-v">Off</span>
-          </div>
-          <div class="status-signal" id="statusDevices">
-            <span class="status-k">Devices</span>
-            <span class="status-v">0 online</span>
-          </div>
-          <div class="status-signal" id="statusImu">
-            <span class="status-k">IMU Throughput</span>
-            <span class="status-v">0 Hz</span>
-          </div>
-          <div class="status-signal" id="statusCam">
-            <span class="status-k">Camera Throughput</span>
-            <span class="status-v">0 FPS</span>
-          </div>
-          <div class="status-signal" id="statusAudio">
-            <span class="status-k">Audio</span>
-            <span class="status-v status-v-audio">Audio Level: -- dB</span>
-            <span class="status-sub">Detected: --</span>
-            <span class="status-sub">Clip: 0</span>
-            <span class="status-sub">Dropouts: 0</span>
-          </div>
-        </section>
-      </section>
-
-      <aside class="dashboard-rail card">
-        <div class="section-eyebrow">View Scope</div>
-        <h2 class="rail-title">What the dashboard is showing</h2>
-        <p class="rail-copy">Choose whether widgets follow one device closely or summarize the whole fleet.</p>
-        <section class="mode-bar" aria-label="View mode">
-          <div class="mode-group">
-            <span class="mode-label">Display Mode</span>
-            <div class="mode-segment" role="tablist" aria-label="Device view mode">
-              <button id="modeFocusedBtn" class="mode-seg-btn" type="button">Focused Device</button>
-              <button id="modeAllBtn" class="mode-seg-btn" type="button">All Devices</button>
-            </div>
-            <select id="viewModeSelect" class="mode-select-hidden" aria-hidden="true" tabindex="-1">
-              <option value="focused">Focused Device</option>
-              <option value="all">All Devices</option>
-            </select>
-          </div>
-          <label class="mode-device-label">Focused Device
-            <select id="focusedDeviceSelect"></select>
-          </label>
-          <div id="viewModeHint" class="mode-hint" hidden>All Devices mode active</div>
-        </section>
-        <div class="mode-note" aria-live="polite">Focus only changes the dashboard view. Recording always targets every connected device.</div>
-      </aside>
-    </section>
-
-    <section class="overview-strip" id="overviewStrip" aria-label="Fleet overview"></section>
-    <section class="alert-strip" id="alertStrip" aria-label="Important alerts"></section>
-
-    <section class="card toolbar" id="advancedLayoutPanel" hidden>
-      <div class="toolbar-head">
-        <div>
-          <div class="section-eyebrow">Workspace Tools</div>
-          <h2 class="toolbar-title">Customize the dashboard layout</h2>
-          <p class="toolbar-copy">Use this area when you want to save layouts, add widgets, or import/export workspace presets.</p>
-        </div>
+      <div class="status-item" id="statusDevices">
+        <span class="status-text">0/0 Devices</span>
       </div>
-      <div class="toolbar-row">
-        <label>Fleet Device Filter
-          <select id="globalDeviceFilter"></select>
-        </label>
-        <label>Layout
-          <select id="layoutSelect"></select>
-        </label>
-        <label>Layout Preset
+      <div class="status-item" id="statusRec">
+        <span class="indicator gray"></span>
+        <span class="status-text">Idle</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button id="logoutBtn" class="btn btn-alt btn-small">Log Out</button>
+    </div>
+  </header>
+
+  <details class="workspace-bar" id="advancedLayoutPanel">
+    <summary class="workspace-bar-summary">
+      <span class="workspace-bar-label">Workspace</span>
+      <div class="workspace-bar-controls" onclick="event.stopPropagation()">
+        <label>Layout <select id="layoutSelect"></select></label>
+        <label>Preset
           <select id="layoutPresetSelect">
-            <option value="">Select preset</option>
-            <option value="Recording">Recording</option>
-            <option value="Monitoring">Monitoring</option>
-            <option value="Debug">Debug</option>
+            <option value="">—</option>
+            <option value="Overview">Overview</option>
+            <option value="Cameras">Cameras</option>
+            <option value="Review">Review</option>
           </select>
         </label>
-        <button id="editLayoutBtn" class="btn btn-alt">Edit Layout</button>
+        <button id="editLayoutBtn" class="btn btn-alt btn-small">Edit</button>
+        <label>Name <input id="layoutNameInput" type="text" placeholder="e.g. Demo" /></label>
+        <button id="saveLayoutBtn" class="btn btn-small">Save</button>
+        <button id="deleteLayoutBtn" class="btn btn-alt btn-small">Delete</button>
+        <button id="exportLayoutBtn" class="btn btn-alt btn-small">Export</button>
+        <label class="file-label">Import <input id="importLayoutFile" type="file" accept="application/json" /></label>
       </div>
+    </summary>
+    <div class="workspace-bar-edit edit-row" id="editToolsRow">
+      <label>Add Widget <select id="addWidgetSelect"></select></label>
+      <button id="addWidgetBtn" class="btn btn-small">Add</button>
+      <span class="muted mono">Drag headers to move · Resize from corner</span>
+    </div>
+  </details>
 
-      <div class="toolbar-row">
-        <label>New Layout Name
-          <input id="layoutNameInput" type="text" placeholder="e.g. Demo" />
-        </label>
-        <button id="saveLayoutBtn" class="btn">Save Layout</button>
-        <button id="deleteLayoutBtn" class="btn btn-alt">Delete Layout</button>
-        <button id="exportLayoutBtn" class="btn btn-alt">Export Layout</button>
-        <label class="file-label">Import Layout
-          <input id="importLayoutFile" type="file" accept="application/json" />
-        </label>
-      </div>
-
-      <div class="toolbar-row edit-row" id="editToolsRow">
-        <label>Add Widget
-          <select id="addWidgetSelect"></select>
-        </label>
-        <button id="addWidgetBtn" class="btn">Add</button>
-        <span class="muted mono">Drag cards by header to reorder. Resize from the bottom-right corner handle.</span>
-      </div>
-    </section>
-
-    <section class="workspace-head">
-      <div>
-        <div class="section-eyebrow">Workspace</div>
-        <h2 class="workspace-title">Live panels</h2>
-      </div>
-      <p class="workspace-copy">Session controls, fleet health, and sensor panels update live below.</p>
-    </section>
+  <main class="widget-area">
     <section id="widgetGrid" class="widget-grid"></section>
   </main>
+
   <script type="module" src="/dashboard.js"></script>
 </body>
 </html>
-
-
-
-
-
