@@ -142,40 +142,14 @@ class CameraRecorder {
   }
 
   encodeFromJpgSequence({ fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23 }) {
-    return new Promise((resolve) => {
-      const inputPattern = path.join(this.cameraDir, "%06d.jpg");
-      const args = [
-        "-y",
-        "-framerate",
-        String(Math.max(1, Number(fps || 10))),
-        "-i",
-        inputPattern,
-        "-c:v",
-        "libx264",
-        "-b:v",
-        String(bitrate || "2M"),
-        "-crf",
-        String(Number.isFinite(crf) ? crf : 23),
-        "-pix_fmt",
-        "yuv420p",
-        this.videoPath
-      ];
-
-      const proc = spawn(ffmpegBin, args, { windowsHide: true });
-      let stderr = "";
-      proc.stderr.on("data", (d) => {
-        stderr += d.toString();
-      });
-      proc.on("error", (err) => {
-        resolve({ ok: false, error: err.message });
-      });
-      proc.on("close", (code) => {
-        if (code !== 0) {
-          resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-400)}` });
-          return;
-        }
-        resolve({ ok: true, skipped: false, videoPath: this.videoPath });
-      });
+    return encodeCameraDirToMp4({
+      cameraDir: this.cameraDir,
+      timestampsPath: this.timestampsPath,
+      outMp4: this.videoPath,
+      fps,
+      ffmpegBin,
+      bitrate,
+      crf
     });
   }
 
@@ -191,6 +165,157 @@ function safeRemoveDir(dirPath) {
 }
 
 module.exports = {
-  CameraRecorder
+  CameraRecorder,
+  encodeCameraDirToMp4
 };
 
+function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23 }) {
+  const resolvedCameraDir = path.resolve(cameraDir);
+  const resolvedOutMp4 = path.resolve(outMp4);
+  const timing = buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps: fps });
+  const args = timing?.sequenceDir
+    ? [
+        "-y",
+        "-framerate",
+        String(Math.max(1, Number(fps || 10))),
+        "-i",
+        path.join(timing.sequenceDir, "%06d.jpg"),
+        "-c:v",
+        "libx264",
+        "-b:v",
+        String(bitrate || "2M"),
+        "-crf",
+        String(Number.isFinite(crf) ? crf : 23),
+        "-pix_fmt",
+        "yuv420p",
+        resolvedOutMp4
+      ]
+    : [
+        "-y",
+        "-framerate",
+        String(Math.max(1, Number(fps || 10))),
+        "-i",
+        path.join(resolvedCameraDir, "%06d.jpg"),
+        "-c:v",
+        "libx264",
+        "-b:v",
+        String(bitrate || "2M"),
+        "-crf",
+        String(Number.isFinite(crf) ? crf : 23),
+        "-pix_fmt",
+        "yuv420p",
+        resolvedOutMp4
+      ];
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegBin, args, { windowsHide: true });
+    let stderr = "";
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+    proc.on("error", (err) => {
+      cleanupTimingManifest(timing);
+      resolve({ ok: false, error: err.message });
+    });
+    proc.on("close", (code) => {
+      cleanupTimingManifest(timing);
+      if (code !== 0) {
+        resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-400)}` });
+        return;
+      }
+      resolve({
+        ok: true,
+        skipped: false,
+        videoPath: resolvedOutMp4,
+        timing_mode: timing ? "timestamped" : "fixed_fps",
+        timing_source: timing?.source || null
+      });
+    });
+  });
+}
+
+function buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps }) {
+  try {
+    const resolvedCameraDir = path.resolve(cameraDir);
+    const resolvedTimestampsPath = path.resolve(timestampsPath);
+    if (!timestampsPath || !fs.existsSync(resolvedTimestampsPath)) return null;
+    const lines = fs.readFileSync(resolvedTimestampsPath, "utf8").trim().split(/\r?\n/).slice(1);
+    if (lines.length < 2) return null;
+    const rows = lines.map(parseTimestampRow).filter(Boolean);
+    if (rows.length < 2) return null;
+
+    const chosen = chooseTimeline(rows);
+    if (!chosen) return null;
+
+    const safeOutputFps = Math.max(1, Number(outputFps || 10));
+    const startMs = chosen.values[0];
+    const endMs = chosen.values[chosen.values.length - 1];
+    const durationMs = Math.max(0, endMs - startMs);
+    const outputFrameCount = Math.max(1, Math.round((durationMs / 1000) * safeOutputFps) + 1);
+    const sequenceDir = path.join(resolvedCameraDir, ".camera_ffmpeg_sequence");
+    safeRemoveDir(sequenceDir);
+    fs.mkdirSync(sequenceDir, { recursive: true });
+
+    let sourceIndex = 0;
+    for (let outputIndex = 0; outputIndex < outputFrameCount; outputIndex += 1) {
+      const targetMs = startMs + (outputIndex * 1000) / safeOutputFps;
+      while (
+        sourceIndex < chosen.values.length - 1 &&
+        chosen.values[sourceIndex + 1] <= targetMs
+      ) {
+        sourceIndex += 1;
+      }
+      const sourcePath = path.join(resolvedCameraDir, rows[sourceIndex].filename);
+      const destPath = path.join(sequenceDir, `${String(outputIndex + 1).padStart(6, "0")}.jpg`);
+      try {
+        fs.linkSync(sourcePath, destPath);
+      } catch {
+        fs.copyFileSync(sourcePath, destPath);
+      }
+    }
+
+    return { sequenceDir, source: chosen.source };
+  } catch {
+    return null;
+  }
+}
+
+function parseTimestampRow(line) {
+  const parts = line.split(",");
+  if (parts.length < 4) return null;
+  const filename = parts[1];
+  const tDeviceMs = Number(parts[2]);
+  const tRecvMs = Number(parts[3]);
+  if (!filename) return null;
+  return {
+    filename,
+    tDeviceMs: Number.isFinite(tDeviceMs) ? tDeviceMs : NaN,
+    tRecvMs: Number.isFinite(tRecvMs) ? tRecvMs : NaN
+  };
+}
+
+function chooseTimeline(rows) {
+  const deviceValues = rows.map((r) => r.tDeviceMs);
+  if (isStrictlyIncreasing(deviceValues)) {
+    return { source: "t_device_ms", values: deviceValues };
+  }
+  const recvValues = rows.map((r) => r.tRecvMs);
+  if (isStrictlyIncreasing(recvValues)) {
+    return { source: "t_recv_ms", values: recvValues };
+  }
+  return null;
+}
+
+function isStrictlyIncreasing(values) {
+  if (values.length < 2) return false;
+  for (let i = 0; i < values.length; i += 1) {
+    if (!Number.isFinite(values[i])) return false;
+    if (i > 0 && values[i] <= values[i - 1]) return false;
+  }
+  return true;
+}
+
+function cleanupTimingManifest(timing) {
+  if (!timing?.sequenceDir) return;
+  safeRemoveDir(timing.sequenceDir);
+}

@@ -11,6 +11,7 @@ const { sanitizeRunConfig, WS_ROLES } = require("./shared/schema");
 const { MotionState } = require("./compute/motion_state");
 const { SyncTracker } = require("./compute/sync_tracker");
 const { SessionManager } = require("./session/session_manager");
+const { encodeCameraDirToMp4 } = require("./session/recorders/camera_recorder");
 
 const AUTH_STATE_PATH = process.env.AUTH_STATE_PATH
   ? path.resolve(process.env.AUTH_STATE_PATH)
@@ -161,11 +162,12 @@ app.post("/api/datasets/:id/encode", requireDashboardAuth("api"), express.json()
   const cameraDir = path.join(streamsDir, "camera");
   if (!fs.existsSync(cameraDir)) return res.status(404).json({ error: "camera frames not found" });
   const outMp4 = path.join(streamsDir, "camera_video.mp4");
+  const timestampsPath = path.join(streamsDir, "camera_timestamps.csv");
   const fps = Math.max(1, Number(req.body?.fps || 10));
   const bitrate = String(req.body?.bitrate || "2M");
   const crf = Number.isFinite(req.body?.crf) ? Number(req.body.crf) : 23;
   const ffmpeg = process.env.FFMPEG_BIN || "ffmpeg";
-  const result = await encodeCameraDirToMp4({ cameraDir, outMp4, fps, bitrate, crf, ffmpegBin: ffmpeg });
+  const result = await encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, bitrate, crf, ffmpegBin: ffmpeg });
   const logPath = path.join(root, "control_log.jsonl");
   appendControlLog(logPath, { type: "manual_encode", device_id: deviceId, at_iso: new Date().toISOString(), result });
   if (!result.ok) return res.status(500).json(result);
@@ -1978,36 +1980,6 @@ function appendControlLog(controlLogPath, entry) {
   } catch {}
 }
 
-async function encodeCameraDirToMp4({ cameraDir, outMp4, fps, bitrate, crf, ffmpegBin }) {
-  const { spawn } = require("child_process");
-  return new Promise((resolve) => {
-    const args = [
-      "-y",
-      "-framerate",
-      String(Math.max(1, Number(fps || 10))),
-      "-i",
-      path.join(cameraDir, "%06d.jpg"),
-      "-c:v",
-      "libx264",
-      "-b:v",
-      String(bitrate || "2M"),
-      "-crf",
-      String(Number.isFinite(crf) ? crf : 23),
-      "-pix_fmt",
-      "yuv420p",
-      outMp4
-    ];
-    const proc = spawn(ffmpegBin, args, { windowsHide: true });
-    let stderr = "";
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("error", (err) => resolve({ ok: false, error: err.message }));
-    proc.on("close", (code) => {
-      if (code !== 0) return resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-400)}` });
-      resolve({ ok: true, videoPath: outMp4 });
-    });
-  });
-}
-
 function getDiskFreeBytes(targetPath) {
   try {
     const { execSync } = require("child_process");
@@ -2029,7 +2001,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
 
 
 
