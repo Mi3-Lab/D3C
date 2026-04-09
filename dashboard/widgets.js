@@ -10,7 +10,7 @@ export function getWidgetDevice(settings) {
   return "";
 }
 
-export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, defaultRunConfig, loadReplaySessions }) {
+export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRunConfig, defaultRunConfig, loadReplaySessions }) {
   return {
     fleet_health: {
       title: "Fleet Health",
@@ -44,13 +44,14 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const s = st.statesByDevice?.[d.device_id] || {};
             const imu = Number(d.imuHz ?? d.imu_hz ?? s.net?.imu_hz ?? 0);
             const cam = Number(d.camFps ?? d.cameraFps ?? d.camera_fps ?? s.net?.camera_fps ?? 0);
+            const camLive = !!d.cameraPreviewLive;
             const gps = s.gps_latest;
             const audio = s.audio_latest;
 
             const imuTxt = imu > 0 ? `${imu.toFixed(1)} Hz` : "idle";
             const gpsTxt = gps ? `${Number(gps.lat).toFixed(5)}, ${Number(gps.lon).toFixed(5)}` : "no fix";
             const audTxt = audio ? `${Math.round(20 * Math.log10(Math.max(1e-6, Number(audio.amplitude || 0))))} dB` : "idle";
-            const camTxt = cam > 0 ? `${cam.toFixed(1)} FPS` : "idle";
+            const camTxt = cam > 0 ? `${cam.toFixed(1)} FPS` : (camLive ? "WebRTC live" : "idle");
 
             const tr = document.createElement("tr");
             tr.innerHTML = `<td>${escapeHtml(String(d.deviceName || d.device_id))}<div class="device-sub">${escapeHtml(d.device_id)}</div></td><td>${escapeHtml(imuTxt)}</td><td>${escapeHtml(gpsTxt)}</td><td>${escapeHtml(audTxt)}</td><td>${escapeHtml(camTxt)}</td>`;
@@ -83,7 +84,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const imu = Number(d.imuHz ?? d.imu_hz ?? 0);
             const cam = Number(d.camFps ?? d.cameraFps ?? d.camera_fps ?? 0);
             const connected = d?.connected !== false;
-            const streaming = connected && (imu > 0.5 || cam > 0.5);
+            const streaming = connected && (imu > 0.5 || cam > 0.5 || !!d.cameraPreviewLive);
             const tone = connected ? (streaming ? "ok" : "warn") : "bad";
             const label = tone === "ok" ? "Streaming" : tone === "warn" ? "Idle" : "Disconnected";
 
@@ -132,7 +133,7 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const healthTitle = healthAlerts.length
               ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
               : "No active alerts";
-            tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${cam.toFixed(1)}</td><td><span class="gps-badge ${gpsClass}">${escapeHtml(gpsText)}</span></td><td><span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span></td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
+            tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${escapeHtml(cam > 0 ? cam.toFixed(1) : (d.cameraPreviewLive ? "RTC" : "0.0"))}</td><td><span class="gps-badge ${gpsClass}">${escapeHtml(gpsText)}</span></td><td><span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span></td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
             tbody.appendChild(tr);
           }
         });
@@ -575,7 +576,19 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
         const grid = document.createElement("div");
         grid.className = "camview-grid";
         const cards = new Map();
+        const empty = document.createElement("div");
+        empty.className = "camview-empty";
+        empty.textContent = "No devices connected";
         content.appendChild(grid);
+        grid.appendChild(empty);
+
+        function destroyCard(deviceId) {
+          const card = cards.get(deviceId);
+          if (!card) return;
+          try { card.detachPreview?.(); } catch {}
+          card.root.remove();
+          cards.delete(deviceId);
+        }
 
         function ensureCard(deviceId) {
           let card = cards.get(deviceId);
@@ -597,6 +610,11 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
 
           const frame = document.createElement("div");
           frame.className = "camview-frame";
+          const video = document.createElement("video");
+          video.className = "camview-video";
+          video.muted = true;
+          video.autoplay = true;
+          video.playsInline = true;
           const img = document.createElement("img");
           img.className = "camview-img";
           img.alt = deviceId;
@@ -607,19 +625,32 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
           const placeholder = document.createElement("div");
           placeholder.className = "camview-placeholder";
           placeholder.innerHTML = `<div class="camera-icon" aria-hidden="true"></div><p>No feed</p>`;
-          frame.append(img, placeholder);
+          const placeholderText = placeholder.querySelector("p");
+          frame.append(video, img, placeholder);
 
           root.append(header, frame);
           grid.appendChild(root);
 
-          card = { root, title, fps, badge, img, placeholder, lastCamTs: 0 };
+          card = {
+            root,
+            title,
+            fps,
+            badge,
+            video,
+            img,
+            placeholder,
+            placeholderText,
+            lastCamTs: 0,
+            detachPreview: previewRtc?.registerSink(deviceId, video) || null
+          };
           cards.set(deviceId, card);
           return card;
         }
 
-        const unsub = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice, recordByDevice: s.recordByDevice }), () => {
+        function renderCards() {
           const st = store.getState();
           const activeIds = new Set();
+          const now = Date.now();
 
           for (const summary of (st.deviceList || [])) {
             const deviceId = summary.device_id;
@@ -627,47 +658,77 @@ export function createWidgetRegistry({ store, bus, sendJson, mergeRunConfig, def
             const card = ensureCard(deviceId);
             const state = st.statesByDevice?.[deviceId] || {};
             const camTs = Number(state?.camera_latest_ts || 0);
-            const fresh = camTs > 0 && (Date.now() - camTs) < 4000;
+            const fresh = camTs > 0 && (now - camTs) < 4000;
             const fpsVal = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
             const rec = st.recordByDevice?.[deviceId];
             const isCamRecording = !!rec?.recording && !!rec?.modalities?.cam;
             const isOnline = summary.connected !== false;
-            const statusClass = !fresh || !isOnline ? "offline" : (isCamRecording ? "rec" : "live");
-            const statusLabel = !fresh || !isOnline ? "OFFLINE" : (isCamRecording ? "REC" : "LIVE");
+            const previewEnabled = !!state?.stream_status?.camera?.enabled;
+            previewRtc?.updateAvailability(deviceId, { connected: isOnline, previewEnabled });
+            const previewState = previewRtc?.getState(deviceId) || { live: false, connecting: false, error: "", stream: null };
+            const showVideo = !!previewState.live;
+            const showImage = !showVideo && fresh;
+            let statusClass = "offline";
+            let statusLabel = "OFFLINE";
+            let placeholderText = previewEnabled ? "No feed" : "Camera disabled";
+            if (!isOnline) {
+              placeholderText = "Device offline";
+            } else if (showVideo) {
+              statusClass = isCamRecording ? "rec" : "live";
+              statusLabel = isCamRecording ? "REC" : "LIVE";
+            } else if (showImage) {
+              statusClass = isCamRecording ? "rec" : "live";
+              statusLabel = isCamRecording ? "REC" : "LIVE";
+            } else if (previewState.connecting && previewEnabled) {
+              statusClass = isCamRecording ? "rec" : "live";
+              statusLabel = "LINK";
+              placeholderText = "Connecting live preview";
+            } else if (previewState.error) {
+              placeholderText = previewState.error;
+              statusLabel = "WAIT";
+            } else if (previewEnabled) {
+              statusLabel = "WAIT";
+              placeholderText = "Waiting for camera";
+            }
             const displayName = String(summary.deviceName || deviceId);
 
             card.title.textContent = displayName;
             card.badge.className = `camview-badge ${statusClass}`;
             card.badge.textContent = statusLabel;
-            card.fps.textContent = fresh && fpsVal > 0 ? `${fpsVal.toFixed(1)} fps` : "";
+            card.fps.textContent = showVideo ? "RTC" : (fresh && fpsVal > 0 ? `${fpsVal.toFixed(1)} fps` : "");
+            if (card.placeholderText) card.placeholderText.textContent = placeholderText;
 
-            if (fresh) {
+            if (showImage) {
               if (card.lastCamTs !== camTs) {
                 card.img.src = `/latest.jpg?device_id=${encodeURIComponent(deviceId)}&ts=${camTs}`;
                 card.lastCamTs = camTs;
               }
-              card.img.style.display = "";
-              card.placeholder.style.display = "none";
-            } else {
-              card.img.style.display = "none";
-              card.placeholder.style.display = "flex";
             }
+            card.video.style.display = showVideo ? "" : "none";
+            card.img.style.display = showImage ? "" : "none";
+            card.placeholder.style.display = showVideo || showImage ? "none" : "flex";
           }
 
-          for (const [deviceId, card] of cards.entries()) {
-            card.root.style.display = activeIds.has(deviceId) ? "" : "none";
+          for (const deviceId of [...cards.keys()]) {
+            if (activeIds.has(deviceId)) continue;
+            previewRtc?.updateAvailability(deviceId, { connected: false, previewEnabled: false });
+            destroyCard(deviceId);
           }
 
-          if (!activeIds.size) {
-            grid.innerHTML = `<div class="camview-empty">No devices connected</div>`;
-            cards.clear();
-          } else {
-            const empty = grid.querySelector(".camview-empty");
-            if (empty) empty.remove();
-          }
+          empty.style.display = activeIds.size ? "none" : "";
+        }
+
+        const unsubStore = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice, recordByDevice: s.recordByDevice }), renderCards);
+        const unsubPreview = bus.on("preview_rtc_update", ({ deviceId } = {}) => {
+          if (!deviceId || cards.has(deviceId)) renderCards();
         });
+        renderCards();
 
-        return () => unsub();
+        return () => {
+          unsubStore();
+          unsubPreview();
+          for (const deviceId of [...cards.keys()]) destroyCard(deviceId);
+        };
       }
     },
 
@@ -1072,7 +1133,7 @@ function computeSessionPreflight(st, cfg) {
     return items;
   }
   const activeImu = connected.filter((d) => Number(d.imuHz ?? d.imu_hz ?? 0) > 0.5).length;
-  const activeCam = connected.filter((d) => Number(d.camFps ?? d.camera_fps ?? 0) > 0.5).length;
+  const activeCam = connected.filter((d) => Number(d.camFps ?? d.camera_fps ?? 0) > 0.5 || !!d.cameraPreviewLive).length;
   const gpsOk = connected.filter((d) => {
     const gpsTs = Number(st.statesByDevice?.[d.device_id]?.gps_latest?.t_recv_ms || 0);
     return gpsTs && (Date.now() - gpsTs) < 12000;
@@ -1083,7 +1144,7 @@ function computeSessionPreflight(st, cfg) {
     items.push({ severity: "warn", message: `IMU is enabled but only ${activeImu}/${connected.length} devices are sending motion data.` });
   }
   if (cfg.streams.camera.mode === "stream" && activeCam < connected.length) {
-    items.push({ severity: "warn", message: `Camera is enabled but only ${activeCam}/${connected.length} devices are sending preview frames.` });
+    items.push({ severity: "warn", message: `Camera is enabled but only ${activeCam}/${connected.length} devices are sending camera frames or live preview.` });
   }
   if (cfg.streams.gps.enabled && gpsOk < connected.length) {
     items.push({ severity: "warn", message: `GPS is enabled but only ${gpsOk}/${connected.length} devices have a recent fix.` });
@@ -1211,10 +1272,6 @@ function addInfoLine(parent, text) {
   line.textContent = text;
   parent.appendChild(line);
 }
-
-
-
-
 
 
 

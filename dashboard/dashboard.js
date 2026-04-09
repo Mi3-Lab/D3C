@@ -62,9 +62,11 @@ const store = createStore({
 });
 
 const bus = createEventBus();
+const previewRtc = createPreviewRtcManager({ bus, sendJson });
 const widgetRegistry = createWidgetRegistry({
   store,
   bus,
+  previewRtc,
   sendJson,
   mergeRunConfig,
   defaultRunConfig: DEFAULT_RUN_CONFIG,
@@ -128,6 +130,327 @@ function init() {
     const img = cameraWidget?.el.querySelector("img");
     if (img) img.src = src;
   });
+}
+
+function createPreviewRtcManager({ bus, sendJson }) {
+  const ICE_SERVERS = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
+  const entries = new Map();
+  let signalingConnected = false;
+  let dashboardClientId = "";
+
+  function ensureEntry(deviceId) {
+    const key = String(deviceId || "").trim();
+    if (!key) return null;
+    if (entries.has(key)) return entries.get(key);
+    const entry = {
+      deviceId: key,
+      available: { connected: false, previewEnabled: false },
+      sinks: new Set(),
+      pc: null,
+      stream: null,
+      pendingRemoteIce: [],
+      restartTimer: null,
+      connecting: false,
+      live: false,
+      error: ""
+    };
+    entries.set(key, entry);
+    return entry;
+  }
+
+  function isDesired(entry) {
+    return !!entry && signalingConnected && !!dashboardClientId && entry.available.connected && entry.available.previewEnabled && entry.sinks.size > 0;
+  }
+
+  function applyStream(entry) {
+    const stream = entry?.stream && entry.stream.getTracks().length ? entry.stream : null;
+    for (const sink of entry?.sinks || []) {
+      if (sink.srcObject !== stream) sink.srcObject = stream;
+      if (stream) {
+        try { sink.play?.().catch(() => {}); } catch {}
+      }
+    }
+  }
+
+  function emitUpdate(deviceId) {
+    bus.emit("preview_rtc_update", { deviceId });
+  }
+
+  function clearRestart(entry) {
+    if (!entry?.restartTimer) return;
+    clearTimeout(entry.restartTimer);
+    entry.restartTimer = null;
+  }
+
+  function humanizeReason(reason) {
+    if (reason === "camera_disabled") return "Camera disabled";
+    if (reason === "camera_unavailable") return "Camera unavailable";
+    if (reason === "dashboard_disconnected") return "Dashboard reconnecting";
+    if (reason === "preview_failed") return "Preview reconnecting";
+    if (reason === "answer_failed") return "Preview negotiation failed";
+    return reason ? String(reason).replaceAll("_", " ") : "";
+  }
+
+  function cleanupEntry(entry) {
+    if (!entry || entry.sinks.size || entry.pc || entry.restartTimer || entry.available.connected || entry.available.previewEnabled) return;
+    entries.delete(entry.deviceId);
+  }
+
+  function stopPeer(entry, notifyPhone = false, reason = "preview_closed") {
+    if (!entry) return;
+    clearRestart(entry);
+    const hadPeer = !!entry.pc;
+    entry.connecting = false;
+    entry.live = false;
+    entry.pendingRemoteIce = [];
+    entry.stream = null;
+    if (notifyPhone && signalingConnected && dashboardClientId && hadPeer) {
+      sendJson({
+        type: "webrtc_signal",
+        device_id: entry.deviceId,
+        dashboard_id: dashboardClientId,
+        signal: { type: "disconnect", reason }
+      });
+    }
+    if (entry.pc) {
+      try {
+        entry.pc.ontrack = null;
+        entry.pc.onicecandidate = null;
+        entry.pc.onconnectionstatechange = null;
+        entry.pc.oniceconnectionstatechange = null;
+        entry.pc.close();
+      } catch {}
+    }
+    entry.pc = null;
+    applyStream(entry);
+    emitUpdate(entry.deviceId);
+    cleanupEntry(entry);
+  }
+
+  function scheduleReconnect(entry, delayMs = 1500) {
+    if (!entry || entry.restartTimer || !isDesired(entry)) return;
+    entry.restartTimer = setTimeout(() => {
+      entry.restartTimer = null;
+      maybeStart(entry);
+    }, delayMs);
+  }
+
+  async function flushPendingIce(entry) {
+    if (!entry?.pc || !entry.pendingRemoteIce.length) return;
+    while (entry.pendingRemoteIce.length) {
+      const candidate = entry.pendingRemoteIce.shift();
+      try {
+        await entry.pc.addIceCandidate(candidate);
+      } catch {}
+    }
+  }
+
+  async function maybeStart(entry) {
+    if (!isDesired(entry) || entry.pc || entry.connecting) return;
+    entry.connecting = true;
+    entry.error = "";
+    emitUpdate(entry.deviceId);
+
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    entry.pc = pc;
+    entry.stream = null;
+    entry.pendingRemoteIce = [];
+    applyStream(entry);
+
+    const handlePeerFailure = (reason) => {
+      if (entry.pc !== pc) return;
+      entry.error = humanizeReason(reason) || "Preview reconnecting";
+      stopPeer(entry, false);
+      scheduleReconnect(entry);
+    };
+
+    const syncTransportState = () => {
+      if (entry.pc !== pc) return;
+      const states = [String(pc.connectionState || ""), String(pc.iceConnectionState || "")];
+      const live = states.includes("connected") || states.includes("completed");
+      if (entry.live !== live) {
+        entry.live = live;
+        emitUpdate(entry.deviceId);
+      }
+      if (states.includes("failed") || states.includes("closed")) {
+        handlePeerFailure("preview_failed");
+        return;
+      }
+      if (states.includes("disconnected")) {
+        entry.live = false;
+        emitUpdate(entry.deviceId);
+        handlePeerFailure("preview_failed");
+      }
+    };
+
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.ontrack = (ev) => {
+      if (entry.pc !== pc) return;
+      entry.stream = ev.streams?.[0] || new MediaStream([ev.track]);
+      entry.live = true;
+      entry.error = "";
+      applyStream(entry);
+      emitUpdate(entry.deviceId);
+      ev.track.onended = () => {
+        if (entry.pc !== pc) return;
+        entry.live = false;
+        emitUpdate(entry.deviceId);
+      };
+    };
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate || entry.pc !== pc || !signalingConnected || !dashboardClientId) return;
+      sendJson({
+        type: "webrtc_signal",
+        device_id: entry.deviceId,
+        dashboard_id: dashboardClientId,
+        signal: {
+          type: "ice",
+          candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
+        }
+      });
+    };
+    pc.onconnectionstatechange = syncTransportState;
+    pc.oniceconnectionstatechange = syncTransportState;
+
+    try {
+      const offer = await pc.createOffer();
+      if (entry.pc !== pc) return;
+      await pc.setLocalDescription(offer);
+      if (entry.pc !== pc || !signalingConnected || !dashboardClientId) return;
+      sendJson({
+        type: "webrtc_signal",
+        device_id: entry.deviceId,
+        dashboard_id: dashboardClientId,
+        signal: { type: "offer", sdp: String(pc.localDescription?.sdp || offer.sdp || "") }
+      });
+    } catch {
+      entry.error = "Live preview failed to start";
+      stopPeer(entry, false);
+      scheduleReconnect(entry, 2000);
+    } finally {
+      entry.connecting = false;
+      emitUpdate(entry.deviceId);
+    }
+  }
+
+  function setSignalingState({ connected, clientId } = {}) {
+    const nextConnected = typeof connected === "boolean" ? connected : signalingConnected;
+    const nextClientId = typeof clientId === "string" ? clientId : dashboardClientId;
+    const clientChanged = nextClientId !== dashboardClientId;
+    const connectionChanged = nextConnected !== signalingConnected;
+
+    signalingConnected = nextConnected;
+    dashboardClientId = nextClientId;
+
+    if (clientChanged || !signalingConnected) {
+      for (const entry of entries.values()) {
+        stopPeer(entry, false);
+      }
+      if (signalingConnected) {
+        for (const entry of entries.values()) maybeStart(entry);
+      }
+    } else if (connectionChanged && signalingConnected) {
+      for (const entry of entries.values()) {
+        maybeStart(entry);
+      }
+    }
+  }
+
+  async function handleSignal(msg) {
+    const deviceId = String(msg.device_id || "").trim();
+    const signal = msg.signal && typeof msg.signal === "object" ? msg.signal : null;
+    if (!deviceId || !signal) return;
+    const entry = ensureEntry(deviceId);
+    if (!entry) return;
+
+    if (signal.type === "answer") {
+      if (!entry.pc || typeof signal.sdp !== "string") return;
+      try {
+        await entry.pc.setRemoteDescription({ type: "answer", sdp: signal.sdp });
+        entry.error = "";
+        await flushPendingIce(entry);
+        emitUpdate(entry.deviceId);
+      } catch {
+        entry.error = "Preview negotiation failed";
+        stopPeer(entry, false);
+        scheduleReconnect(entry, 2000);
+      }
+      return;
+    }
+
+    if (signal.type === "ice") {
+      if (!entry.pc || !signal.candidate) return;
+      if (!entry.pc.remoteDescription) {
+        entry.pendingRemoteIce.push(signal.candidate);
+        return;
+      }
+      try {
+        await entry.pc.addIceCandidate(signal.candidate);
+      } catch {}
+      return;
+    }
+
+    if (signal.type === "disconnect" || signal.type === "unavailable") {
+      entry.error = humanizeReason(signal.reason || signal.type);
+      stopPeer(entry, false);
+      if (signal.type === "unavailable") scheduleReconnect(entry, 3000);
+    }
+  }
+
+  function registerSink(deviceId, videoEl) {
+    const entry = ensureEntry(deviceId);
+    if (!entry || !videoEl) return () => {};
+    videoEl.autoplay = true;
+    videoEl.muted = true;
+    videoEl.playsInline = true;
+    entry.sinks.add(videoEl);
+    applyStream(entry);
+    maybeStart(entry);
+    emitUpdate(entry.deviceId);
+    return () => {
+      entry.sinks.delete(videoEl);
+      videoEl.srcObject = null;
+      if (!entry.sinks.size) stopPeer(entry, true, "widget_closed");
+      cleanupEntry(entry);
+    };
+  }
+
+  function updateAvailability(deviceId, availability = {}) {
+    const entry = ensureEntry(deviceId);
+    if (!entry) return;
+    const nextConnected = !!availability.connected;
+    const nextPreviewEnabled = !!availability.previewEnabled;
+    if (entry.available.connected === nextConnected && entry.available.previewEnabled === nextPreviewEnabled) return;
+    entry.available = {
+      connected: nextConnected,
+      previewEnabled: nextPreviewEnabled
+    };
+    if (!entry.available.connected || !entry.available.previewEnabled) {
+      stopPeer(entry, true, "preview_unavailable");
+      if (!entry.available.connected || !entry.available.previewEnabled) entry.error = "";
+    } else {
+      maybeStart(entry);
+    }
+    emitUpdate(entry.deviceId);
+  }
+
+  function getState(deviceId) {
+    const entry = entries.get(String(deviceId || "").trim());
+    return {
+      live: !!entry?.live,
+      connecting: !!entry?.pc || !!entry?.connecting,
+      error: entry?.error || "",
+      stream: entry?.stream || null
+    };
+  }
+
+  return {
+    getState,
+    handleSignal,
+    registerSink,
+    setSignalingState,
+    updateAvailability
+  };
 }
 
 function updateGlobalStatusBar() {
@@ -276,10 +599,12 @@ function connectWs() {
   ws = new WebSocket(`${wsScheme}://${location.host}/ws`);
   ws.onopen = () => {
     store.setState({ wsConnected: true });
+    previewRtc.setSignalingState({ connected: true });
     sendJson({ type: "hello", role: "dashboard" });
   };
   ws.onclose = () => {
     store.setState({ wsConnected: false });
+    previewRtc.setSignalingState({ connected: false, clientId: "" });
     setTimeout(connectWs, 1000);
   };
   ws.onmessage = (ev) => {
@@ -287,8 +612,18 @@ function connectWs() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (!msg) return;
 
+    if (msg.type === "hello_ack" && msg.role === "dashboard") {
+      previewRtc.setSignalingState({ connected: true, clientId: String(msg.client_id || "") });
+      return;
+    }
+
     if (msg.type === "auth_required") {
       window.location.assign(`/dashboard/login?next=${encodeURIComponent(location.pathname + location.search)}`);
+      return;
+    }
+
+    if (msg.type === "webrtc_signal") {
+      void previewRtc.handleSignal(msg);
       return;
     }
 
@@ -880,8 +1215,3 @@ function mergeRunConfig(input) {
 function sendJson(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
-
-
-
-
-

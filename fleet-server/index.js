@@ -300,6 +300,7 @@ wss.on("connection", (ws, req) => {
         d.connected = false;
         d.ws = null;
         d.lastSeenTs = Date.now();
+        d.state.camera_preview = { live: false, peer_count: 0, updated_at_ms: Date.now() };
         d.recordingStatus.recording = false;
         d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
       }
@@ -307,6 +308,9 @@ wss.on("connection", (ws, req) => {
         focusedDeviceId = firstConnectedDeviceId() || null;
       }
       broadcastDeviceList();
+    }
+    if (ws.role === "dashboard" && ws.client_id) {
+      relayPreviewDisconnectToPhones(ws.client_id, "dashboard_disconnected");
     }
     dashboardSockets.delete(ws);
   });
@@ -399,6 +403,7 @@ function handleHello(ws, msg) {
       dashboards_disconnected: connectionStats.dashboards_disconnected
     });
     dashboardSockets.add(ws);
+    sendWs(ws, { type: "hello_ack", role: "dashboard", client_id: ws.client_id }, { critical: true });
     sendWs(ws, { type: "device_list", devices: deviceSummaries() });
     sendWs(ws, { type: "focus", focused_device_id: focusedDeviceId });
     sendWs(ws, buildSessionConfigPayload());
@@ -476,6 +481,29 @@ function handlePhoneJson(ws, msg) {
   const d = devices.get(deviceId);
   if (!d) return;
   d.lastSeenTs = Date.now();
+
+  if (msg.type === "webrtc_signal") {
+    const dashboardId = String(msg.dashboard_id || "").trim();
+    const signal = sanitizeWebRtcSignal(msg.signal);
+    const dashboardWs = findDashboardSocketByClientId(dashboardId);
+    if (!dashboardWs || !signal) return;
+    sendWs(dashboardWs, {
+      type: "webrtc_signal",
+      dashboard_id: dashboardId,
+      device_id: deviceId,
+      signal
+    }, { critical: true });
+    return;
+  }
+
+  if (msg.type === "preview_status") {
+    d.state.camera_preview = {
+      live: !!msg.active,
+      peer_count: Math.max(0, Math.min(8, Number(msg.peer_count || 0) || 0)),
+      updated_at_ms: Date.now()
+    };
+    return;
+  }
 
   if (msg.type === "imu") {
     if (!allowByRate(d, "imu", d.config.streams.imu.rate_hz)) return;
@@ -638,6 +666,13 @@ function handlePhoneJson(ws, msg) {
 
   if (msg.type === "heartbeat") {
     d.lastSeenTs = Date.now();
+    if (typeof msg.preview_active !== "undefined" || typeof msg.preview_peer_count !== "undefined") {
+      d.state.camera_preview = {
+        live: !!msg.preview_active,
+        peer_count: Math.max(0, Math.min(8, Number(msg.preview_peer_count || 0) || 0)),
+        updated_at_ms: Date.now()
+      };
+    }
     return;
   }
 
@@ -709,6 +744,20 @@ function handlePhoneBinary(ws, data) {
 }
 
 function handleDashboardJson(ws, msg) {
+  if (msg.type === "webrtc_signal") {
+    const deviceId = sanitizeDeviceId(String(msg.device_id || "").trim());
+    const signal = sanitizeWebRtcSignal(msg.signal);
+    const d = devices.get(deviceId);
+    if (!deviceId || !signal || !d?.connected || !isSocketOpen(d.ws)) return;
+    sendWs(d.ws, {
+      type: "webrtc_signal",
+      dashboard_id: ws.client_id,
+      device_id: deviceId,
+      signal
+    }, { critical: true });
+    return;
+  }
+
   if (msg.type === "set_focus") {
     const id = String(msg.device_id || "");
     if (devices.has(id)) focusedDeviceId = id;
@@ -1091,6 +1140,7 @@ function publicStateForDevice(deviceId, d) {
     inactivity_duration_sec: d.state.inactivity_duration_sec,
     imu_latest: d.state.imu_latest,
     camera_latest_ts: d.state.camera_latest_ts,
+    camera_preview: d.state.camera_preview,
     audio_latest: d.state.audio_latest,
     gps_latest: d.state.gps_latest,
     device_latest: d.state.device_latest,
@@ -1123,6 +1173,7 @@ function deviceSummaries() {
       connectionStatus: d.connectionStatus || "disconnected",
       deviceName: d.device_name || id,
       capabilities: d.capabilities || {},
+      cameraPreviewLive: !!d.state.camera_preview?.live,
       recordingActive: !!d.recordingStatus?.recording,
       recordingState: d.recordingStatus?.recording ? "recording" : (d.connected ? "armed" : "idle"),
       recordingModalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
@@ -1137,13 +1188,14 @@ function deviceSummaries() {
 function buildStreamStatus(config, d) {
   const s = config.streams;
   const now = Date.now();
+  const cameraSeenMs = cameraActivityTsForDevice(d);
   return {
     imu: { enabled: !!s.imu.enabled, recording: !!s.imu.record, rate: `${s.imu.rate_hz} Hz`, last_seen_ms: d.state.imu_latest?.t_recv_ms || null },
     camera: {
       enabled: s.camera.mode !== "off",
       recording: !!s.camera.record && s.camera.mode === "stream",
       rate: s.camera.mode === "stream" ? `${s.camera.fps} fps (${s.camera.record_mode || "jpg"})` : s.camera.mode,
-      last_seen_ms: d.state.camera_latest_ts || null
+      last_seen_ms: cameraSeenMs || null
     },
     gps: { enabled: !!s.gps.enabled, recording: !!s.gps.record, rate: `${s.gps.rate_hz} Hz`, last_seen_ms: d.state.gps_latest?.t_recv_ms || null },
     audio: { enabled: !!s.audio.enabled, recording: !!s.audio.record, rate: `${s.audio.rate_hz} Hz`, last_seen_ms: d.state.audio_latest?.t_recv_ms || null },
@@ -1165,7 +1217,7 @@ function computeFusion(d) {
   const connection_quality = Number((0.6 * rttScore + 0.4 * dropScore).toFixed(3));
   const enabled = [];
   if (d.config.streams.imu.enabled) enabled.push(d.state.imu_latest?.t_recv_ms || 0);
-  if (d.config.streams.camera.mode === "stream") enabled.push(d.state.camera_latest_ts || 0);
+  if (d.config.streams.camera.mode === "stream") enabled.push(cameraActivityTsForDevice(d) || 0);
   if (d.config.streams.audio.enabled) enabled.push(d.state.audio_latest?.t_recv_ms || 0);
   if (d.config.streams.device.enabled) enabled.push(d.state.device_latest?.t_recv_ms || 0);
   const now = Date.now();
@@ -1177,6 +1229,54 @@ function computeFusion(d) {
 
 function isSocketOpen(sock) {
   return !!sock && sock.readyState === WebSocket.OPEN;
+}
+
+function cameraActivityTsForDevice(d) {
+  const previewTs = d?.state?.camera_preview?.live ? Number(d.state.camera_preview.updated_at_ms || 0) : 0;
+  return Math.max(Number(d?.state?.camera_latest_ts || 0), previewTs) || 0;
+}
+
+function findDashboardSocketByClientId(clientId) {
+  const targetId = String(clientId || "").trim();
+  if (!targetId) return null;
+  for (const ws of dashboardSockets) {
+    if (ws.client_id === targetId && isSocketOpen(ws)) return ws;
+  }
+  return null;
+}
+
+function relayPreviewDisconnectToPhones(dashboardId, reason = "dashboard_disconnected") {
+  const targetId = String(dashboardId || "").trim();
+  if (!targetId) return;
+  for (const [deviceId, d] of devices.entries()) {
+    if (!d.connected || !isSocketOpen(d.ws)) continue;
+    sendWs(d.ws, {
+      type: "webrtc_signal",
+      dashboard_id: targetId,
+      device_id: deviceId,
+      signal: { type: "disconnect", reason }
+    }, { critical: true });
+  }
+}
+
+function sanitizeWebRtcSignal(signal) {
+  if (!signal || typeof signal !== "object") return null;
+  const type = String(signal.type || "").trim();
+  if (!["offer", "answer", "ice", "disconnect", "unavailable"].includes(type)) return null;
+  const out = { type };
+  if ((type === "offer" || type === "answer")) {
+    if (typeof signal.sdp !== "string" || !signal.sdp.trim()) return null;
+    out.sdp = signal.sdp;
+  }
+  if (type === "ice") {
+    if (signal.candidate && typeof signal.candidate === "object") out.candidate = signal.candidate;
+    else if (typeof signal.candidate === "string" && signal.candidate.trim()) out.candidate = { candidate: signal.candidate };
+    else return null;
+  }
+  if (typeof signal.reason === "string" && signal.reason.trim()) {
+    out.reason = signal.reason.trim().slice(0, 160);
+  }
+  return out;
 }
 
 function resolvePhoneDeviceId({ requested, reconnectKey, incomingWs }) {
@@ -1253,6 +1353,7 @@ function newDeviceEntry(deviceId) {
       inactivity_duration_sec: 0,
       imu_latest: null,
       camera_latest_ts: null,
+      camera_preview: { live: false, peer_count: 0, updated_at_ms: null },
       audio_latest: null,
       gps_latest: null,
       device_latest: null,
@@ -1828,7 +1929,8 @@ function computeDeviceAlerts(d) {
   if (stream.camera?.mode === "stream") {
     const target = Number(stream.camera.fps || 0);
     const actual = Number(d.stats.camera_fps || 0);
-    if (target > 0 && actual < Math.max(1, target * 0.6)) {
+    const previewLive = !!d.state?.camera_preview?.live;
+    if (target > 0 && actual < Math.max(1, target * 0.6) && !(previewLive && actual === 0)) {
       alerts.push({ severity: "warn", code: "cam_low_fps", message: `Camera low ${actual.toFixed(1)}/${target} FPS` });
     }
   }
@@ -2001,8 +2103,6 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
 
 
 

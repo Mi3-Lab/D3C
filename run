@@ -1,0 +1,4 @@
+#!/bin/bash
+
+./.local/bin/cloudflared --version
+./scripts/start-quick-tunnel.sh

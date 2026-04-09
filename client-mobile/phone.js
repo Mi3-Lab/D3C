@@ -19,6 +19,7 @@
   const cameraPreviewFps = document.getElementById("cameraPreviewFps");
   const cameraPreviewMeta = document.getElementById("cameraPreviewMeta");
   const RECONNECT_KEY_STORAGE = "d3c_phone_reconnect_key";
+  const PREVIEW_ICE_SERVERS = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
 
   const DEFAULT_RUN_CONFIG = {
     device_id: resolveDeviceId(),
@@ -83,6 +84,8 @@
   let wakeLock = null;
   const deviceMonoOriginWallMs = Date.now() - performance.now();
   let silentAudio = null;
+  const previewPeers = new Map();
+  let lastPreviewStatusSent = "";
 
   renderDeviceIdentity();
   renderJoinFields();
@@ -181,6 +184,8 @@
       },
       onClose() {
         ws = null;
+        closeAllPreviewPeers("signaling_lost");
+        lastPreviewStatusSent = "";
         setConnectionUi(false, "Disconnected");
         if (started) setJoinStatus("Disconnected - retrying");
         renderStatus();
@@ -200,6 +205,7 @@
             if (deviceNameInput) deviceNameInput.value = authState.deviceName;
           }
           renderDeviceIdentity();
+          emitPreviewStatus(true);
           renderStatus();
           return;
         }
@@ -212,12 +218,17 @@
           if (msg.device_id && msg.device_id !== runConfig.device_id) return;
           runConfig = mergeRunConfig(msg.runConfig);
           renderStatus();
-          applyConfig();
+          void applyConfig();
           return;
         }
         if (msg.type === "recording_state") {
           sessionRecordingActive = !!msg.active;
+          updateCameraTransport();
           renderStatus();
+          return;
+        }
+        if (msg.type === "webrtc_signal") {
+          void handlePreviewSignal(msg);
           return;
         }
         if (msg.type === "sync_ping") {
@@ -282,18 +293,12 @@
     const mode = runConfig.streams.camera.mode === "preview" ? "stream" : runConfig.streams.camera.mode;
     if (mode === "off") {
       stopCamera();
+      closeAllPreviewPeers("camera_off", true);
       cameraPermissionState = runConfig.streams.camera.record || runConfig.streams.camera.mode !== "off" ? cameraPermissionState : "idle";
     } else {
-      if (!cameraStream) {
-        try {
-          cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacingMode }, audio: false });
-          cameraPermissionState = "granted";
-          previewEl.srcObject = cameraStream;
-        } catch {
-          cameraPermissionState = "denied";
-        }
-      }
-      if (mode === "stream") startFrameLoop();
+      await ensureCameraStream();
+      syncPreviewTracks();
+      updateCameraTransport();
     }
     await applyAudioConfig();
     applyGpsConfig();
@@ -390,25 +395,40 @@
     frameTimer = null;
   }
 
+  function shouldRunSnapshotLoop() {
+    const mode = runConfig.streams.camera.mode === "preview" ? "stream" : runConfig.streams.camera.mode;
+    return started && mode === "stream" && (sessionRecordingActive || connectedPreviewPeerCount() === 0);
+  }
+
+  function updateCameraTransport() {
+    if (!cameraStream || !shouldRunSnapshotLoop()) {
+      stopFrameLoop();
+      return;
+    }
+    startFrameLoop();
+  }
+
   function stopCamera() {
     stopFrameLoop();
     if (!cameraStream) return;
     for (const t of cameraStream.getTracks()) t.stop();
     cameraStream = null;
     previewEl.srcObject = null;
+    emitPreviewStatus(true);
   }
 
   async function restartCamera() {
-    stopCamera();
-    if (runConfig.streams.camera.mode === "off") return;
-    try {
-      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacingMode }, audio: false });
-      cameraPermissionState = "granted";
-      previewEl.srcObject = cameraStream;
-      if (runConfig.streams.camera.mode === "stream") startFrameLoop();
-    } catch {
-      cameraPermissionState = "denied";
+    stopFrameLoop();
+    if (cameraStream) {
+      for (const t of cameraStream.getTracks()) t.stop();
     }
+    cameraStream = null;
+    previewEl.srcObject = null;
+    if (runConfig.streams.camera.mode === "off") return;
+    await ensureCameraStream();
+    syncPreviewTracks();
+    updateCameraTransport();
+    emitPreviewStatus(true);
   }
 
   async function applyAudioConfig() {
@@ -597,7 +617,9 @@
         type: "heartbeat",
         device_id: runConfig.device_id,
         t_device_ms: getDeviceMonoMs(),
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        preview_active: connectedPreviewPeerCount() > 0,
+        preview_peer_count: connectedPreviewPeerCount()
       });
     }, interval);
   }
@@ -669,11 +691,12 @@
     }
 
     if (runConfig.streams.camera.mode !== "off") {
+      const cameraReady = cameraPermissionState === "granted" && !!cameraStream;
       items.push(readinessItem(
         "Camera",
-        cameraPermissionState === "granted" && ageFresh(lastCameraFrameMs, now, 6000) ? "ready" : cameraPermissionState === "denied" ? "error" : "warning",
+        cameraReady ? "ready" : cameraPermissionState === "denied" ? "error" : "warning",
         cameraPermissionState === "granted"
-          ? (ageFresh(lastCameraFrameMs, now, 6000) ? "Preview frames are flowing" : "Permission granted, waiting for frames")
+          ? (cameraStream ? "Camera is ready for live preview" : "Permission granted, waiting for camera")
           : describePermission(cameraPermissionState, "camera")
       ));
     }
@@ -819,15 +842,15 @@
   function renderCameraPreviewStatus() {
     if (!cameraPreviewBadge || !cameraPreviewFps || !cameraPreviewMeta) return;
     const active = runConfig.streams.camera.mode !== "off";
-    const streaming = active && ageFresh(lastCameraFrameMs, Date.now(), 6000);
+    const streaming = active && !!cameraStream;
     const width = Number(previewEl?.videoWidth || 0);
     const height = Number(previewEl?.videoHeight || 0);
     const fps = Number(runConfig.streams.camera?.fps || 0);
     cameraPreviewBadge.textContent = streaming ? "LIVE" : (active ? "WAITING" : "OFF");
     cameraPreviewBadge.className = `badge ${streaming ? "live" : active ? "pending" : "off"}`;
-    cameraPreviewFps.textContent = `${streaming ? fps : 0} FPS`;
+    cameraPreviewFps.textContent = streaming ? (connectedPreviewPeerCount() > 0 ? "RTC" : `${fps} FPS`) : "0 FPS";
     const parts = [];
-    parts.push(`Camera: ${active ? `${fps} FPS` : "Off"}`);
+    parts.push(`Camera: ${active ? (connectedPreviewPeerCount() > 0 ? "WebRTC live" : `${fps} FPS`) : "Off"}`);
     parts.push(width && height ? `Resolution: ${width}x${height}` : "Resolution: --");
     parts.push(`Facing: ${cameraFacingMode === "user" ? "Front" : "Rear"}`);
     cameraPreviewMeta.innerHTML = parts.map((part) => `<span>${part}</span>`).join("<span>•</span>");
@@ -883,7 +906,242 @@
     if (motionPermissionState === "implicit") return "Motion pending";
     return "Motion permission pending";
   }
-function queueJson(obj) {
+
+  async function ensureCameraStream() {
+    if (cameraStream) return cameraStream;
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacingMode }, audio: false });
+      cameraPermissionState = "granted";
+      previewEl.srcObject = cameraStream;
+      try { await previewEl.play?.(); } catch {}
+      emitPreviewStatus(true);
+      return cameraStream;
+    } catch {
+      cameraPermissionState = "denied";
+      emitPreviewStatus(true);
+      return null;
+    }
+  }
+
+  function previewPeerTransportState(entry) {
+    const state = entry?.pc?.connectionState || entry?.pc?.iceConnectionState || "new";
+    return String(state || "new");
+  }
+
+  function previewPeerIsConnected(entry) {
+    const states = [entry?.pc?.connectionState, entry?.pc?.iceConnectionState]
+      .map((value) => String(value || ""))
+      .filter(Boolean);
+    return states.includes("connected") || states.includes("completed");
+  }
+
+  function connectedPreviewPeerCount() {
+    let count = 0;
+    for (const entry of previewPeers.values()) {
+      if (entry.connected) count += 1;
+    }
+    return count;
+  }
+
+  function emitPreviewStatus(force = false) {
+    if (!started || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload = {
+      active: connectedPreviewPeerCount() > 0,
+      peer_count: connectedPreviewPeerCount()
+    };
+    const sig = JSON.stringify(payload);
+    if (!force && sig === lastPreviewStatusSent) return;
+    lastPreviewStatusSent = sig;
+    queueJson({
+      type: "preview_status",
+      device_id: runConfig.device_id,
+      active: payload.active,
+      peer_count: payload.peer_count
+    });
+  }
+
+  function createPreviewPeer(dashboardId) {
+    if (typeof RTCPeerConnection !== "function") return null;
+    const pc = new RTCPeerConnection({ iceServers: PREVIEW_ICE_SERVERS });
+    const entry = {
+      dashboardId,
+      pc,
+      sender: null,
+      connected: false,
+      pendingIce: []
+    };
+    const syncState = () => {
+      const nextConnected = previewPeerIsConnected(entry);
+      if (entry.connected !== nextConnected) {
+        entry.connected = nextConnected;
+        updateCameraTransport();
+        emitPreviewStatus(true);
+        renderStatus();
+      }
+      const state = previewPeerTransportState(entry);
+      if (state === "failed" || state === "closed") {
+        closePreviewPeer(dashboardId, { reason: "preview_failed" });
+      }
+    };
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate) return;
+      queueJson({
+        type: "webrtc_signal",
+        device_id: runConfig.device_id,
+        dashboard_id: dashboardId,
+        signal: {
+          type: "ice",
+          candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate
+        }
+      });
+    };
+    pc.onconnectionstatechange = syncState;
+    pc.oniceconnectionstatechange = syncState;
+    previewPeers.set(dashboardId, entry);
+    updateCameraTransport();
+    emitPreviewStatus(true);
+    return entry;
+  }
+
+  function ensurePreviewPeer(dashboardId) {
+    const key = String(dashboardId || "").trim();
+    if (!key) return null;
+    const existing = previewPeers.get(key);
+    if (existing) return existing;
+    return createPreviewPeer(key);
+  }
+
+  function syncPreviewTrack(entry) {
+    if (!entry?.pc) return;
+    const track = cameraStream?.getVideoTracks?.()[0] || null;
+    if (!track) {
+      if (entry.sender) entry.sender.replaceTrack(null).catch(() => {});
+      return;
+    }
+    if (!entry.sender) {
+      entry.sender = entry.pc.addTrack(track, cameraStream);
+      return;
+    }
+    if (entry.sender.track === track) return;
+    entry.sender.replaceTrack(track).catch(() => {});
+  }
+
+  function syncPreviewTracks() {
+    for (const entry of previewPeers.values()) syncPreviewTrack(entry);
+  }
+
+  async function flushPreviewIce(entry) {
+    if (!entry?.pc || !entry.pendingIce.length) return;
+    while (entry.pendingIce.length) {
+      const candidate = entry.pendingIce.shift();
+      try {
+        await entry.pc.addIceCandidate(candidate);
+      } catch {}
+    }
+  }
+
+  function closePreviewPeer(dashboardId, opts = {}) {
+    const key = String(dashboardId || "").trim();
+    const entry = previewPeers.get(key);
+    if (!entry) return;
+    previewPeers.delete(key);
+    const wasConnected = entry.connected;
+    entry.connected = false;
+    try {
+      entry.pc.onicecandidate = null;
+      entry.pc.onconnectionstatechange = null;
+      entry.pc.oniceconnectionstatechange = null;
+      entry.pc.close();
+    } catch {}
+    if (opts.notify) {
+      queueJson({
+        type: "webrtc_signal",
+        device_id: runConfig.device_id,
+        dashboard_id: key,
+        signal: {
+          type: "disconnect",
+          reason: String(opts.reason || "preview_closed")
+        }
+      });
+    }
+    if (wasConnected) {
+      updateCameraTransport();
+      emitPreviewStatus(true);
+      renderStatus();
+      return;
+    }
+    updateCameraTransport();
+    emitPreviewStatus(true);
+  }
+
+  function closeAllPreviewPeers(reason = "preview_reset", notify = false) {
+    for (const dashboardId of [...previewPeers.keys()]) {
+      closePreviewPeer(dashboardId, { reason, notify });
+    }
+  }
+
+  async function handlePreviewSignal(msg) {
+    const dashboardId = String(msg.dashboard_id || "").trim();
+    const signal = msg.signal && typeof msg.signal === "object" ? msg.signal : null;
+    if (!dashboardId || !signal) return;
+    if (signal.type === "disconnect") {
+      closePreviewPeer(dashboardId, { reason: signal.reason || "remote_disconnect" });
+      return;
+    }
+    if (signal.type === "offer") {
+      if (runConfig.streams.camera.mode === "off") {
+        queueJson({
+          type: "webrtc_signal",
+          device_id: runConfig.device_id,
+          dashboard_id: dashboardId,
+          signal: { type: "unavailable", reason: "camera_disabled" }
+        });
+        return;
+      }
+      const stream = await ensureCameraStream();
+      if (!stream) {
+        queueJson({
+          type: "webrtc_signal",
+          device_id: runConfig.device_id,
+          dashboard_id: dashboardId,
+          signal: { type: "unavailable", reason: "camera_unavailable" }
+        });
+        return;
+      }
+      const entry = ensurePreviewPeer(dashboardId);
+      if (!entry?.pc) return;
+      syncPreviewTrack(entry);
+      try {
+        await entry.pc.setRemoteDescription({ type: "offer", sdp: String(signal.sdp || "") });
+        await flushPreviewIce(entry);
+        const answer = await entry.pc.createAnswer();
+        await entry.pc.setLocalDescription(answer);
+        queueJson({
+          type: "webrtc_signal",
+          device_id: runConfig.device_id,
+          dashboard_id: dashboardId,
+          signal: { type: "answer", sdp: String(entry.pc.localDescription?.sdp || answer.sdp || "") }
+        });
+      } catch {
+        closePreviewPeer(dashboardId, { reason: "answer_failed" });
+      }
+      return;
+    }
+    if (signal.type === "ice") {
+      const entry = ensurePreviewPeer(dashboardId);
+      if (!entry?.pc || !signal.candidate) return;
+      const candidate = signal.candidate;
+      if (!entry.pc.remoteDescription) {
+        entry.pendingIce.push(candidate);
+        return;
+      }
+      try {
+        await entry.pc.addIceCandidate(candidate);
+      } catch {}
+    }
+  }
+
+  function queueJson(obj) {
     wsClient?.sendJson(obj);
   }
 
@@ -1005,7 +1263,8 @@ function queueJson(obj) {
       audio: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
       gps: !!navigator.geolocation,
       battery: !!navigator.getBattery,
-      wake_lock: "wakeLock" in navigator
+      wake_lock: "wakeLock" in navigator,
+      webrtc_preview: typeof RTCPeerConnection === "function"
     };
   }
 
