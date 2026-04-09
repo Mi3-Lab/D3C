@@ -1,0 +1,30 @@
+Parthib's Changes
+
+Date and time: 2026-04-08 18:39:42 PDT
+
+What changed:
+- The live phone camera preview was changed from slow JPEG image snapshots to WebRTC live video.
+- WebSocket is still used, but now only for signaling and coordination.
+- The actual live camera video now goes directly from the phone browser to the dashboard browser through WebRTC.
+
+Why this was changed:
+- The old system sent repeated JPEG frames over WebSocket.
+- That made the camera preview slow and laggy.
+- WebRTC is designed for low-latency live video, so it should make the preview much smoother.
+
+Main code changes:
+- The server now relays WebRTC signaling messages between the phone and the dashboard.
+- The phone now creates a WebRTC preview connection and sends its camera track through it.
+- The dashboard now receives that live video track and shows it in the camera widget.
+- The old image-based path was kept as a fallback and for recording support.
+
+Simple before/after:
+- Before: phone camera -> JPEG snapshots -> WebSocket -> server -> dashboard image refresh
+- After: phone camera -> WebRTC live stream -> dashboard video
+
+Files changed:
+- fleet-server/index.js
+- client-mobile/phone.js
+- dashboard/dashboard.js
+- dashboard/widgets.js
+- dashboard/styles.css
