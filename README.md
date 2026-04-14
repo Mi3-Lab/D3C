@@ -1,4 +1,4 @@
-# D3C
+# D3C - Distributed Driving Data Collective
 
 D3C is a server that lets multiple phones stream live sensor and camera data to a single operator dashboard. Phones connect over the internet via a Cloudflare Quick Tunnel — no local network required, no firewall config, works from anywhere.
 
