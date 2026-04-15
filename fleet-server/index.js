@@ -12,6 +12,14 @@ const { MotionState } = require("./compute/motion_state");
 const { SyncTracker } = require("./compute/sync_tracker");
 const { SessionManager } = require("./session/session_manager");
 const { encodeCameraDirToMp4 } = require("./session/recorders/camera_recorder");
+const {
+  exportSessionMedia,
+  EXPORTS_DIRNAME,
+  SESSION_MULTIVIEW_NAME,
+  SESSION_MULTIVIEW_WITH_AUDIO_NAME,
+  SESSION_MULTIVIEW_MANIFEST_NAME,
+  CAMERA_WITH_AUDIO_NAME
+} = require("./session/export_session_media");
 
 const AUTH_STATE_PATH = process.env.AUTH_STATE_PATH
   ? path.resolve(process.env.AUTH_STATE_PATH)
@@ -173,6 +181,26 @@ app.post("/api/datasets/:id/encode", requireDashboardAuth("api"), express.json()
   if (!result.ok) return res.status(500).json(result);
   res.json(result);
 });
+app.post("/api/datasets/:id/exports", requireDashboardAuth("api"), express.json(), async (req, res) => {
+  const id = sanitizeSessionId(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid id" });
+  const root = path.join(DATASETS_ROOT, id);
+  if (!fs.existsSync(root)) return res.status(404).json({ error: "not found" });
+  const result = await exportSessionMedia({
+    sessionDir: root,
+    ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg",
+    audioDeviceId: typeof req.body?.audio_device_id === "string" ? req.body.audio_device_id : null,
+    force: !!req.body?.force
+  });
+  appendControlLog(path.join(root, "control_log.jsonl"), {
+    type: "session_export",
+    mode: "manual",
+    at_iso: new Date().toISOString(),
+    result
+  });
+  if (!result.ok) return res.status(500).json(result);
+  res.json(result);
+});
 app.delete("/api/datasets/:id", requireDashboardAuth("api"), (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
@@ -202,9 +230,24 @@ app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) =>
     device_id: deviceId,
     metaJson: toUrlIfExists(path.join(root, "meta.json"), `/datasets/${id}/meta.json`),
     syncReportJson: toUrlIfExists(path.join(root, "sync_report.json"), `/datasets/${id}/sync_report.json`),
+    sessionExports: {
+      multiview: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_NAME}`
+      ),
+      multiviewWithAudio: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_WITH_AUDIO_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_WITH_AUDIO_NAME}`
+      ),
+      manifestJson: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_MANIFEST_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_MANIFEST_NAME}`
+      )
+    },
     imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
     imuParquet: toUrlIfExists(path.join(streamRoot, "imu.parquet"), `/datasets/${id}/devices/${deviceId}/streams/imu.parquet`),
     audioCsv: toUrlIfExists(path.join(streamRoot, "audio.csv"), `/datasets/${id}/devices/${deviceId}/streams/audio.csv`),
+    audioChunksCsv: toUrlIfExists(path.join(streamRoot, "audio_chunks.csv"), `/datasets/${id}/devices/${deviceId}/streams/audio_chunks.csv`),
     audioParquet: toUrlIfExists(path.join(streamRoot, "audio.parquet"), `/datasets/${id}/devices/${deviceId}/streams/audio.parquet`),
     audioWav: toUrlIfExists(path.join(streamRoot, "audio.wav"), `/datasets/${id}/devices/${deviceId}/streams/audio.wav`),
     deviceCsv: toUrlIfExists(path.join(streamRoot, "device.csv"), `/datasets/${id}/devices/${deviceId}/streams/device.csv`),
@@ -224,6 +267,10 @@ app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) =>
     cameraVideo: toUrlIfExists(
       path.join(streamRoot, "camera_video.mp4"),
       `/datasets/${id}/devices/${deviceId}/streams/camera_video.mp4`
+    ),
+    cameraWithAudio: toUrlIfExists(
+      path.join(streamRoot, CAMERA_WITH_AUDIO_NAME),
+      `/datasets/${id}/devices/${deviceId}/streams/${CAMERA_WITH_AUDIO_NAME}`
     ),
     cameraDir: toUrlIfExists(path.join(streamRoot, "camera"), `/datasets/${id}/devices/${deviceId}/streams/camera`)
   });
@@ -568,6 +615,8 @@ function handlePhoneJson(ws, msg) {
       t_device_ms: Number(msg.t_device_ms || 0),
       amplitude: Number(msg.amplitude || 0),
       noise_level: Number(msg.noise_level || 0),
+      pcm_age_ms: Number.isFinite(msg.pcm_age_ms) ? Number(msg.pcm_age_ms) : null,
+      audio_context_state: typeof msg.audio_context_state === "string" ? msg.audio_context_state : null,
       t_server_rx_ns: tServerRxNs
     };
     if (recording.active) {
@@ -625,15 +674,18 @@ function handlePhoneJson(ws, msg) {
       return;
     }
     if (!pcmBuffer.length) return;
+    const tRecvMs = Date.now();
+    const tServerRxNs = nowServerRxNs();
     sessionManager.writeAudioPcm(deviceId, {
       pcmBuffer,
-      t_recv_ms: Date.now(),
+      t_recv_ms: tRecvMs,
       t_device_ms: Number(msg.t_device_ms || 0),
+      t_server_rx_ns: tServerRxNs,
       sampleRate: Number(msg.sample_rate || 48000),
       channels: Number(msg.channels || 1),
       bitsPerSample: 16
     });
-    markDeviceWrite(deviceId, Date.now());
+    markDeviceWrite(deviceId, tRecvMs);
     return;
   }
 
@@ -987,6 +1039,25 @@ async function stopRecordingSession() {
     timeout_ms: timeoutMs,
     finalize_tasks: finalizeTasks.length
   });
+  const exportTimeoutMs = 300000;
+  let exportResult = null;
+  try {
+    exportResult = await Promise.race([
+      exportSessionMedia({
+        sessionDir: res.sessionDir,
+        ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg"
+      }),
+      new Promise((resolve) => setTimeout(() => resolve({ ok: false, error: `export timeout after ${exportTimeoutMs}ms` }), exportTimeoutMs))
+    ]);
+  } catch (err) {
+    exportResult = { ok: false, error: String(err?.message || err) };
+  }
+  appendControlLog(path.join(res.sessionDir, "control_log.jsonl"), {
+    type: "session_export",
+    mode: "auto",
+    at_iso: new Date().toISOString(),
+    result: exportResult
+  });
 
   for (const id of stoppingTargets) {
     const d = devices.get(id);
@@ -1088,6 +1159,7 @@ function collectStoppedFiles(sessionDir, deviceId) {
     else if (fs.existsSync(path.join(streamsDir, "imu.csv"))) out.imu = "imu.csv";
     if (fs.existsSync(path.join(streamsDir, "camera_video.mp4"))) out.cam = "camera_video.mp4";
     else if (fs.existsSync(path.join(streamsDir, "camera"))) out.cam = "camera/";
+    if (fs.existsSync(path.join(streamsDir, CAMERA_WITH_AUDIO_NAME))) out.cam_audio = CAMERA_WITH_AUDIO_NAME;
     if (fs.existsSync(path.join(streamsDir, "audio.wav"))) out.audio = "audio.wav";
     else if (fs.existsSync(path.join(streamsDir, "audio.parquet"))) out.audio = "audio.parquet";
     else if (fs.existsSync(path.join(streamsDir, "audio.csv"))) out.audio = "audio.csv";
@@ -2103,11 +2175,3 @@ function getDiskFreeBytes(targetPath) {
     return null;
   }
 }
-
-
-
-
-
-
-
-

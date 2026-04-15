@@ -5,7 +5,8 @@
     "description":  "D3C: Distributed Driving Data Collective fleet server and mobile node dashboard stack.",
     "main":  "fleet-server/index.js",
     "scripts":  {
-                    "start":  "node fleet-server/index.js"
+                    "start":  "node fleet-server/index.js",
+                    "backfill:exports":  "node scripts/backfill-session-exports.js"
                 },
     "dependencies":  {
                          "express":  "^4.21.2",

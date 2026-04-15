@@ -1,12 +1,15 @@
 const fs = require("fs");
+const path = require("path");
 
 class AudioWavRecorder {
   constructor(filePath) {
     this.filePath = filePath;
+    this.chunksPath = path.join(path.dirname(filePath), "audio_chunks.csv");
     this.sampleRate = 48000;
     this.channels = 1;
     this.bitsPerSample = 16;
     this.dataBytes = 0;
+    this.chunkIndex = 0;
     this.initialized = false;
   }
 
@@ -21,14 +24,28 @@ class AudioWavRecorder {
       channels: this.channels,
       bitsPerSample: this.bitsPerSample
     }));
+    fs.writeFileSync(
+      this.chunksPath,
+      "chunk_index,t_recv_ms,t_device_ms,t_server_rx_ns,sample_rate,channels,bits_per_sample,samples,duration_ms\n",
+      "utf8"
+    );
     this.initialized = true;
   }
 
-  writeChunk({ pcmBuffer, sampleRate, channels, bitsPerSample }) {
+  writeChunk({ pcmBuffer, t_recv_ms, t_device_ms, t_server_rx_ns, sampleRate, channels, bitsPerSample }) {
     if (!pcmBuffer || !pcmBuffer.length) return;
     this.ensureInit({ sampleRate, channels, bitsPerSample });
+    const blockAlign = this.channels * (this.bitsPerSample / 8);
+    const sampleCount = blockAlign > 0 ? Math.floor(pcmBuffer.length / blockAlign) : 0;
+    const durationMs = this.sampleRate > 0 ? (sampleCount / this.sampleRate) * 1000 : 0;
     fs.appendFileSync(this.filePath, pcmBuffer);
     this.dataBytes += pcmBuffer.length;
+    this.chunkIndex += 1;
+    fs.appendFileSync(
+      this.chunksPath,
+      `${this.chunkIndex},${Number(t_recv_ms || 0)},${Number(t_device_ms || 0)},${t_server_rx_ns ?? ""},${this.sampleRate},${this.channels},${this.bitsPerSample},${sampleCount},${durationMs}\n`,
+      "utf8"
+    );
   }
 
   finalize() {

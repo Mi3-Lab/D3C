@@ -124,10 +124,36 @@ Each session contains:
 
 - `meta.json` — session metadata
 - `sync_report.json` — device sync summary
+- `exports/session_multiview.mp4` — synced multi-view composite video
+- `exports/session_multiview_with_audio.mp4` — composite video with a selected audio track
+- `exports/session_multiview_manifest.json` — export metadata, layout, and chosen audio source
 - `devices/<device_id>/streams/net.csv` — network timing
 - `devices/<device_id>/streams/gps.csv` — GPS data
 - `devices/<device_id>/streams/imu.csv` — accelerometer/gyroscope data
+- `devices/<device_id>/streams/camera_video.mp4` — per-device MP4 camera export
+- `devices/<device_id>/streams/camera_with_audio.mp4` — per-device MP4 with audio
+- `devices/<device_id>/streams/audio_chunks.csv` — PCM chunk timing used for audio/video sync
 - Camera and audio files (when enabled and `ffmpeg` is installed)
+
+## Backfill Existing Sessions
+
+After you install `ffmpeg`, you can generate missing exports for older `datasets/session_*` folders without re-recording them:
+
+```bash
+npm run backfill:exports
+```
+
+By default this skips sessions that already have `exports/session_multiview_manifest.json`.
+
+Useful variants:
+
+```bash
+# Rebuild one session
+node scripts/backfill-session-exports.js --session session_20260414_191633
+
+# Force regeneration even if exports already exist
+node scripts/backfill-session-exports.js --force
+```
 
 ## Environment Variables
 
@@ -148,5 +174,6 @@ Each session contains:
 - **Quick Tunnel stopped** — rerun `./scripts/start-quick-tunnel.sh`.
 - **iPhone motion sensors not working** — use Safari and keep the page open in the foreground.
 - **No MP4 output** — install `ffmpeg`.
+- **No multiview or video+audio export** — install `ffmpeg`, then call `POST /api/datasets/:id/exports` to regenerate session media.
 - **No Parquet output** — install `pyarrow`.
 - **`cloudflared` not found** — download it and place it at `.local/bin/cloudflared`, or set `CLOUDFLARED_BIN`.

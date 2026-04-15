@@ -169,10 +169,10 @@ module.exports = {
   encodeCameraDirToMp4
 };
 
-function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23 }) {
+function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23, timelineRows = null }) {
   const resolvedCameraDir = path.resolve(cameraDir);
   const resolvedOutMp4 = path.resolve(outMp4);
-  const timing = buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps: fps });
+  const timing = buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps: fps, timelineRows });
   const args = timing?.sequenceDir
     ? [
         "-y",
@@ -234,17 +234,29 @@ function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBi
   });
 }
 
-function buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps }) {
+function buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps, timelineRows = null }) {
   try {
     const resolvedCameraDir = path.resolve(cameraDir);
-    const resolvedTimestampsPath = path.resolve(timestampsPath);
-    if (!timestampsPath || !fs.existsSync(resolvedTimestampsPath)) return null;
-    const lines = fs.readFileSync(resolvedTimestampsPath, "utf8").trim().split(/\r?\n/).slice(1);
-    if (lines.length < 2) return null;
-    const rows = lines.map(parseTimestampRow).filter(Boolean);
+    let rows = null;
+    let chosen = null;
+    if (Array.isArray(timelineRows) && timelineRows.length >= 2) {
+      rows = timelineRows
+        .filter((row) => row?.filename && Number.isFinite(row.timelineMs))
+        .map((row) => ({ ...row }));
+      if (rows.length >= 2) {
+        chosen = buildMonotonicTimeline(rows, "external_timeline_ms", (row) => row.timelineMs);
+      }
+    }
+    if (!chosen) {
+      const resolvedTimestampsPath = path.resolve(timestampsPath);
+      if (!timestampsPath || !fs.existsSync(resolvedTimestampsPath)) return null;
+      const lines = fs.readFileSync(resolvedTimestampsPath, "utf8").trim().split(/\r?\n/).slice(1);
+      if (lines.length < 2) return null;
+      rows = lines.map(parseTimestampRow).filter(Boolean);
+      if (rows.length < 2) return null;
+      chosen = chooseTimeline(rows);
+    }
     if (rows.length < 2) return null;
-
-    const chosen = chooseTimeline(rows);
     if (!chosen) return null;
 
     const safeOutputFps = Math.max(1, Number(outputFps || 10));
@@ -265,7 +277,7 @@ function buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps }) {
       ) {
         sourceIndex += 1;
       }
-      const sourcePath = path.join(resolvedCameraDir, rows[sourceIndex].filename);
+      const sourcePath = path.join(resolvedCameraDir, chosen.rows[sourceIndex].filename);
       const destPath = path.join(sequenceDir, `${String(outputIndex + 1).padStart(6, "0")}.jpg`);
       try {
         fs.linkSync(sourcePath, destPath);
@@ -286,24 +298,30 @@ function parseTimestampRow(line) {
   const filename = parts[1];
   const tDeviceMs = Number(parts[2]);
   const tRecvMs = Number(parts[3]);
+  const tServerRxNs = Number(parts[4]);
   if (!filename) return null;
   return {
     filename,
     tDeviceMs: Number.isFinite(tDeviceMs) ? tDeviceMs : NaN,
-    tRecvMs: Number.isFinite(tRecvMs) ? tRecvMs : NaN
+    tRecvMs: Number.isFinite(tRecvMs) ? tRecvMs : NaN,
+    tServerRxNs: Number.isFinite(tServerRxNs) ? tServerRxNs : NaN
   };
 }
 
 function chooseTimeline(rows) {
-  const deviceValues = rows.map((r) => r.tDeviceMs);
-  if (isStrictlyIncreasing(deviceValues)) {
-    return { source: "t_device_ms", values: deviceValues };
-  }
-  const recvValues = rows.map((r) => r.tRecvMs);
-  if (isStrictlyIncreasing(recvValues)) {
-    return { source: "t_recv_ms", values: recvValues };
-  }
-  return null;
+  const candidates = [
+    buildMonotonicTimeline(rows, "t_device_ms", (row) => row.tDeviceMs),
+    buildMonotonicTimeline(rows, "t_server_rx_ns", (row) => row.tServerRxNs, { scale: 1 / 1000000 }),
+    buildMonotonicTimeline(rows, "t_recv_ms", (row) => row.tRecvMs)
+  ].filter(Boolean);
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => {
+    if (b.values.length !== a.values.length) return b.values.length - a.values.length;
+    const priority = { t_device_ms: 3, t_server_rx_ns: 2, t_recv_ms: 1 };
+    return (priority[b.source] || 0) - (priority[a.source] || 0);
+  });
+  return candidates[0];
 }
 
 function isStrictlyIncreasing(values) {
@@ -313,6 +331,24 @@ function isStrictlyIncreasing(values) {
     if (i > 0 && values[i] <= values[i - 1]) return false;
   }
   return true;
+}
+
+function buildMonotonicTimeline(rows, source, getter, options = {}) {
+  const scale = Number.isFinite(options.scale) ? options.scale : 1;
+  const keptRows = [];
+  const values = [];
+  let lastValue = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    const rawValue = getter(row);
+    if (!Number.isFinite(rawValue)) continue;
+    const value = rawValue * scale;
+    if (!(value > lastValue)) continue;
+    keptRows.push(row);
+    values.push(value);
+    lastValue = value;
+  }
+  if (values.length < 2) return null;
+  return { source, rows: keptRows, values };
 }
 
 function cleanupTimingManifest(timing) {
