@@ -6,7 +6,8 @@
     "main":  "fleet-server/index.js",
     "scripts":  {
                     "start":  "node fleet-server/index.js",
-                    "backfill:exports":  "node scripts/backfill-session-exports.js"
+                    "backfill:exports":  "node scripts/backfill-session-exports.js",
+                    "backfill:gps-playback":  "node scripts/backfill-session-gps-playback.js"
                 },
     "dependencies":  {
                          "express":  "^4.21.2",

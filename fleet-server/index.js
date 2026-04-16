@@ -17,7 +17,10 @@ const {
   EXPORTS_DIRNAME,
   SESSION_MULTIVIEW_NAME,
   SESSION_MULTIVIEW_WITH_AUDIO_NAME,
+  SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME,
   SESSION_MULTIVIEW_MANIFEST_NAME,
+  SESSION_GPS_PLAYBACK_NAME,
+  SESSION_GPS_PLAYBACK_VIDEO_NAME,
   CAMERA_WITH_AUDIO_NAME
 } = require("./session/export_session_media");
 
@@ -239,9 +242,21 @@ app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) =>
         path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_WITH_AUDIO_NAME),
         `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_WITH_AUDIO_NAME}`
       ),
+      multiviewWithAudioAndGps: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME}`
+      ),
       manifestJson: toUrlIfExists(
         path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_MANIFEST_NAME),
         `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_MANIFEST_NAME}`
+      ),
+      gpsPlaybackJson: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_GPS_PLAYBACK_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_GPS_PLAYBACK_NAME}`
+      ),
+      gpsPlaybackVideo: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_GPS_PLAYBACK_VIDEO_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_GPS_PLAYBACK_VIDEO_NAME}`
       )
     },
     imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
