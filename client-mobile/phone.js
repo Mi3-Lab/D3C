@@ -75,6 +75,8 @@
   let pcmSilenceGain = null;
   let pcmChunkParts = [];
   let pcmChunkSamples = 0;
+  let lastPcmChunkMs = 0;
+  let pcmRestarting = false;
   let audioTimer = null;
   let deviceTimer = null;
   let batteryManager = null;
@@ -223,7 +225,9 @@
         }
         if (msg.type === "recording_state") {
           sessionRecordingActive = !!msg.active;
+          if (!sessionRecordingActive) flushPcmChunk(audioCtx?.sampleRate || 48000);
           updateCameraTransport();
+          void ensureAudioRunning();
           renderStatus();
           return;
         }
@@ -477,6 +481,7 @@
       pcmSilenceGain.connect(audioCtx.destination);
       pcmProcessor.onaudioprocess = onPcmProcess;
     }
+    await resumeAudioContext();
     startAudioLoop();
   }
 
@@ -500,9 +505,12 @@
         device_id: runConfig.device_id,
         t_device_ms: getDeviceMonoMs(),
         amplitude: Number(peak.toFixed(4)),
-        noise_level: Number(Math.sqrt(sum / arr.length).toFixed(4))
+        noise_level: Number(Math.sqrt(sum / arr.length).toFixed(4)),
+        pcm_age_ms: lastPcmChunkMs ? Date.now() - lastPcmChunkMs : null,
+        audio_context_state: audioCtx?.state || "unknown"
       });
       lastAudioEventMs = Date.now();
+      void ensureAudioRunning();
     }, Math.floor(1000 / hz));
   }
 
@@ -546,8 +554,75 @@
       encoding: "pcm_s16le",
       data_b64: b64
     });
+    lastPcmChunkMs = Date.now();
     pcmChunkParts = [];
     pcmChunkSamples = 0;
+  }
+
+  async function ensureAudioRunning() {
+    if (!started || !runConfig.streams.audio?.enabled || !audioCtx) return;
+    await resumeAudioContext();
+    if (!sessionRecordingActive || pcmRestarting) return;
+    const now = Date.now();
+    if (lastPcmChunkMs && now - lastPcmChunkMs < 6000) return;
+    if (!lastPcmChunkMs && lastAudioEventMs && now - lastAudioEventMs < 6000) return;
+    await restartPcmCapture();
+  }
+
+  async function resumeAudioContext() {
+    try {
+      if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
+    } catch {}
+    try {
+      if (silentAudio?.ctx?.state === "suspended") await silentAudio.ctx.resume();
+    } catch {}
+    if (!wakeLock) await requestWakeLock();
+  }
+
+  async function restartPcmCapture() {
+    if (pcmRestarting) return;
+    pcmRestarting = true;
+    try {
+      flushPcmChunk(audioCtx?.sampleRate || 48000);
+      if (pcmProcessor) {
+        try { pcmProcessor.disconnect(); } catch {}
+        pcmProcessor.onaudioprocess = null;
+      }
+      if (pcmSilenceGain) {
+        try { pcmSilenceGain.disconnect(); } catch {}
+      }
+      pcmProcessor = null;
+      pcmSilenceGain = null;
+
+      if (!micStream || !micStream.getAudioTracks().some((track) => track.readyState === "live")) {
+        if (micStream) {
+          for (const track of micStream.getTracks()) track.stop();
+        }
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+      if (!audioCtx || audioCtx.state === "closed") {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyserSource = audioCtx.createMediaStreamSource(micStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        analyserSource.connect(analyser);
+      }
+      await resumeAudioContext();
+      pcmProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
+      pcmSilenceGain = audioCtx.createGain();
+      pcmSilenceGain.gain.value = 0;
+      analyserSource.connect(pcmProcessor);
+      pcmProcessor.connect(pcmSilenceGain);
+      pcmSilenceGain.connect(audioCtx.destination);
+      pcmProcessor.onaudioprocess = onPcmProcess;
+      pcmChunkParts = [];
+      pcmChunkSamples = 0;
+    } catch {
+      audioPermissionState = "error";
+      renderStatus();
+    } finally {
+      pcmRestarting = false;
+    }
   }
 
 
