@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import json
 import math
+import os
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+TILE_URL = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"
+TILE_SIZE = 256
+TILE_CACHE_DIR = Path(os.environ.get(
+    "GPS_TILE_CACHE_DIR",
+    str(Path.home() / ".cache" / "d3c_gps_tiles"),
+))
 
 
 PALETTE = [
@@ -88,6 +104,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--crf", type=int, default=23)
+    parser.add_argument("--per-device", action="store_true", help="Render one MP4 per device instead of a combined video.")
     return parser.parse_args()
 
 
@@ -323,9 +340,114 @@ def format_elapsed_label(elapsed_ms, total_ms):
     return normalize_label(f"{_format(elapsed_ms)} / {_format(total_ms)}")
 
 
+def lat_lon_to_tile_xy(lat, lon, zoom):
+    n = 2.0 ** zoom
+    x = (lon + 180.0) / 360.0 * n
+    lat_rad = math.radians(max(-85.05112878, min(85.05112878, lat)))
+    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def pick_zoom_and_scale(min_lat, max_lat, min_lon, max_lon, map_width, map_height, fill_ratio=0.88):
+    best_in_range = None
+    fallback = (12, 1.0)
+    fallback_dist = float("inf")
+    for zoom in range(1, 20):
+        min_xf, _ = lat_lon_to_tile_xy(max_lat, min_lon, zoom)
+        max_xf, _ = lat_lon_to_tile_xy(min_lat, max_lon, zoom)
+        _, min_yf = lat_lon_to_tile_xy(max_lat, min_lon, zoom)
+        _, max_yf = lat_lon_to_tile_xy(min_lat, max_lon, zoom)
+        data_span_x = max(1.0, (max_xf - min_xf) * TILE_SIZE)
+        data_span_y = max(1.0, (max_yf - min_yf) * TILE_SIZE)
+        scale = min(map_width * fill_ratio / data_span_x, map_height * fill_ratio / data_span_y)
+        if 0.7 <= scale <= 1.8:
+            best_in_range = (zoom, scale)
+        dist = abs(math.log(max(scale, 1e-6)))
+        if dist < fallback_dist:
+            fallback_dist = dist
+            fallback = (zoom, scale)
+    return best_in_range if best_in_range else fallback
+
+
+def fetch_tile(zoom, x, y):
+    TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = TILE_CACHE_DIR / f"{zoom}_{x}_{y}.png"
+    if cache_path.exists():
+        with Image.open(cache_path) as img:
+            return img.convert("RGB").copy()
+    url = TILE_URL.format(z=zoom, x=x, y=y)
+    req = urllib.request.Request(url, headers={"User-Agent": "D3C-GPS-Playback/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = resp.read()
+    cache_path.write_bytes(data)
+    with Image.open(io.BytesIO(data)) as img:
+        return img.convert("RGB").copy()
+
+
+def render_tile_background(projection):
+    if not HAS_PIL:
+        return None
+    try:
+        zoom = projection["zoom"]
+        min_xf = projection["min_xf"]
+        max_xf = projection["max_xf"]
+        min_yf = projection["min_yf"]
+        max_yf = projection["max_yf"]
+        tile_min_x = int(math.floor(min_xf))
+        tile_max_x = int(math.floor(max_xf))
+        tile_min_y = int(math.floor(min_yf))
+        tile_max_y = int(math.floor(max_yf))
+        cols = tile_max_x - tile_min_x + 1
+        rows = tile_max_y - tile_min_y + 1
+        canvas = Image.new("RGB", (cols * TILE_SIZE, rows * TILE_SIZE), MAP_BG_BOTTOM)
+        for ty in range(tile_min_y, tile_max_y + 1):
+            for tx in range(tile_min_x, tile_max_x + 1):
+                try:
+                    tile = fetch_tile(zoom, tx, ty)
+                    canvas.paste(tile, ((tx - tile_min_x) * TILE_SIZE, (ty - tile_min_y) * TILE_SIZE))
+                except Exception:
+                    continue
+        crop_left = (min_xf - tile_min_x) * TILE_SIZE
+        crop_top = (min_yf - tile_min_y) * TILE_SIZE
+        crop_right = (max_xf - tile_min_x) * TILE_SIZE
+        crop_bottom = (max_yf - tile_min_y) * TILE_SIZE
+        cropped = canvas.crop((crop_left, crop_top, crop_right, crop_bottom))
+        fit_width = max(1, int(round(projection["fit_right"] - projection["fit_left"])))
+        fit_height = max(1, int(round(projection["fit_bottom"] - projection["fit_top"])))
+        return cropped.resize((fit_width, fit_height), Image.LANCZOS)
+    except Exception:
+        return None
+
+
+def paste_image_into_frame(frame, width, height, image, x, y):
+    img_w, img_h = image.size
+    pixels = image.tobytes("raw", "RGB")
+    for row in range(img_h):
+        dest_y = y + row
+        if dest_y < 0 or dest_y >= height:
+            continue
+        left_clip = max(0, -x)
+        right_clip = max(0, x + img_w - width)
+        copy_w = img_w - left_clip - right_clip
+        if copy_w <= 0:
+            continue
+        src_offset = (row * img_w + left_clip) * 3
+        dest_offset = (dest_y * width + (x + left_clip)) * 3
+        frame[dest_offset:dest_offset + copy_w * 3] = pixels[src_offset:src_offset + copy_w * 3]
+
+
 def project_point(projection, lat, lon):
-    px = projection["left"] + projection["extra_x"] + ((lon * projection["lon_scale"]) - projection["min_x"]) * projection["scale"]
-    py = projection["bottom"] - projection["extra_y"] - (lat - projection["min_y"]) * projection["scale"]
+    x, y = lat_lon_to_tile_xy(lat, lon, projection["zoom"])
+    span_x = projection["max_xf"] - projection["min_xf"]
+    span_y = projection["max_yf"] - projection["min_yf"]
+    if span_x > 0:
+        px = projection["fit_left"] + (x - projection["min_xf"]) / span_x * (projection["fit_right"] - projection["fit_left"])
+    else:
+        px = (projection["fit_left"] + projection["fit_right"]) / 2.0
+    if span_y > 0:
+        py = projection["fit_top"] + (y - projection["min_yf"]) / span_y * (projection["fit_bottom"] - projection["fit_top"])
+    else:
+        py = (projection["fit_top"] + projection["fit_bottom"]) / 2.0
     return int(round(px)), int(round(py))
 
 
@@ -354,12 +476,18 @@ def draw_scale_bar(frame, width, height, projection):
     draw_text(frame, width, height, x, y - 16, format_distance_label(bar_m), LEGEND_TEXT, scale=2)
 
 
-def draw_grid(frame, width, height, projection):
+def draw_grid(frame, width, height, projection, tile_image=None):
     left = projection["left"]
     top = projection["top"]
     right = projection["right"]
     bottom = projection["bottom"]
     fill_vertical_gradient(frame, width, height, left, top, right, bottom, MAP_BG_TOP, MAP_BG_BOTTOM)
+    if tile_image is not None:
+        paste_image_into_frame(
+            frame, width, height, tile_image,
+            int(round(projection["fit_left"])),
+            int(round(projection["fit_top"])),
+        )
     fill_rect(frame, width, height, left, top, right, top + 2, BORDER)
     fill_rect(frame, width, height, left, bottom - 2, right, bottom, BORDER)
     fill_rect(frame, width, height, left, top, left + 2, bottom, BORDER)
@@ -369,16 +497,12 @@ def draw_grid(frame, width, height, projection):
 
 def build_projection(tracks, width, height):
     all_points = [point for track in tracks for point in track["points"]]
-    mean_lat = sum(point["lat"] for point in all_points) / max(1, len(all_points))
-    lon_scale = max(0.2, math.cos(math.radians(mean_lat)))
-    xs = [point["lon"] * lon_scale for point in all_points]
-    ys = [point["lat"] for point in all_points]
-    min_x = min(xs)
-    max_x = max(xs)
-    min_y = min(ys)
-    max_y = max(ys)
-    span_x = max(max_x - min_x, 1e-6)
-    span_y = max(max_y - min_y, 1e-6)
+    lats = [point["lat"] for point in all_points]
+    lons = [point["lon"] for point in all_points]
+    min_lat = min(lats)
+    max_lat = max(lats)
+    min_lon = min(lons)
+    max_lon = max(lons)
 
     left = max(44, int(round(width * 0.06)))
     right = width - max(28, int(round(width * 0.035)))
@@ -386,11 +510,31 @@ def build_projection(tracks, width, height):
     bottom = height - max(54, int(round(height * 0.11)))
     map_width = max(1, right - left)
     map_height = max(1, bottom - top)
-    scale = min(map_width / span_x, map_height / span_y)
-    if span_x < 1e-5 and span_y < 1e-5:
-        scale = min(map_width, map_height) / 4.0
-    extra_x = (map_width - span_x * scale) / 2.0
-    extra_y = (map_height - span_y * scale) / 2.0
+
+    zoom, scale = pick_zoom_and_scale(min_lat, max_lat, min_lon, max_lon, map_width, map_height)
+
+    min_xf_raw, _ = lat_lon_to_tile_xy(max_lat, min_lon, zoom)
+    max_xf_raw, _ = lat_lon_to_tile_xy(min_lat, max_lon, zoom)
+    _, min_yf_raw = lat_lon_to_tile_xy(max_lat, min_lon, zoom)
+    _, max_yf_raw = lat_lon_to_tile_xy(min_lat, max_lon, zoom)
+
+    center_xf = (min_xf_raw + max_xf_raw) / 2.0
+    center_yf = (min_yf_raw + max_yf_raw) / 2.0
+    half_tile_width = (map_width / 2.0 / scale) / TILE_SIZE
+    half_tile_height = (map_height / 2.0 / scale) / TILE_SIZE
+
+    min_xf = center_xf - half_tile_width
+    max_xf = center_xf + half_tile_width
+    min_yf = center_yf - half_tile_height
+    max_yf = center_yf + half_tile_height
+
+    fit_left = float(left)
+    fit_top = float(top)
+    fit_right = float(right)
+    fit_bottom = float(bottom)
+
+    center_lat = (min_lat + max_lat) / 2.0
+    meters_per_px = 156543.03392 * math.cos(math.radians(center_lat)) / (2 ** zoom) / max(1e-9, scale)
 
     return {
         "left": left,
@@ -399,17 +543,20 @@ def build_projection(tracks, width, height):
         "bottom": bottom,
         "map_width": map_width,
         "map_height": map_height,
-        "scale": scale,
-        "extra_x": extra_x,
-        "extra_y": extra_y,
-        "lon_scale": lon_scale,
-        "min_x": min_x,
-        "min_y": min_y,
-        "min_lat": min(ys),
-        "max_lat": max(ys),
-        "min_lon": min(point["lon"] for point in all_points),
-        "max_lon": max(point["lon"] for point in all_points),
-        "meters_per_px": 111320.0 / max(1e-6, scale),
+        "zoom": zoom,
+        "min_xf": min_xf,
+        "max_xf": max_xf,
+        "min_yf": min_yf,
+        "max_yf": max_yf,
+        "fit_left": fit_left,
+        "fit_top": fit_top,
+        "fit_right": fit_right,
+        "fit_bottom": fit_bottom,
+        "min_lat": min_lat,
+        "max_lat": max_lat,
+        "min_lon": min_lon,
+        "max_lon": max_lon,
+        "meters_per_px": meters_per_px,
     }
 
 
@@ -463,22 +610,71 @@ def prepare_tracks(payload, width, height):
     return raw_tracks, projection, start_ms, end_ms
 
 
-def draw_static_background(width, height, tracks, projection):
+SPEED_STOPS = [
+    (0.00, (50, 130, 255)),
+    (0.25, (80, 220, 240)),
+    (0.50, (120, 230, 110)),
+    (0.75, (255, 210, 60)),
+    (1.00, (255, 70, 70)),
+]
+
+
+def speed_color(speed_mps, min_speed, max_speed):
+    if speed_mps is None or not math.isfinite(speed_mps):
+        return (170, 175, 185)
+    if max_speed <= min_speed:
+        t = 0.5
+    else:
+        t = max(0.0, min(1.0, (speed_mps - min_speed) / (max_speed - min_speed)))
+    for i in range(len(SPEED_STOPS) - 1):
+        a_t, a_color = SPEED_STOPS[i]
+        b_t, b_color = SPEED_STOPS[i + 1]
+        if t <= b_t:
+            local = 0.0 if b_t == a_t else (t - a_t) / (b_t - a_t)
+            return mix_color(a_color, b_color, local)
+    return SPEED_STOPS[-1][1]
+
+
+def segment_speed(prev, curr):
+    prev_s = prev.get("speed_mps")
+    curr_s = curr.get("speed_mps")
+    if prev_s is not None and curr_s is not None:
+        return (prev_s + curr_s) / 2.0
+    if prev_s is not None:
+        return prev_s
+    if curr_s is not None:
+        return curr_s
+    return None
+
+
+def compute_speed_range(tracks):
+    speeds = [p["speed_mps"] for t in tracks for p in t["points"] if p.get("speed_mps") is not None]
+    if not speeds:
+        return 0.0, 1.0
+    lo = min(speeds)
+    hi = max(speeds)
+    if hi - lo < 0.5:
+        hi = lo + 0.5
+    return lo, hi
+
+
+def draw_static_background(width, height, tracks, projection, tile_image=None, speed_range=(0.0, 1.0)):
     frame = bytearray(bytes(BG) * (width * height))
-    draw_grid(frame, width, height, projection)
+    draw_grid(frame, width, height, projection, tile_image=tile_image)
+    min_speed, max_speed = speed_range
+    halo = (12, 16, 22)
     for track in tracks:
-        halo_color = dim(track["color"], 0.18)
-        route_color = dim(track["color"], 0.46)
         points = track["points"]
         for idx in range(1, len(points)):
             prev = points[idx - 1]
             curr = points[idx]
-            draw_line(frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], halo_color, thickness=6)
-            draw_line(frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], route_color, thickness=2)
+            color = speed_color(segment_speed(prev, curr), min_speed, max_speed)
+            draw_line(frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], halo, thickness=7)
+            draw_line(frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], color, thickness=4)
         start = points[0]
         end = points[-1]
-        draw_ring(frame, width, height, start["x"], start["y"], 6, 3, START_MARK)
-        draw_ring(frame, width, height, end["x"], end["y"], 7, 4, END_MARK)
+        draw_ring(frame, width, height, start["x"], start["y"], 7, 4, START_MARK)
+        draw_ring(frame, width, height, end["x"], end["y"], 8, 5, END_MARK)
     return frame
 
 
@@ -515,9 +711,7 @@ def interpolate_position(track, idx, t_ms):
 
 
 def draw_marker(frame, width, height, x, y, color, heading_deg, accuracy_px=None, tag=None):
-    if accuracy_px is not None and accuracy_px >= 4:
-        draw_ring(frame, width, height, x, y, int(round(accuracy_px)), max(0, int(round(accuracy_px - 2))), dim(color, 0.55))
-    draw_circle(frame, width, height, x, y, 10, dim(color, 0.35))
+    draw_circle(frame, width, height, x, y, 9, (12, 16, 22))
     draw_circle(frame, width, height, x, y, 7, START_MARK)
     draw_circle(frame, width, height, x, y, 4, color)
     if heading_deg is None or not math.isfinite(heading_deg):
@@ -534,16 +728,18 @@ def draw_marker(frame, width, height, x, y, color, heading_deg, accuracy_px=None
     draw_line(frame, width, height, tip_x, tip_y, right_x, right_y, START_MARK, thickness=1)
 
 
-def draw_recent_trail(frame, width, height, track, idx, live_x, live_y):
+def draw_recent_trail(frame, width, height, track, idx, live_x, live_y, speed_range):
     points = track["points"]
     start_idx = max(0, idx - 6)
     prev_x = live_x
     prev_y = live_y
+    min_speed, max_speed = speed_range
     for seg_idx in range(idx, start_idx, -1):
         curr = points[seg_idx]
         prev = points[seg_idx - 1]
         factor = (seg_idx - start_idx) / max(1, idx - start_idx + 1)
-        color = mix_color(dim(track["color"], 0.30), TRACK_GLOW, factor * 0.5)
+        base = speed_color(segment_speed(prev, curr), min_speed, max_speed)
+        color = mix_color(base, TRACK_GLOW, factor * 0.5)
         if seg_idx == idx:
             draw_line(frame, width, height, curr["x"], curr["y"], prev_x, prev_y, color, thickness=5)
         draw_line(frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], color, thickness=max(2, int(round(2 + factor * 2))))
@@ -576,6 +772,36 @@ def draw_status_panel(frame, width, height, tracks, live_states):
         draw_text(frame, width, height, x + padding + 16, row_y + 1, normalize_label(labels[index]), LEGEND_TEXT, scale=scale)
 
 
+def draw_speed_legend(frame, width, height, speed_range):
+    min_speed, max_speed = speed_range
+    bar_width = 180
+    bar_height = 10
+    padding = 8
+    panel_width = bar_width + padding * 2
+    panel_height = bar_height + 7 + 12 + padding * 2
+    x = 20
+    y = height - panel_height - 40
+    fill_rect(frame, width, height, x, y, x + panel_width, y + panel_height, HUD_BG)
+    fill_rect(frame, width, height, x, y, x + panel_width, y + 2, HUD_BORDER)
+    fill_rect(frame, width, height, x, y + panel_height - 2, x + panel_width, y + panel_height, HUD_BORDER)
+    fill_rect(frame, width, height, x, y, x + 2, y + panel_height, HUD_BORDER)
+    fill_rect(frame, width, height, x + panel_width - 2, y, x + panel_width, y + panel_height, HUD_BORDER)
+    bar_x = x + padding
+    bar_y = y + padding
+    for i in range(bar_width):
+        t = i / max(1, bar_width - 1)
+        speed_val = min_speed + t * (max_speed - min_speed)
+        color = speed_color(speed_val, min_speed, max_speed)
+        fill_rect(frame, width, height, bar_x + i, bar_y, bar_x + i + 1, bar_y + bar_height, color)
+    lo_mph = int(round(min_speed * 2.2369362921))
+    hi_mph = int(round(max_speed * 2.2369362921))
+    lo_label = normalize_label(f"{lo_mph} MPH")
+    hi_label = normalize_label(f"{hi_mph} MPH")
+    draw_text(frame, width, height, bar_x, bar_y + bar_height + 3, lo_label, LEGEND_TEXT, scale=1)
+    hi_width = glyph_width(hi_label, scale=1)
+    draw_text(frame, width, height, bar_x + bar_width - hi_width, bar_y + bar_height + 3, hi_label, LEGEND_TEXT, scale=1)
+
+
 def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height: int, fps: float, crf: int):
     tracks, projection, start_ms, end_ms = prepare_tracks(payload, width, height)
     if not tracks:
@@ -590,7 +816,9 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
     frame_count = max(2, int(math.ceil((duration_ms / 1000.0) * fps)) + 1)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    base_frame = draw_static_background(width, height, tracks, projection)
+    tile_image = render_tile_background(projection)
+    speed_range = compute_speed_range(tracks)
+    base_frame = draw_static_background(width, height, tracks, projection, tile_image=tile_image, speed_range=speed_range)
     active_frame = bytearray(base_frame)
     states = [{"idx": 0} for _ in tracks]
 
@@ -621,8 +849,9 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
                 while state["idx"] + 1 < len(points) and points[state["idx"] + 1]["t_ms"] <= t_ms:
                     prev = points[state["idx"]]
                     curr = points[state["idx"] + 1]
-                    draw_line(active_frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], dim(track["color"], 0.35), thickness=6)
-                    draw_line(active_frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], track["color"], thickness=3)
+                    color = speed_color(segment_speed(prev, curr), *speed_range)
+                    draw_line(active_frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], (12, 16, 22), thickness=7)
+                    draw_line(active_frame, width, height, prev["x"], prev["y"], curr["x"], curr["y"], color, thickness=4)
                     state["idx"] += 1
 
             frame = bytearray(active_frame)
@@ -630,12 +859,12 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
             for track_index, track in enumerate(tracks):
                 x, y, heading, speed_mps, accuracy_m, seg_idx, next_idx = interpolate_position(track, states[track_index]["idx"], t_ms)
                 points = track["points"]
+                live_color = speed_color(speed_mps, *speed_range)
                 if next_idx < len(points):
                     curr = points[seg_idx]
-                    draw_line(frame, width, height, curr["x"], curr["y"], x, y, mix_color(track["color"], TRACK_GLOW, 0.35), thickness=4)
-                draw_recent_trail(frame, width, height, track, seg_idx, x, y)
-                accuracy_px = None if accuracy_m is None else max(4.0, min(22.0, accuracy_m / projection["meters_per_px"]))
-                draw_marker(frame, width, height, x, y, track["color"], heading, accuracy_px=accuracy_px, tag=track["tag"])
+                    draw_line(frame, width, height, curr["x"], curr["y"], x, y, mix_color(live_color, TRACK_GLOW, 0.35), thickness=4)
+                draw_recent_trail(frame, width, height, track, seg_idx, x, y, speed_range)
+                draw_marker(frame, width, height, x, y, live_color, heading, tag=track["tag"])
                 live_states.append({
                     "track": track,
                     "speed_mps": speed_mps,
@@ -644,6 +873,7 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
 
             draw_legend(frame, width, height, tracks)
             draw_status_panel(frame, width, height, tracks, live_states)
+            draw_speed_legend(frame, width, height, speed_range)
             progress = min(1.0, max(0.0, (t_ms - start_ms) / duration_ms))
             draw_progress_bar(frame, width, height, progress, label=format_elapsed_label(t_ms - start_ms, duration_ms))
             proc.stdin.write(frame)
@@ -704,15 +934,32 @@ def main():
         }))
         return 1
 
-    result = render_video(
-        payload=payload,
-        output_path=output_path,
+    render_kwargs = dict(
         ffmpeg_bin=args.ffmpeg_bin,
         width=max(320, int(args.width)),
         height=max(180, int(args.height)),
         fps=max(1.0, float(args.fps)),
         crf=max(0, int(args.crf)),
     )
+
+    if args.per_device:
+        devices = payload.get("devices") or []
+        results = []
+        all_ok = True
+        for index, device in enumerate(devices):
+            device_id = str(device.get("device_id") or f"device-{index + 1}")
+            safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in device_id)
+            per_path = output_path.with_name(f"{output_path.stem}_{safe_id}{output_path.suffix}")
+            device_payload = {**payload, "devices": [device]}
+            result = render_video(payload=device_payload, output_path=per_path, **render_kwargs)
+            result["device_id"] = device_id
+            results.append(result)
+            if not result.get("ok"):
+                all_ok = False
+        print(json.dumps({"ok": all_ok, "per_device": True, "results": results}))
+        return 0 if all_ok else 1
+
+    result = render_video(payload=payload, output_path=output_path, **render_kwargs)
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 
