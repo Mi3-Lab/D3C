@@ -802,6 +802,57 @@ def draw_speed_legend(frame, width, height, speed_range):
     draw_text(frame, width, height, bar_x + bar_width - hi_width, bar_y + bar_height + 3, hi_label, LEGEND_TEXT, scale=1)
 
 
+def probe_video_dims(path: Path):
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        w_str, h_str = out.split(",", 1)
+        return int(w_str), int(h_str)
+    except Exception:
+        return None
+
+
+def compose_camera_with_map(camera_path: Path, map_path: Path, output_path: Path, ffmpeg_bin: str, crf: int):
+    dims = probe_video_dims(camera_path)
+    cam_w, cam_h = dims if dims else (1280, 720)
+    if cam_w >= cam_h:
+        overlay_w = max(320, cam_w // 3)
+    else:
+        overlay_w = max(360, cam_w // 2)
+    margin = max(16, cam_w // 60)
+    filter_expr = (
+        f"[1:v]scale={overlay_w}:-2,setsar=1,"
+        f"pad=iw+4:ih+4:2:2:color=white[mapov];"
+        f"[0:v][mapov]overlay=W-w-{margin}:{margin}[outv]"
+    )
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(camera_path),
+        "-i", str(map_path),
+        "-filter_complex", filter_expr,
+        "-map", "[outv]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    return proc.returncode == 0, proc.stderr.decode("utf-8", errors="ignore")[-1200:]
+
+
 def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height: int, fps: float, crf: int):
     tracks, projection, start_ms, end_ms = prepare_tracks(payload, width, height)
     if not tracks:
@@ -946,13 +997,51 @@ def main():
         devices = payload.get("devices") or []
         results = []
         all_ok = True
+        session_root = None
+        parent = output_path.parent
+        for candidate in [parent] + list(parent.parents):
+            if (candidate / "devices").is_dir():
+                session_root = candidate
+                break
+            if candidate.name == "exports":
+                session_root = candidate.parent
+                break
         for index, device in enumerate(devices):
             device_id = str(device.get("device_id") or f"device-{index + 1}")
             safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in device_id)
-            per_path = output_path.with_name(f"{output_path.stem}_{safe_id}{output_path.suffix}")
+            per_path = None
+            camera_video_path = None
+            device_dir = None
+            if session_root is not None:
+                device_dir = session_root / "devices" / device_id
+                if device_dir.is_dir():
+                    per_path = device_dir / output_path.name
+                    for candidate in ("camera_with_audio.mp4", "camera_video.mp4"):
+                        candidate_path = device_dir / "streams" / candidate
+                        if candidate_path.exists():
+                            camera_video_path = candidate_path
+                            break
+                else:
+                    device_dir = None
+            if per_path is None:
+                per_path = output_path.with_name(f"{output_path.stem}_{safe_id}{output_path.suffix}")
             device_payload = {**payload, "devices": [device]}
             result = render_video(payload=device_payload, output_path=per_path, **render_kwargs)
             result["device_id"] = device_id
+            if camera_video_path is not None and result.get("ok") and not result.get("skipped"):
+                combined_path = per_path.with_name(f"{per_path.stem}_camera{per_path.suffix}")
+                ok, err = compose_camera_with_map(
+                    camera_path=camera_video_path,
+                    map_path=per_path,
+                    output_path=combined_path,
+                    ffmpeg_bin=render_kwargs["ffmpeg_bin"],
+                    crf=render_kwargs["crf"],
+                )
+                if ok:
+                    result["camera_with_map"] = combined_path.as_posix()
+                else:
+                    result["camera_with_map_error"] = err
+                    all_ok = False
             results.append(result)
             if not result.get("ok"):
                 all_ok = False
