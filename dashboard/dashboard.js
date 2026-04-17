@@ -6,7 +6,7 @@ const DEFAULT_RUN_CONFIG = {
   device_id: "phone1",
   streams: {
     imu: { enabled: true, rate_hz: 30, record: true },
-    camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", encode_timing: "post_session", video_fps: 10, video_bitrate: "2M", video_crf: 23, downsample_factor: 1 },
+    camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", encode_timing: "post_session", video_fps: 30, video_bitrate: "2M", video_crf: 23, downsample_factor: 1 },
     gps: { enabled: false, rate_hz: 1, record: false },
     audio: { enabled: false, rate_hz: 10, record: false },
     device: { enabled: true, rate_hz: 1, record: false },
@@ -458,12 +458,16 @@ function updateGlobalStatusBar() {
   const totalCount = (st.deviceList || []).length;
   const onlineCount = (st.deviceList || []).filter((d) => d?.connected !== false).length;
   const systemReady = st.wsConnected && onlineCount > 0;
-  setHeaderStatus(els.statusSystem, systemReady ? "System Ready" : "Waiting for Devices", systemReady ? "green" : "gray");
-  setHeaderStatus(els.statusConn, st.wsConnected ? "Server Connected" : "Server Offline", st.wsConnected ? "green" : "gray");
-  setHeaderStatus(els.statusDevices, `${onlineCount}/${Math.max(totalCount, onlineCount)} Devices`);
+  const phoneLabel = `${onlineCount} phone${onlineCount === 1 ? "" : "s"} online`;
+  const fleetText = systemReady
+    ? "Ready to record"
+    : (st.wsConnected ? "Waiting for phones" : "Connecting to server");
+  setHeaderStatus(els.statusSystem, fleetText, systemReady ? "green" : "gray");
+  setHeaderStatus(els.statusConn, st.wsConnected ? "Dashboard connected" : "Dashboard offline", st.wsConnected ? "green" : "gray");
+  setHeaderStatus(els.statusDevices, totalCount > onlineCount ? `${phoneLabel} of ${totalCount}` : phoneLabel);
   setHeaderStatus(
     els.statusRec,
-    st.recording?.active ? `Recording ${formatElapsed(st.recording.elapsed_sec || 0)}` : "Recording Idle",
+    st.recording?.active ? `Recording ${formatElapsed(st.recording.elapsed_sec || 0)}` : "Not recording",
     st.recording?.active ? "red" : "gray"
   );
 }
@@ -501,7 +505,9 @@ function panelRecBadgeHtml(instance) {
 }
 function bindTopUi() {
   els.editLayoutBtn.addEventListener("click", () => {
-    store.setState({ editMode: !store.getState().editMode });
+    const nextEditMode = !store.getState().editMode;
+    store.setState({ editMode: nextEditMode });
+    if (els.advancedLayoutPanel) els.advancedLayoutPanel.open = nextEditMode;
     renderDashboard();
   });
   els.layoutSelect.addEventListener("change", () => {
@@ -776,6 +782,7 @@ function renderLayoutSelectors() {
     els.layoutSelect.appendChild(opt);
   }
   if (st.layouts[st.activeLayoutName]) els.layoutSelect.value = st.activeLayoutName;
+  els.layoutNameInput.placeholder = st.activeLayoutName ? `e.g. ${st.activeLayoutName} Copy` : "e.g. Demo";
 }
 
 

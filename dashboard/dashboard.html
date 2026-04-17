@@ -6,31 +6,49 @@
   <title>D3C / Fleet Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body class="app-body">
+<body class="app-body dashboard-body">
 
   <header class="topbar">
     <div class="topbar-left">
-      <span class="topbar-logo">D3C</span>
-      <span class="topbar-title">Fleet Dashboard</span>
+      <div class="brand-lockup">
+        <span class="topbar-logo">D3C</span>
+        <div class="topbar-copy">
+          <span class="topbar-kicker">Distributed Driving Data Collective</span>
+          <span class="topbar-title">Fleet Dashboard</span>
+        </div>
+      </div>
     </div>
     <div class="status-bar" id="globalStatusBar" aria-label="Global status">
-      <div class="status-item" id="statusSystem">
-        <span class="indicator gray"></span>
-        <span class="status-text">System Ready</span>
+      <div class="status-card" id="statusSystem">
+        <span class="status-label">Fleet</span>
+        <div class="status-value">
+          <span class="indicator gray"></span>
+          <span class="status-text">Waiting for phones</span>
+        </div>
       </div>
-      <div class="status-item" id="statusConn">
-        <span class="indicator gray"></span>
-        <span class="status-text">Connected</span>
+      <div class="status-card" id="statusConn">
+        <span class="status-label">Connection</span>
+        <div class="status-value">
+          <span class="indicator gray"></span>
+          <span class="status-text">Dashboard offline</span>
+        </div>
       </div>
-      <div class="status-item" id="statusDevices">
-        <span class="status-text">0/0 Devices</span>
+      <div class="status-card" id="statusDevices">
+        <span class="status-label">Phones</span>
+        <div class="status-value">
+          <span class="indicator gray" hidden></span>
+          <span class="status-text">0 phones online</span>
+        </div>
       </div>
-      <div class="status-item" id="statusRec">
-        <span class="indicator gray"></span>
-        <span class="status-text">Idle</span>
+      <div class="status-card" id="statusRec">
+        <span class="status-label">Recording</span>
+        <div class="status-value">
+          <span class="indicator gray"></span>
+          <span class="status-text">Not recording</span>
+        </div>
       </div>
     </div>
     <div class="topbar-right">
@@ -38,36 +56,51 @@
     </div>
   </header>
 
-  <details class="workspace-bar" id="advancedLayoutPanel">
-    <summary class="workspace-bar-summary">
-      <span class="workspace-bar-label">Workspace</span>
-      <div class="workspace-bar-controls" onclick="event.stopPropagation()">
-        <label>Layout <select id="layoutSelect"></select></label>
-        <label>Preset
-          <select id="layoutPresetSelect">
-            <option value="">—</option>
-            <option value="Overview">Overview</option>
-            <option value="Cameras">Cameras</option>
-            <option value="Review">Review</option>
-          </select>
-        </label>
-        <button id="editLayoutBtn" class="btn btn-alt btn-small">Edit</button>
-        <label>Name <input id="layoutNameInput" type="text" placeholder="e.g. Demo" /></label>
-        <button id="saveLayoutBtn" class="btn btn-small">Save</button>
-        <button id="deleteLayoutBtn" class="btn btn-alt btn-small">Delete</button>
-        <button id="exportLayoutBtn" class="btn btn-alt btn-small">Export</button>
-        <label class="file-label">Import <input id="importLayoutFile" type="file" accept="application/json" /></label>
+  <main class="dashboard-main">
+    <section class="dashboard-hero">
+      <div class="dashboard-hero-copy">
+        <h1>Fleet Dashboard</h1>
+        <p class="dashboard-hero-text">Join code, capture toggles, and live device status.</p>
       </div>
-    </summary>
-    <div class="workspace-bar-edit edit-row" id="editToolsRow">
-      <label>Add Widget <select id="addWidgetSelect"></select></label>
-      <button id="addWidgetBtn" class="btn btn-small">Add</button>
-      <span class="muted mono">Drag headers to move · Resize from corner</span>
-    </div>
-  </details>
+    </section>
 
-  <main class="widget-area">
-    <section id="widgetGrid" class="widget-grid"></section>
+    <details class="workspace-bar workspace-panel" id="advancedLayoutPanel" hidden>
+      <summary class="workspace-bar-summary workspace-panel-summary">
+        <div class="workspace-panel-copy">
+          <span class="workspace-bar-label">Customize Dashboard</span>
+          <p class="workspace-panel-text">Layouts, presets, and widget editing live here when you need them.</p>
+        </div>
+        <span class="workspace-panel-meta">Optional</span>
+      </summary>
+      <div class="workspace-panel-body">
+        <div class="workspace-bar-controls">
+          <label>Current layout <select id="layoutSelect"></select></label>
+          <label>Reset to preset
+            <select id="layoutPresetSelect">
+              <option value="">—</option>
+              <option value="Overview">Overview</option>
+              <option value="Cameras">Cameras</option>
+              <option value="Review">Review</option>
+            </select>
+          </label>
+          <button id="editLayoutBtn" class="btn btn-alt btn-small">Edit Layout</button>
+          <label>Save as <input id="layoutNameInput" type="text" placeholder="e.g. Demo" /></label>
+          <button id="saveLayoutBtn" class="btn btn-small">Save</button>
+          <button id="deleteLayoutBtn" class="btn btn-alt btn-small">Delete</button>
+          <button id="exportLayoutBtn" class="btn btn-alt btn-small">Export</button>
+          <label class="file-label">Import <input id="importLayoutFile" type="file" accept="application/json" /></label>
+        </div>
+        <div class="workspace-bar-edit edit-row" id="editToolsRow">
+          <label>Add widget <select id="addWidgetSelect"></select></label>
+          <button id="addWidgetBtn" class="btn btn-small">Add Widget</button>
+          <span class="muted mono">Drag headers to move widgets and use the lower-right handle to resize.</span>
+        </div>
+      </div>
+    </details>
+
+    <section class="widget-area">
+      <section id="widgetGrid" class="widget-grid"></section>
+    </section>
   </main>
 
   <script type="module" src="/dashboard.js"></script>

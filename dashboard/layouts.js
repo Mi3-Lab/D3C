@@ -8,24 +8,24 @@ export function defaultLayouts(makeWidget) {
     Overview: {
       name: "Overview",
       widgets: [
-        makeWidget("stream_controls", { w: 12, h: 5, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("camera_preview", { w: 12, h: 4, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("stream_controls", { w: 5, h: 6, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("camera_preview", { w: 7, h: 6, pinned: true, settings: { device_id: "global" } }),
         makeWidget("device_list", { w: 12, h: 4, pinned: true })
       ]
     },
     Cameras: {
       name: "Cameras",
       widgets: [
-        makeWidget("camera_preview", { w: 12, h: 4, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("device_list", { w: 12, h: 4, pinned: true }),
+        makeWidget("camera_preview", { w: 8, h: 5, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("device_list", { w: 4, h: 5, pinned: true }),
         makeWidget("gps_live", { w: 12, h: 3, pinned: false, settings: { device_id: "global" } })
       ]
     },
     Review: {
       name: "Review",
       widgets: [
-        makeWidget("stream_controls", { w: 12, h: 5, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("replay", { w: 12, h: 4, pinned: true }),
+        makeWidget("stream_controls", { w: 4, h: 5, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("replay", { w: 8, h: 5, pinned: true }),
         makeWidget("device_list", { w: 12, h: 4, pinned: false })
       ]
     }

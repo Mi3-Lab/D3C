@@ -76,8 +76,12 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
   }
 
   const compositeInputs = deviceInfos.filter((info) => canIncludeInMultiview(info));
-  const layout = buildLayout(compositeInputs.length);
-  const globalWindow = computeGlobalWindow(compositeInputs);
+  const multiviewInputs = compositeInputs.length >= 2 ? compositeInputs : [];
+  if (compositeInputs.length === 1) {
+    result.warnings.push("Skipped session multiview exports because only one recorded camera was available.");
+  }
+  const layout = buildLayout(multiviewInputs.length);
+  const globalWindow = computeGlobalWindow(multiviewInputs);
   const sessionMultiviewPath = path.join(exportsDir, SESSION_MULTIVIEW_NAME);
   const sessionMultiviewWithAudioPath = path.join(exportsDir, SESSION_MULTIVIEW_WITH_AUDIO_NAME);
   const sessionMultiviewWithAudioAndGpsPath = path.join(exportsDir, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME);
@@ -85,10 +89,15 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
   const sessionGpsPlaybackPath = path.join(exportsDir, SESSION_GPS_PLAYBACK_NAME);
   const sessionGpsPlaybackVideoPath = path.join(exportsDir, SESSION_GPS_PLAYBACK_VIDEO_NAME);
 
-  let multiviewRes = { ok: true, skipped: true, reason: "no_camera_inputs", path: sessionMultiviewPath };
-  if (compositeInputs.length) {
+  let multiviewRes = {
+    ok: true,
+    skipped: true,
+    reason: compositeInputs.length === 1 ? "single_camera_input" : "no_camera_inputs",
+    path: sessionMultiviewPath
+  };
+  if (multiviewInputs.length) {
     multiviewRes = await createMultiviewVideo({
-      inputs: compositeInputs,
+      inputs: multiviewInputs,
       outPath: sessionMultiviewPath,
       ffmpegBin,
       layout,
@@ -187,7 +196,8 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
     deviceInfos,
     result,
     layout,
-    globalWindow
+    globalWindow,
+    multiviewDeviceIds: multiviewInputs.map((info) => info.deviceId)
   });
   fs.writeFileSync(sessionManifestPath, JSON.stringify(manifest, null, 2), "utf8");
 
@@ -407,33 +417,16 @@ function probeVideoDimensions(videoPath, ffprobeBin = process.env.FFPROBE_BIN ||
 }
 
 async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, globalWindow }) {
-  if (!inputs.length) {
-    return { ok: true, skipped: true, reason: "no_inputs", path: outPath };
+  if (inputs.length < 2) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: inputs.length === 1 ? "single_input" : "no_inputs",
+      path: outPath
+    };
   }
   if (!globalWindow) {
     return { ok: false, path: outPath, error: "global timeline unavailable" };
-  }
-  if (inputs.length === 1) {
-    const info = inputs[0];
-    const offsetSec = Math.max(0, (info.cameraTimeline.absoluteStartMs - globalWindow.startMs) / 1000);
-    const serverScale = Math.max(0.0001, Number(info.cameraTimeline.serverScale || 1));
-    const args = [
-      "-y",
-      "-i", info.cameraVideoPath,
-      "-filter:v",
-      `setpts=${formatFfmpegNumber(serverScale)}*(PTS-STARTPTS)+${formatFfmpegNumber(offsetSec)}/TB,` +
-      `scale=${TILE_WIDTH}:${TILE_HEIGHT}:force_original_aspect_ratio=decrease,` +
-      `pad=${TILE_WIDTH}:${TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,` +
-      `${buildTileChromeFilters(info)}`,
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-pix_fmt", "yuv420p",
-      "-movflags", "+faststart",
-      outPath
-    ];
-    const res = await runFfmpeg(args, ffmpegBin);
-    return { ...res, path: outPath };
   }
 
   const args = ["-y"];
@@ -480,33 +473,42 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
 async function muxVideoWithAudio({ videoPath, audioPath, outPath, ffmpegBin, offsetSec = 0, audioTempoFactor = 1 }) {
   const args = ["-y", "-i", videoPath, "-i", audioPath];
   const audioFilters = [];
+  const videoFilters = [];
   const clampedTempo = Number.isFinite(audioTempoFactor) && audioTempoFactor > 0 ? audioTempoFactor : 1;
   audioFilters.push(...buildAtempoFilters(clampedTempo));
   if (offsetSec < -0.0005) {
     audioFilters.push(`atrim=start=${formatFfmpegNumber(Math.abs(offsetSec))}`, "asetpts=PTS-STARTPTS");
   } else if (offsetSec > 0.0005) {
-    const delayMs = Math.round(offsetSec * 1000);
-    audioFilters.push(`adelay=${delayMs}:all=1`);
+    videoFilters.push(`trim=start=${formatFfmpegNumber(offsetSec)}`, "setpts=PTS-STARTPTS");
   }
 
+  const filterParts = [];
+  let videoMap = "0:v:0";
+  let audioMap = "1:a:0";
+  if (videoFilters.length) {
+    filterParts.push(`[0:v]${videoFilters.join(",")}[outv]`);
+    videoMap = "[outv]";
+  }
   if (audioFilters.length) {
+    filterParts.push(`[1:a]${audioFilters.join(",")}[outa]`);
+    audioMap = "[outa]";
+  }
+  if (filterParts.length) args.push("-filter_complex", filterParts.join(";"));
+
+  args.push("-map", videoMap, "-map", audioMap);
+
+  if (videoFilters.length) {
     args.push(
-      "-filter_complex",
-      `[1:a]${audioFilters.join(",")}[outa]`,
-      "-map", "0:v",
-      "-map", "[outa]"
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "23",
+      "-pix_fmt", "yuv420p"
     );
   } else {
-    args.push("-map", "0:v", "-map", "1:a");
+    args.push("-c:v", "copy");
   }
 
-  args.push(
-    "-c:v", "copy",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-movflags", "+faststart",
-    outPath
-  );
+  args.push("-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", outPath);
   const res = await runFfmpeg(args, ffmpegBin);
   return { ...res, path: outPath };
 }
@@ -645,40 +647,54 @@ function hasUsableAudio(info) {
   return !!(info?.audioWavPath && fs.existsSync(info.audioWavPath) && info.audioTimeline);
 }
 
-function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, globalWindow }) {
+function manifestFilePath(sessionDir, filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return relativize(sessionDir, filePath);
+}
+
+function manifestExportPath(sessionDir, exportResult) {
+  if (!exportResult?.ok || exportResult?.skipped || !exportResult?.path || !fs.existsSync(exportResult.path)) return null;
+  return relativize(sessionDir, exportResult.path);
+}
+
+function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, globalWindow, multiviewDeviceIds = [] }) {
+  const includedInMultiview = new Set(multiviewDeviceIds || []);
   return {
     generated_at_iso: result.generated_at_iso,
     session_dir: result.session_dir,
     session_name: meta?.session_name || null,
     focused_device_id: meta?.focused_device_id || null,
     audio_source_device_id: result.audio_source_device_id || null,
-    layout: layout || null,
+    layout: layout?.count ? layout : null,
     global_timeline: globalWindow ? {
       start_ms: roundNumber(globalWindow.startMs),
       end_ms: roundNumber(globalWindow.endMs),
       duration_ms: roundNumber(globalWindow.durationMs)
     } : null,
     exports: {
-      session_multiview: relativize(result.session_dir, result.exports.session_multiview?.path || null),
-      session_multiview_with_audio: relativize(result.session_dir, result.exports.session_multiview_with_audio?.path || null),
-      session_multiview_with_audio_and_gps: relativize(result.session_dir, result.exports.session_multiview_with_audio_and_gps?.path || null),
-      session_gps_playback: relativize(result.session_dir, result.exports.session_gps_playback?.path || null),
-      session_gps_playback_video: relativize(result.session_dir, result.exports.session_gps_playback_video?.path || null),
+      session_multiview: manifestExportPath(result.session_dir, result.exports.session_multiview),
+      session_multiview_with_audio: manifestExportPath(result.session_dir, result.exports.session_multiview_with_audio),
+      session_multiview_with_audio_and_gps: manifestExportPath(result.session_dir, result.exports.session_multiview_with_audio_and_gps),
+      session_gps_playback: manifestExportPath(result.session_dir, result.exports.session_gps_playback),
+      session_gps_playback_video: manifestExportPath(result.session_dir, result.exports.session_gps_playback_video),
       session_multiview_manifest: relativize(result.session_dir, result.exports.session_multiview_manifest?.path || null)
     },
-    devices: deviceInfos.map((info) => ({
-      device_id: info.deviceId,
-      device_name: info.deviceName,
-      video_fps: info.videoFps,
-      included_in_multiview: canIncludeInMultiview(info),
-      camera_video: relativize(result.session_dir, info.cameraVideoPath),
-      camera_with_audio: relativize(result.session_dir, path.join(info.streamsDir, CAMERA_WITH_AUDIO_NAME)),
-      audio_wav: relativize(result.session_dir, info.audioWavPath),
-      audio_chunks_csv: relativize(result.session_dir, info.audioChunksPath),
-      imu_csv: relativize(result.session_dir, info.imuCsvPath),
-      gps_csv: relativize(result.session_dir, info.gpsCsvPath),
-      timeline: summarizeTimeline(info)
-    })),
+    devices: deviceInfos.map((info) => {
+      const deviceResult = result.devices?.[info.deviceId] || {};
+      return {
+        device_id: info.deviceId,
+        device_name: info.deviceName,
+        video_fps: info.videoFps,
+        included_in_multiview: includedInMultiview.has(info.deviceId),
+        camera_video: manifestExportPath(result.session_dir, deviceResult.camera_video),
+        camera_with_audio: manifestExportPath(result.session_dir, deviceResult.camera_with_audio),
+        audio_wav: manifestFilePath(result.session_dir, info.audioWavPath),
+        audio_chunks_csv: manifestFilePath(result.session_dir, info.audioChunksPath),
+        imu_csv: manifestFilePath(result.session_dir, info.imuCsvPath),
+        gps_csv: manifestFilePath(result.session_dir, info.gpsCsvPath),
+        timeline: summarizeTimeline(info)
+      };
+    }),
     sync_report_generated_at_iso: syncReport?.generated_at_iso || null,
     had_errors: !!result.had_errors,
     warnings: result.warnings || []
