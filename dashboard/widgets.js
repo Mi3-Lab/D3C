@@ -63,21 +63,21 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
       }
     },
     device_list: {
-      title: "Devices",
+      title: "Connected Phones",
       defaults: { w: 3, h: 5, pinned: true, settings: {} },
       render(content) {
-        const table = document.createElement("table");
-        table.innerHTML = "<thead><tr><th>device</th><th>readiness</th><th>imu hz</th><th>cam fps</th><th>gps</th><th>health</th><th>dropouts</th><th>lastSeen</th></tr></thead><tbody></tbody>";
-        const tbody = table.querySelector("tbody");
-        content.appendChild(table);
+        const list = document.createElement("div");
+        list.className = "device-roster";
+        content.appendChild(list);
 
         const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice }), () => {
           const st = store.getState();
-          tbody.innerHTML = "";
+          list.innerHTML = "";
           if (!st.deviceList || !st.deviceList.length) {
-            const tr = document.createElement("tr");
-            tr.innerHTML = "<td colspan=\"8\" class=\"empty-state\">No devices connected</td>";
-            tbody.appendChild(tr);
+            const empty = document.createElement("div");
+            empty.className = "empty-state device-roster-empty";
+            empty.textContent = "No phones connected";
+            list.appendChild(empty);
             return;
           }
           for (const d of st.deviceList) {
@@ -88,7 +88,6 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const tone = connected ? (streaming ? "ok" : "warn") : "bad";
             const label = tone === "ok" ? "Streaming" : tone === "warn" ? "Idle" : "Disconnected";
 
-            const tr = document.createElement("tr");
             const readiness = connected ? (d.recordingActive ? "recording" : "armed") : "not ready";
             const readinessClass = readiness === "recording" ? "recording" : (readiness === "armed" ? "armed" : "not-ready");
             const dropped = Number(d.droppedPackets ?? 0);
@@ -133,8 +132,50 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const healthTitle = healthAlerts.length
               ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
               : "No active alerts";
-            tr.innerHTML = `<td><span class="device-dot ${tone}"></span><div class="device-cell"><div class="device-main">${displayName}</div><div class="device-sub">${secondaryId}</div></div></td><td><span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span></td><td>${imu.toFixed(1)}</td><td>${escapeHtml(cam > 0 ? cam.toFixed(1) : (d.cameraPreviewLive ? "RTC" : "0.0"))}</td><td><span class="gps-badge ${gpsClass}">${escapeHtml(gpsText)}</span></td><td><span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span></td><td>${Number.isFinite(dropped) ? dropped : "-"}</td><td>${escapeHtml(lastSeen)}</td>`;
-            tbody.appendChild(tr);
+            const card = document.createElement("article");
+            card.className = `device-roster-card tone-${tone}`;
+            card.innerHTML = `
+              <div class="device-roster-head">
+                <div class="device-roster-title">
+                  <span class="device-dot ${tone}"></span>
+                  <div class="device-cell">
+                    <div class="device-main">${displayName}</div>
+                    <div class="device-sub">${secondaryId}</div>
+                  </div>
+                </div>
+                <div class="device-roster-badges">
+                  <span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span>
+                  <span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span>
+                </div>
+              </div>
+              <div class="device-roster-grid">
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Status</span>
+                  <strong>${escapeHtml(label)}</strong>
+                </div>
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Motion</span>
+                  <strong>${escapeHtml(`${imu.toFixed(1)} Hz`)}</strong>
+                </div>
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Camera</span>
+                  <strong>${escapeHtml(cam > 0 ? `${cam.toFixed(1)} FPS` : (d.cameraPreviewLive ? "RTC live" : "Off"))}</strong>
+                </div>
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Location</span>
+                  <strong><span class="gps-badge ${gpsClass}">${escapeHtml(gpsText)}</span></strong>
+                </div>
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Dropouts</span>
+                  <strong>${escapeHtml(Number.isFinite(dropped) ? String(dropped) : "-")}</strong>
+                </div>
+                <div class="device-roster-metric">
+                  <span class="device-roster-label">Last seen</span>
+                  <strong>${escapeHtml(lastSeen)}</strong>
+                </div>
+              </div>
+            `;
+            list.appendChild(card);
           }
         });
         return () => unsub();
@@ -142,17 +183,22 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
     },
 
     stream_controls: {
-      title: "Session Setup",
+      title: "Session Control",
       defaults: { w: 5, h: 6, pinned: true, settings: {} },
       render(content) {
         content.classList.add("session-setup-panel");
 
-        const intro = document.createElement("div");
-        intro.className = "session-intro";
-        content.appendChild(intro);
-
         const summary = document.createElement("div");
         summary.className = "kv-grid session-kpis";
+
+        const capturePanel = document.createElement("section");
+        capturePanel.className = "session-capture-panel";
+        const captureTitle = document.createElement("div");
+        captureTitle.className = "session-section-title";
+        captureTitle.textContent = "Record";
+        const captureGrid = document.createElement("div");
+        captureGrid.className = "session-capture-grid";
+        capturePanel.append(captureTitle, captureGrid);
 
         const recRow = document.createElement("div");
         recRow.className = "row session-cta-row";
@@ -160,10 +206,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         ctaPanel.className = "session-cta-panel";
         const ctaTitle = document.createElement("strong");
         ctaTitle.className = "session-cta-title";
-        ctaTitle.textContent = "Recording Control";
-        const ctaHint = document.createElement("span");
-        ctaHint.className = "session-cta-hint";
-        ctaHint.textContent = "Start when your phones are ready. Stop when the take is done.";
+        ctaTitle.textContent = "Recording";
         let actionPending = false;
         const ctaBtn = mkBtn("Start Recording", () => {
           actionPending = true;
@@ -187,15 +230,15 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         timer.className = "session-rec-timer mono";
         timer.textContent = "0:00:00 elapsed";
         recRow.append(ctaBtn, timer);
-        ctaPanel.append(ctaTitle, ctaHint, recRow);
+        ctaPanel.append(ctaTitle, recRow);
 
         const setupDetails = document.createElement("details");
         setupDetails.className = "session-setup";
         const setupSummary = document.createElement("summary");
         setupSummary.innerHTML = `
           <div>
-            <h2>Session Setup</h2>
-            <span class="helper">Configure next recording session</span>
+            <h2>Advanced</h2>
+            <span class="helper">Join code and stream rates</span>
           </div>
         `;
         const setupBody = document.createElement("div");
@@ -204,10 +247,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
         const form = document.createElement("div");
         form.className = "session-form";
-        const preflight = document.createElement("div");
-        preflight.className = "session-preflight";
 
-        setupBody.append(intro, summary, preflight, form);
+        setupBody.append(form);
 
         const joinBanner = document.createElement("div");
         joinBanner.className = "join-code-banner";
@@ -225,21 +266,36 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const joinBannerCopy = document.createElement("button");
         joinBannerCopy.className = "btn btn-alt";
         joinBannerCopy.textContent = "Copy";
+        const joinBannerCopyLink = document.createElement("button");
+        joinBannerCopyLink.className = "btn btn-alt";
+        joinBannerCopyLink.textContent = "Copy Link";
+        const setBannerCopyState = (button, idleLabel, activeLabel) => {
+          button.textContent = activeLabel;
+          setTimeout(() => {
+            button.textContent = idleLabel;
+          }, 1500);
+        };
         joinBannerCopy.addEventListener("click", () => {
           const code = store.getState().sessionJoinCode;
           if (code) navigator.clipboard?.writeText(code).catch(() => {});
-          joinBannerCopy.textContent = "Copied!";
-          setTimeout(() => { joinBannerCopy.textContent = "Copy"; }, 1500);
+          setBannerCopyState(joinBannerCopy, "Copy", "Copied!");
         });
-        const joinBannerHint = document.createElement("span");
-        joinBannerHint.className = "muted join-banner-hint";
-        joinBannerHint.textContent = "Share with phones to join";
-        joinBannerRight.append(joinBannerCopy, joinBannerHint);
+        joinBannerCopyLink.addEventListener("click", () => {
+          const st = store.getState();
+          const code = String(st.sessionJoinCode || "").trim();
+          if (!code) return;
+          const baseUrl = String(st.runtime?.public_url || window.location.origin || "").trim() || window.location.origin;
+          const phoneUrl = new URL("/phone", baseUrl);
+          phoneUrl.searchParams.set("join_code", code);
+          navigator.clipboard?.writeText(phoneUrl.toString()).catch(() => {});
+          setBannerCopyState(joinBannerCopyLink, "Copy Link", "Link Copied!");
+        });
+        joinBannerRight.append(joinBannerCopy, joinBannerCopyLink);
         joinBanner.append(joinBannerLeft, joinBannerRight);
 
-        content.append(joinBanner, ctaPanel, setupDetails);
+        content.append(joinBanner, capturePanel, ctaPanel, summary, setupDetails);
 
-        setupDetails.open = true;
+        setupDetails.open = false;
         let prevIsActive = false;
         let lastFormKey = "";
         const onStateChange = () => {
@@ -251,24 +307,15 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
           const online = (st.deviceList || []).filter((d) => d?.connected !== false).length;
           const estimates = computeSessionEstimates(cfg);
-          const preflightItems = computeSessionPreflight(st, cfg);
           const captureItems = describeCapturePlan(cfg);
-
-          intro.innerHTML = "";
-          const introTitle = document.createElement("strong");
-          introTitle.textContent = isActive ? "Session is live" : "Set up the next recording";
-          const introBody = document.createElement("span");
-          introBody.textContent = isActive
-            ? `Recording all connected devices. Capturing ${captureItems.join(", ")}.`
-            : "Choose what each phone should capture, then start recording when the fleet looks ready.";
-          intro.append(introTitle, introBody);
 
           summary.innerHTML = "";
           kv(summary, "Status", isActive ? "Recording now" : "Ready to configure");
           kv(summary, "Phones Online", String(online));
-          kv(summary, "Join Code", joinCode || "Not set");
-          kv(summary, "Capture Plan", captureItems.join(", "));
+          kv(summary, "Capture", captureItems.join(", "));
           kv(summary, "Estimated Data", `${estimates.storageMbPerMin.toFixed(1)} MB/min/device`);
+
+          renderPrimaryCaptureToggles(captureGrid, cfg, isActive, updateSessionCfg);
 
           const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
           const isStopping = phase === "STOPPING";
@@ -284,44 +331,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           timer.textContent = isStopping
             ? "Stopping and saving files..."
             : (isActive ? `${formatElapsed(st.recording?.elapsed_sec || 0)} elapsed` : "0:00:00 elapsed");
-          if (isActive !== prevIsActive) {
-            setupDetails.open = !isActive;
-            prevIsActive = isActive;
-          }
-
-          preflight.innerHTML = "";
-          const preflightTitle = document.createElement("div");
-          preflightTitle.className = "session-preflight-title";
-          preflightTitle.textContent = "Before You Record";
-          preflight.appendChild(preflightTitle);
-          const preflightList = document.createElement("div");
-          preflightList.className = "session-preflight-list";
-          if (!preflightItems.length) {
-            const ok = document.createElement("div");
-            ok.className = "session-preflight-item ok";
-            ok.innerHTML = `
-              <div class="session-preflight-head">
-                <span class="session-preflight-pill ok">Ready</span>
-                <strong>Fleet check passed</strong>
-              </div>
-              <div class="session-preflight-copy">${escapeHtml(online > 0 ? "Everything looks ready." : "No phones are online yet.")}</div>
-            `;
-            preflightList.appendChild(ok);
-          } else {
-            for (const item of preflightItems) {
-              const row = document.createElement("div");
-              row.className = `session-preflight-item ${item.severity}`;
-              row.innerHTML = `
-                <div class="session-preflight-head">
-                  <span class="session-preflight-pill ${item.severity}">${item.severity === "warn" ? "Check" : "Issue"}</span>
-                  <strong>${escapeHtml(preflightHeadline(item.message))}</strong>
-                </div>
-                <div class="session-preflight-copy">${escapeHtml(item.message)}</div>
-              `;
-              preflightList.appendChild(row);
-            }
-          }
-          preflight.appendChild(preflightList);
+          if (isActive && !prevIsActive) setupDetails.open = false;
+          prevIsActive = isActive;
 
           const formKey = JSON.stringify({
             active: isActive,
@@ -341,69 +352,58 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
           form.innerHTML = "";
 
-          const authBody = addFormSection(form, "Let Phones Join", "Share this code with each phone before you start.");
+          const authBody = addFormSection(form, "Join Access", "Change the code that phones use to join this session.");
           addTextInput(authBody, "Join code", joinCode, (v) => updateJoinCode(v), isActive, "e.g. A1B2C3");
-          addInfoLine(authBody, "Anyone connecting to the phone page needs this code.");
+          addInfoLine(authBody, "The banner above always shows the code currently in use.");
 
-          const imuBody = addFormSection(form, "Motion", "Accelerometer and gyroscope data from each phone.");
-          addToggle(imuBody, "Record motion", cfg.streams.imu.enabled, (v) => updateSessionCfg(cfg, (c) => {
-            c.streams.imu.enabled = v;
-            c.streams.imu.record = v;
-          }), isActive);
+          const captureDetailBody = addFormSection(form, "Capture Detail", "Adjust stream quality for any capture types that are turned on above.");
+          let hasDetailControl = false;
           if (cfg.streams.imu.enabled) {
-            addSelect(imuBody, "Detail level", String(cfg.streams.imu.rate_hz || 30), [
+            hasDetailControl = true;
+            addSelect(captureDetailBody, "Motion detail", String(cfg.streams.imu.rate_hz || 30), [
               { value: "10", label: "Light (10 Hz)" },
               { value: "30", label: "Balanced (30 Hz)" },
               { value: "60", label: "High (60 Hz)" }
-            ], (v) => updateSessionCfg(cfg, (c) => c.streams.imu.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.imu.rate_hz = Number(v)), isActive);
           }
 
-          const camBody = addFormSection(form, "Camera", "Live preview frames from each phone camera.");
-          addToggle(camBody, "Record camera", cfg.streams.camera.mode !== "off", (v) => updateSessionCfg(cfg, (c) => {
-            c.streams.camera.mode = v ? "stream" : "off";
-            c.streams.camera.record = v;
-          }), isActive);
           if (cfg.streams.camera.mode !== "off") {
-            addSelect(camBody, "Preview speed", String(cfg.streams.camera.fps || 10), [
+            hasDetailControl = true;
+            addSelect(captureDetailBody, "Camera preview speed", String(cfg.streams.camera.fps || 10), [
               { value: "5", label: "Low (5 FPS)" },
               { value: "10", label: "Balanced (10 FPS)" },
               { value: "15", label: "Smooth (15 FPS)" },
               { value: "30", label: "High (30 FPS)" }
-            ], (v) => updateSessionCfg(cfg, (c) => c.streams.camera.fps = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.camera.fps = Number(v)), isActive);
           }
 
-          const audioBody = addFormSection(form, "Audio", "Microphone capture from each phone.");
-          addToggle(audioBody, "Record audio", cfg.streams.audio.enabled, (v) => updateSessionCfg(cfg, (c) => {
-            c.streams.audio.enabled = v;
-            c.streams.audio.record = v;
-          }), isActive);
           if (cfg.streams.audio.enabled) {
-            addSelect(audioBody, "Update rate", String(cfg.streams.audio.rate_hz || 10), [
+            hasDetailControl = true;
+            addSelect(captureDetailBody, "Audio update rate", String(cfg.streams.audio.rate_hz || 10), [
               { value: "5", label: "Light (5 Hz)" },
               { value: "10", label: "Balanced (10 Hz)" },
               { value: "20", label: "High (20 Hz)" }
-            ], (v) => updateSessionCfg(cfg, (c) => c.streams.audio.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.audio.rate_hz = Number(v)), isActive);
           }
-          
-          const gpsBody = addFormSection(form, "Location", "GPS fixes from each phone.");
-          addToggle(gpsBody, "Record location", cfg.streams.gps.enabled, (v) => updateSessionCfg(cfg, (c) => {
-            c.streams.gps.enabled = v;
-            c.streams.gps.record = v;
-          }), isActive);
+
           if (cfg.streams.gps.enabled) {
-            addSelect(gpsBody, "Update rate", String(cfg.streams.gps.rate_hz || 1), [
+            hasDetailControl = true;
+            addSelect(captureDetailBody, "Location update rate", String(cfg.streams.gps.rate_hz || 1), [
               { value: "1", label: "Battery saver (1 Hz)" },
               { value: "2", label: "Balanced (2 Hz)" },
               { value: "5", label: "High (5 Hz)" }
-            ], (v) => updateSessionCfg(cfg, (c) => c.streams.gps.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.gps.rate_hz = Number(v)), isActive);
+          }
+          if (!hasDetailControl) {
+            addInfoLine(captureDetailBody, "Turn on a capture type above to reveal its detail controls here.");
           }
         };
 
-        function updateSessionCfg(cfg, mutator) {
+        function updateSessionCfg(mutator) {
           const st = store.getState();
           const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
           if (isActive) return;
-          const next = mergeRunConfig(cfg);
+          const next = mergeRunConfig(st.sessionConfig || defaultRunConfig);
           mutator(next);
           store.setState({ sessionConfig: next, sessionState: "draft" });
           sendJson({ type: "session_config_update", sessionConfig: next });
@@ -1081,6 +1081,100 @@ function drawTriAxisTimeSeries(canvas, samples, key, opts) {
   }
 }
 
+function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
+  parent.innerHTML = "";
+  const items = [
+    {
+      title: "Motion",
+      description: "Accelerometer and gyroscope",
+      isEnabled(currentCfg) {
+        return !!currentCfg.streams?.imu?.enabled;
+      },
+      detail(currentCfg) {
+        return currentCfg.streams?.imu?.enabled ? `${Number(currentCfg.streams.imu.rate_hz || 30)} Hz` : "Off";
+      },
+      toggle(nextCfg, value) {
+        nextCfg.streams.imu.enabled = value;
+        nextCfg.streams.imu.record = value;
+      }
+    },
+    {
+      title: "Camera",
+      description: "Live preview frames",
+      isEnabled(currentCfg) {
+        return String(currentCfg.streams?.camera?.mode || "off") !== "off";
+      },
+      detail(currentCfg) {
+        return String(currentCfg.streams?.camera?.mode || "off") !== "off" ? `${Number(currentCfg.streams.camera.fps || 10)} FPS` : "Off";
+      },
+      toggle(nextCfg, value) {
+        nextCfg.streams.camera.mode = value ? "stream" : "off";
+        nextCfg.streams.camera.record = value;
+      }
+    },
+    {
+      title: "Audio",
+      description: "Microphone capture",
+      isEnabled(currentCfg) {
+        return !!currentCfg.streams?.audio?.enabled;
+      },
+      detail(currentCfg) {
+        return currentCfg.streams?.audio?.enabled ? `${Number(currentCfg.streams.audio.rate_hz || 10)} Hz updates` : "Off";
+      },
+      toggle(nextCfg, value) {
+        nextCfg.streams.audio.enabled = value;
+        nextCfg.streams.audio.record = value;
+      }
+    },
+    {
+      title: "Location",
+      description: "GPS fixes",
+      isEnabled(currentCfg) {
+        return !!currentCfg.streams?.gps?.enabled;
+      },
+      detail(currentCfg) {
+        return currentCfg.streams?.gps?.enabled ? `${Number(currentCfg.streams.gps.rate_hz || 1)} Hz` : "Off";
+      },
+      toggle(nextCfg, value) {
+        nextCfg.streams.gps.enabled = value;
+        nextCfg.streams.gps.record = value;
+      }
+    }
+  ];
+
+  for (const item of items) {
+    const enabled = item.isEnabled(cfg);
+    const card = document.createElement("article");
+    card.className = `session-capture-card ${enabled ? "is-on" : "is-off"}${disabled ? " is-disabled" : ""}`;
+
+    const copy = document.createElement("div");
+    copy.className = "session-capture-copy";
+    copy.innerHTML = `
+      <div class="session-capture-head">
+        <strong>${escapeHtml(item.title)}</strong>
+        <span class="session-capture-status">${enabled ? "On" : "Off"}</span>
+      </div>
+      <span class="session-capture-desc">${escapeHtml(item.description)}</span>
+      <span class="session-capture-detail mono">${escapeHtml(item.detail(cfg))}</span>
+    `;
+
+    const action = document.createElement("button");
+    action.className = enabled ? "btn btn-small session-capture-action" : "btn btn-alt btn-small session-capture-action";
+    action.textContent = enabled ? "Turn Off" : "Turn On";
+    action.disabled = !!disabled;
+    action.addEventListener("click", () => {
+      if (disabled) return;
+      updateSessionCfg((nextCfg) => {
+        const currentEnabled = item.isEnabled(nextCfg);
+        item.toggle(nextCfg, !currentEnabled);
+      });
+    });
+
+    card.append(copy, action);
+    parent.appendChild(card);
+  }
+}
+
 function addFormSection(parent, title, description = "") {
   const section = document.createElement("section");
   section.className = "session-section";
@@ -1272,12 +1366,3 @@ function addInfoLine(parent, text) {
   line.textContent = text;
   parent.appendChild(line);
 }
-
-
-
-
-
-
-
-
-

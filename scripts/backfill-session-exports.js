@@ -43,7 +43,7 @@ async function main() {
   for (const sessionDir of sessions) {
     const sessionId = path.basename(sessionDir);
     const manifestPath = path.join(sessionDir, EXPORTS_DIRNAME, SESSION_MULTIVIEW_MANIFEST_NAME);
-    if (!args.force && fs.existsSync(manifestPath)) {
+    if (!args.force && hasCurrentExportManifest(manifestPath)) {
       summary.skipped_existing += 1;
       console.log(`[skip] ${sessionId} already has ${path.relative(sessionDir, manifestPath)}`);
       continue;
@@ -161,6 +161,26 @@ function appendControlLog(controlLogPath, entry) {
   try {
     fs.appendFileSync(controlLogPath, `${JSON.stringify(entry)}\n`, "utf8");
   } catch {}
+}
+
+function hasCurrentExportManifest(manifestPath) {
+  if (!fs.existsSync(manifestPath)) return false;
+  try {
+    const payload = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const exports = payload?.exports;
+    if (!exports || typeof exports !== "object") return false;
+    const required = [
+      "session_multiview",
+      "session_multiview_with_audio",
+      "session_multiview_with_audio_and_gps",
+      "session_gps_playback",
+      "session_gps_playback_video",
+      "session_multiview_manifest"
+    ];
+    return required.every((key) => Object.prototype.hasOwnProperty.call(exports, key));
+  } catch {
+    return false;
+  }
 }
 
 function collectFailures(result) {

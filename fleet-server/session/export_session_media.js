@@ -1,12 +1,15 @@
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { encodeCameraDirToMp4 } = require("./recorders/camera_recorder");
 
 const EXPORTS_DIRNAME = "exports";
 const SESSION_MULTIVIEW_NAME = "session_multiview.mp4";
 const SESSION_MULTIVIEW_WITH_AUDIO_NAME = "session_multiview_with_audio.mp4";
+const SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME = "session_multiview_with_audio_and_gps.mp4";
 const SESSION_MULTIVIEW_MANIFEST_NAME = "session_multiview_manifest.json";
+const SESSION_GPS_PLAYBACK_NAME = "session_gps_playback.json";
+const SESSION_GPS_PLAYBACK_VIDEO_NAME = "session_gps_playback.mp4";
 const CAMERA_WITH_AUDIO_NAME = "camera_with_audio.mp4";
 const TILE_WIDTH = 640;
 const TILE_HEIGHT = 360;
@@ -50,6 +53,8 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
       camera_video: summarizeExistingFile(info.cameraVideoPath),
       camera_with_audio: null,
       audio_wav: summarizeExistingFile(info.audioWavPath),
+      imu_csv: summarizeExistingFile(info.imuCsvPath),
+      gps_csv: summarizeExistingFile(info.gpsCsvPath),
       timeline: summarizeTimeline(info)
     };
   }
@@ -71,16 +76,28 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
   }
 
   const compositeInputs = deviceInfos.filter((info) => canIncludeInMultiview(info));
-  const layout = buildLayout(compositeInputs.length);
-  const globalWindow = computeGlobalWindow(compositeInputs);
+  const multiviewInputs = compositeInputs.length >= 2 ? compositeInputs : [];
+  if (compositeInputs.length === 1) {
+    result.warnings.push("Skipped session multiview exports because only one recorded camera was available.");
+  }
+  const layout = buildLayout(multiviewInputs.length);
+  const globalWindow = computeGlobalWindow(multiviewInputs);
   const sessionMultiviewPath = path.join(exportsDir, SESSION_MULTIVIEW_NAME);
   const sessionMultiviewWithAudioPath = path.join(exportsDir, SESSION_MULTIVIEW_WITH_AUDIO_NAME);
+  const sessionMultiviewWithAudioAndGpsPath = path.join(exportsDir, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME);
   const sessionManifestPath = path.join(exportsDir, SESSION_MULTIVIEW_MANIFEST_NAME);
+  const sessionGpsPlaybackPath = path.join(exportsDir, SESSION_GPS_PLAYBACK_NAME);
+  const sessionGpsPlaybackVideoPath = path.join(exportsDir, SESSION_GPS_PLAYBACK_VIDEO_NAME);
 
-  let multiviewRes = { ok: true, skipped: true, reason: "no_camera_inputs", path: sessionMultiviewPath };
-  if (compositeInputs.length) {
+  let multiviewRes = {
+    ok: true,
+    skipped: true,
+    reason: compositeInputs.length === 1 ? "single_camera_input" : "no_camera_inputs",
+    path: sessionMultiviewPath
+  };
+  if (multiviewInputs.length) {
     multiviewRes = await createMultiviewVideo({
-      inputs: compositeInputs,
+      inputs: multiviewInputs,
       outPath: sessionMultiviewPath,
       ffmpegBin,
       layout,
@@ -116,6 +133,58 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
   }
   result.exports.session_multiview_with_audio = multiviewAudioRes;
 
+  const gpsPlaybackRes = exportSessionGpsPlayback({
+    sessionDir: resolvedSessionDir,
+    outPath: sessionGpsPlaybackPath,
+    meta,
+    syncReport,
+    syncModels,
+    deviceInfos
+  });
+  markExportError(result, gpsPlaybackRes);
+  result.exports.session_gps_playback = gpsPlaybackRes;
+
+  let gpsPlaybackVideoRes = {
+    ok: true,
+    skipped: true,
+    reason: gpsPlaybackRes.ok ? "no_gps_tracks" : "gps_playback_export_failed",
+    path: sessionGpsPlaybackVideoPath
+  };
+  if (gpsPlaybackRes.ok && Number(gpsPlaybackRes.devices_with_gps || 0) > 0) {
+    gpsPlaybackVideoRes = await renderGpsPlaybackVideo({
+      inputJsonPath: sessionGpsPlaybackPath,
+      outPath: sessionGpsPlaybackVideoPath,
+      ffmpegBin
+    });
+    markExportError(result, gpsPlaybackVideoRes);
+  }
+  result.exports.session_gps_playback_video = gpsPlaybackVideoRes;
+
+  let multiviewAudioGpsRes = {
+    ok: true,
+    skipped: true,
+    reason: !multiviewAudioRes.ok || multiviewAudioRes.skipped
+      ? "missing_multiview_with_audio"
+      : (!gpsPlaybackVideoRes.ok || gpsPlaybackVideoRes.skipped ? "missing_gps_playback_video" : "unavailable"),
+    path: sessionMultiviewWithAudioAndGpsPath
+  };
+  if (
+    multiviewAudioRes.ok &&
+    !multiviewAudioRes.skipped &&
+    gpsPlaybackVideoRes.ok &&
+    !gpsPlaybackVideoRes.skipped
+  ) {
+    multiviewAudioGpsRes = await composeMultiviewWithAudioAndGps({
+      baseVideoPath: sessionMultiviewWithAudioPath,
+      gpsVideoPath: sessionGpsPlaybackVideoPath,
+      outPath: sessionMultiviewWithAudioAndGpsPath,
+      ffmpegBin,
+      layout
+    });
+    markExportError(result, multiviewAudioGpsRes);
+  }
+  result.exports.session_multiview_with_audio_and_gps = multiviewAudioGpsRes;
+
   result.exports.session_multiview_manifest = {
     ok: true,
     skipped: false,
@@ -127,7 +196,8 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
     deviceInfos,
     result,
     layout,
-    globalWindow
+    globalWindow,
+    multiviewDeviceIds: multiviewInputs.map((info) => info.deviceId)
   });
   fs.writeFileSync(sessionManifestPath, JSON.stringify(manifest, null, 2), "utf8");
 
@@ -295,33 +365,68 @@ function computeGlobalWindow(inputs) {
   return { startMs, endMs, durationMs: endMs - startMs };
 }
 
+function buildTileLabel(info) {
+  const title = String(info?.deviceName || info?.deviceId || "Device");
+  const badges = [];
+  if (info?.gpsCsvPath && fs.existsSync(info.gpsCsvPath)) badges.push("GPS");
+  if (info?.imuCsvPath && fs.existsSync(info.imuCsvPath)) badges.push("IMU");
+  if (info?.audioWavPath && fs.existsSync(info.audioWavPath)) badges.push("AUD");
+  return badges.length ? `${title} | ${badges.join(" ")}` : title;
+}
+
+function escapeFfmpegText(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/%/g, "\\%");
+}
+
+function buildTileChromeFilters(info) {
+  const text = escapeFfmpegText(buildTileLabel(info));
+  return [
+    "drawbox=x=0:y=0:w=iw:h=42:color=black@0.55:t=fill",
+    "drawbox=x=0:y=0:w=iw:h=ih:color=white@0.14:t=2",
+    `drawtext=text='${text}':x=16:y=12:fontsize=22:fontcolor=white:shadowcolor=black@0.75:shadowx=2:shadowy=2`
+  ].join(",");
+}
+
+function probeVideoDimensions(videoPath, ffprobeBin = process.env.FFPROBE_BIN || "ffprobe") {
+  if (!videoPath || !fs.existsSync(videoPath)) return null;
+  try {
+    const res = spawnSync(ffprobeBin, [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=width,height",
+      "-of", "csv=p=0:s=x",
+      videoPath
+    ], { encoding: "utf8", windowsHide: true });
+    if (res.status !== 0) return null;
+    const raw = String(res.stdout || "").trim();
+    const [widthRaw, heightRaw] = raw.split("x");
+    const width = ensurePositiveNumber(widthRaw, null);
+    const height = ensurePositiveNumber(heightRaw, null);
+    if (!width || !height) return null;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, globalWindow }) {
-  if (!inputs.length) {
-    return { ok: true, skipped: true, reason: "no_inputs", path: outPath };
+  if (inputs.length < 2) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: inputs.length === 1 ? "single_input" : "no_inputs",
+      path: outPath
+    };
   }
   if (!globalWindow) {
     return { ok: false, path: outPath, error: "global timeline unavailable" };
-  }
-  if (inputs.length === 1) {
-    const info = inputs[0];
-    const offsetSec = Math.max(0, (info.cameraTimeline.absoluteStartMs - globalWindow.startMs) / 1000);
-    const serverScale = Math.max(0.0001, Number(info.cameraTimeline.serverScale || 1));
-    const args = [
-      "-y",
-      "-i", info.cameraVideoPath,
-      "-filter:v",
-      `setpts=${formatFfmpegNumber(serverScale)}*(PTS-STARTPTS)+${formatFfmpegNumber(offsetSec)}/TB,` +
-      `scale=${TILE_WIDTH}:${TILE_HEIGHT}:force_original_aspect_ratio=decrease,` +
-      `pad=${TILE_WIDTH}:${TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black`,
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-pix_fmt", "yuv420p",
-      "-movflags", "+faststart",
-      outPath
-    ];
-    const res = await runFfmpeg(args, ffmpegBin);
-    return { ...res, path: outPath };
   }
 
   const args = ["-y"];
@@ -341,7 +446,8 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
     filterParts.push(
       `[${idx}:v]setpts=${formatFfmpegNumber(serverScale)}*(PTS-STARTPTS)+${formatFfmpegNumber(offsetSec)}/TB,` +
       `scale=${layout.tile_width}:${layout.tile_height}:force_original_aspect_ratio=decrease,` +
-      `pad=${layout.tile_width}:${layout.tile_height}:(ow-iw)/2:(oh-ih)/2:black[${label}]`
+      `pad=${layout.tile_width}:${layout.tile_height}:(ow-iw)/2:(oh-ih)/2:black,` +
+      `${buildTileChromeFilters(info)}[${label}]`
     );
   });
 
@@ -367,33 +473,121 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
 async function muxVideoWithAudio({ videoPath, audioPath, outPath, ffmpegBin, offsetSec = 0, audioTempoFactor = 1 }) {
   const args = ["-y", "-i", videoPath, "-i", audioPath];
   const audioFilters = [];
+  const videoFilters = [];
   const clampedTempo = Number.isFinite(audioTempoFactor) && audioTempoFactor > 0 ? audioTempoFactor : 1;
   audioFilters.push(...buildAtempoFilters(clampedTempo));
   if (offsetSec < -0.0005) {
     audioFilters.push(`atrim=start=${formatFfmpegNumber(Math.abs(offsetSec))}`, "asetpts=PTS-STARTPTS");
   } else if (offsetSec > 0.0005) {
-    const delayMs = Math.round(offsetSec * 1000);
-    audioFilters.push(`adelay=${delayMs}:all=1`);
+    videoFilters.push(`trim=start=${formatFfmpegNumber(offsetSec)}`, "setpts=PTS-STARTPTS");
   }
 
+  const filterParts = [];
+  let videoMap = "0:v:0";
+  let audioMap = "1:a:0";
+  if (videoFilters.length) {
+    filterParts.push(`[0:v]${videoFilters.join(",")}[outv]`);
+    videoMap = "[outv]";
+  }
   if (audioFilters.length) {
+    filterParts.push(`[1:a]${audioFilters.join(",")}[outa]`);
+    audioMap = "[outa]";
+  }
+  if (filterParts.length) args.push("-filter_complex", filterParts.join(";"));
+
+  args.push("-map", videoMap, "-map", audioMap);
+
+  if (videoFilters.length) {
     args.push(
-      "-filter_complex",
-      `[1:a]${audioFilters.join(",")}[outa]`,
-      "-map", "0:v",
-      "-map", "[outa]"
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "23",
+      "-pix_fmt", "yuv420p"
     );
   } else {
-    args.push("-map", "0:v", "-map", "1:a");
+    args.push("-c:v", "copy");
   }
 
-  args.push(
-    "-c:v", "copy",
-    "-c:a", "aac",
-    "-b:a", "128k",
+  args.push("-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", outPath);
+  const res = await runFfmpeg(args, ffmpegBin);
+  return { ...res, path: outPath };
+}
+
+async function composeMultiviewWithAudioAndGps({
+  baseVideoPath,
+  gpsVideoPath,
+  outPath,
+  ffmpegBin = process.env.FFMPEG_BIN || "ffmpeg",
+  layout = null
+}) {
+  if (!baseVideoPath || !fs.existsSync(baseVideoPath)) {
+    return { ok: true, skipped: true, reason: "multiview_with_audio_missing", path: outPath };
+  }
+  if (!gpsVideoPath || !fs.existsSync(gpsVideoPath)) {
+    return { ok: true, skipped: true, reason: "gps_playback_video_missing", path: outPath };
+  }
+
+  const probedCanvas = probeVideoDimensions(baseVideoPath);
+  const baseWidth = Math.max(
+    ensurePositiveNumber(layout?.canvas_width, 0) || 0,
+    ensurePositiveNumber(probedCanvas?.width, 0) || 0,
+    TILE_WIDTH
+  );
+  const baseHeight = Math.max(
+    ensurePositiveNumber(layout?.canvas_height, 0) || 0,
+    ensurePositiveNumber(probedCanvas?.height, 0) || 0,
+    TILE_HEIGHT
+  );
+  const resolvedLayout = { canvas_width: baseWidth, canvas_height: baseHeight };
+  const gap = chooseOverviewGap(resolvedLayout);
+  const sidebarWidth = chooseGpsInsetWidth(resolvedLayout);
+  const waveformPanelHeight = chooseWaveformPanelHeight(resolvedLayout);
+  const finalWidth = baseWidth + sidebarWidth + gap * 3;
+  const finalHeight = baseHeight + waveformPanelHeight + gap * 3;
+  const titleFontSize = Math.max(18, Math.round(Math.min(baseWidth, baseHeight) * 0.032));
+  const gpsHeaderHeight = Math.max(40, titleFontSize + 18);
+  const gpsPanelPadding = Math.max(12, Math.round(sidebarWidth * 0.035));
+  const gpsX = gap * 2 + baseWidth;
+  const gpsY = gap;
+  const gpsContentX = gpsX + gpsPanelPadding;
+  const gpsContentY = gpsY + gpsHeaderHeight;
+  const gpsContentWidth = Math.max(240, sidebarWidth - gpsPanelPadding * 2);
+  const gpsContentHeight = Math.max(140, baseHeight - gpsHeaderHeight - gpsPanelPadding);
+  const waveformPanelY = gap * 2 + baseHeight;
+  const waveformOuterWidth = finalWidth - gap * 2;
+  const waveformHeaderHeight = Math.max(38, titleFontSize + 14);
+  const waveformPadding = Math.max(12, Math.round(waveformPanelHeight * 0.08));
+  const waveformInnerX = gap + waveformPadding;
+  const waveformInnerY = waveformPanelY + waveformHeaderHeight;
+  const waveformInnerWidth = Math.max(240, waveformOuterWidth - waveformPadding * 2);
+  const waveformInnerHeight = Math.max(44, waveformPanelHeight - waveformHeaderHeight - waveformPadding);
+  const args = [
+    "-y",
+    "-i", baseVideoPath,
+    "-i", gpsVideoPath,
+    "-filter_complex",
+    `[0:v]pad=${finalWidth}:${finalHeight}:${gap}:${gap}:color=0x091018,` +
+    `drawbox=x=${gap}:y=${gap}:w=${baseWidth}:h=${baseHeight}:color=white@0.12:t=2,` +
+    `drawbox=x=${gpsX}:y=${gpsY}:w=${sidebarWidth}:h=${baseHeight}:color=0x101923@0.96:t=fill,` +
+    `drawbox=x=${gpsX}:y=${gpsY}:w=${sidebarWidth}:h=${baseHeight}:color=white@0.12:t=2,` +
+    `drawbox=x=${gap}:y=${waveformPanelY}:w=${waveformOuterWidth}:h=${waveformPanelHeight}:color=0x101923@0.96:t=fill,` +
+    `drawbox=x=${gap}:y=${waveformPanelY}:w=${waveformOuterWidth}:h=${waveformPanelHeight}:color=white@0.12:t=2,` +
+    `drawtext=text='GPS REPLAY':x=${gpsX + 16}:y=${gpsY + 12}:fontsize=${titleFontSize}:fontcolor=white:shadowcolor=black@0.7:shadowx=2:shadowy=2,` +
+    `drawtext=text='SHARED AUDIO WAVEFORM':x=${gap + 16}:y=${waveformPanelY + 10}:fontsize=${Math.max(16, titleFontSize - 2)}:fontcolor=white:shadowcolor=black@0.7:shadowx=2:shadowy=2[canvas];` +
+    `[1:v]scale=${gpsContentWidth}:${gpsContentHeight}:force_original_aspect_ratio=decrease,format=yuv420p[gps];` +
+    `[0:a]aformat=channel_layouts=mono,volume=6,showwaves=s=${waveformInnerWidth}x${waveformInnerHeight}:mode=line:draw=full:scale=sqrt:colors=0x79d5ff,format=rgba,colorchannelmixer=aa=0.96[wave];` +
+    `[canvas][gps]overlay=${gpsContentX}+(${gpsContentWidth}-w)/2:${gpsContentY}+(${gpsContentHeight}-h)/2:eof_action=repeat[stage1];` +
+    `[stage1][wave]overlay=${waveformInnerX}:${waveformInnerY}[outv]`,
+    "-map", "[outv]",
+    "-map", "0:a:0?",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "copy",
     "-movflags", "+faststart",
     outPath
-  );
+  ];
   const res = await runFfmpeg(args, ffmpegBin);
   return { ...res, path: outPath };
 }
@@ -453,35 +647,54 @@ function hasUsableAudio(info) {
   return !!(info?.audioWavPath && fs.existsSync(info.audioWavPath) && info.audioTimeline);
 }
 
-function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, globalWindow }) {
+function manifestFilePath(sessionDir, filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return relativize(sessionDir, filePath);
+}
+
+function manifestExportPath(sessionDir, exportResult) {
+  if (!exportResult?.ok || exportResult?.skipped || !exportResult?.path || !fs.existsSync(exportResult.path)) return null;
+  return relativize(sessionDir, exportResult.path);
+}
+
+function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, globalWindow, multiviewDeviceIds = [] }) {
+  const includedInMultiview = new Set(multiviewDeviceIds || []);
   return {
     generated_at_iso: result.generated_at_iso,
     session_dir: result.session_dir,
     session_name: meta?.session_name || null,
     focused_device_id: meta?.focused_device_id || null,
     audio_source_device_id: result.audio_source_device_id || null,
-    layout: layout || null,
+    layout: layout?.count ? layout : null,
     global_timeline: globalWindow ? {
       start_ms: roundNumber(globalWindow.startMs),
       end_ms: roundNumber(globalWindow.endMs),
       duration_ms: roundNumber(globalWindow.durationMs)
     } : null,
     exports: {
-      session_multiview: relativize(result.session_dir, result.exports.session_multiview?.path || null),
-      session_multiview_with_audio: relativize(result.session_dir, result.exports.session_multiview_with_audio?.path || null),
+      session_multiview: manifestExportPath(result.session_dir, result.exports.session_multiview),
+      session_multiview_with_audio: manifestExportPath(result.session_dir, result.exports.session_multiview_with_audio),
+      session_multiview_with_audio_and_gps: manifestExportPath(result.session_dir, result.exports.session_multiview_with_audio_and_gps),
+      session_gps_playback: manifestExportPath(result.session_dir, result.exports.session_gps_playback),
+      session_gps_playback_video: manifestExportPath(result.session_dir, result.exports.session_gps_playback_video),
       session_multiview_manifest: relativize(result.session_dir, result.exports.session_multiview_manifest?.path || null)
     },
-    devices: deviceInfos.map((info) => ({
-      device_id: info.deviceId,
-      device_name: info.deviceName,
-      video_fps: info.videoFps,
-      included_in_multiview: canIncludeInMultiview(info),
-      camera_video: relativize(result.session_dir, info.cameraVideoPath),
-      camera_with_audio: relativize(result.session_dir, path.join(info.streamsDir, CAMERA_WITH_AUDIO_NAME)),
-      audio_wav: relativize(result.session_dir, info.audioWavPath),
-      audio_chunks_csv: relativize(result.session_dir, info.audioChunksPath),
-      timeline: summarizeTimeline(info)
-    })),
+    devices: deviceInfos.map((info) => {
+      const deviceResult = result.devices?.[info.deviceId] || {};
+      return {
+        device_id: info.deviceId,
+        device_name: info.deviceName,
+        video_fps: info.videoFps,
+        included_in_multiview: includedInMultiview.has(info.deviceId),
+        camera_video: manifestExportPath(result.session_dir, deviceResult.camera_video),
+        camera_with_audio: manifestExportPath(result.session_dir, deviceResult.camera_with_audio),
+        audio_wav: manifestFilePath(result.session_dir, info.audioWavPath),
+        audio_chunks_csv: manifestFilePath(result.session_dir, info.audioChunksPath),
+        imu_csv: manifestFilePath(result.session_dir, info.imuCsvPath),
+        gps_csv: manifestFilePath(result.session_dir, info.gpsCsvPath),
+        timeline: summarizeTimeline(info)
+      };
+    }),
     sync_report_generated_at_iso: syncReport?.generated_at_iso || null,
     had_errors: !!result.had_errors,
     warnings: result.warnings || []
@@ -496,6 +709,8 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
   const audioWavPath = path.join(streamsDir, "audio.wav");
   const audioCsvPath = path.join(streamsDir, "audio.csv");
   const audioChunksPath = path.join(streamsDir, "audio_chunks.csv");
+  const gpsCsvPath = path.join(streamsDir, "gps.csv");
+  const imuCsvPath = path.join(streamsDir, "imu.csv");
   const runConfig = meta?.devices?.[deviceId]?.runConfig || {};
   const deviceReport = syncReport?.devices?.[deviceId] || {};
   const cameraTimeline = loadCameraTimeline(cameraTimestampsPath, deviceId, syncModels);
@@ -517,6 +732,8 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
     audioWavPath,
     audioCsvPath,
     audioChunksPath,
+    gpsCsvPath,
+    imuCsvPath,
     videoFps: ensurePositiveNumber(runConfig?.streams?.camera?.video_fps, ensurePositiveNumber(runConfig?.streams?.camera?.fps, 10)),
     videoBitrate: String(runConfig?.streams?.camera?.video_bitrate || "2M"),
     videoCrf: ensurePositiveNumber(runConfig?.streams?.camera?.video_crf, 23),
@@ -627,6 +844,282 @@ function loadAudioTimeline({ audioChunksPath, audioCsvPath, audioWavPath, device
     localStartRecvMs: Number.isFinite(first.tRecvMs) ? first.tRecvMs : null,
     localStartServerMs: Number.isFinite(first.tServerRxNs) ? first.tServerRxNs / 1_000_000 : null
   };
+}
+
+function exportSessionGpsPlayback({ sessionDir, outPath, meta, syncReport, syncModels, deviceInfos }) {
+  try {
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    const payload = buildSessionGpsPlayback({ sessionDir, meta, syncReport, syncModels, deviceInfos });
+    fs.writeFileSync(outPath, JSON.stringify(payload, null, 2), "utf8");
+    return {
+      ok: true,
+      skipped: false,
+      path: outPath,
+      devices_with_gps: payload.devices.length
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      path: outPath,
+      error: String(err?.message || err)
+    };
+  }
+}
+
+function exportSessionGpsPlaybackForSession({ sessionDir, outPath = null } = {}) {
+  const resolvedSessionDir = path.resolve(String(sessionDir || ""));
+  if (!resolvedSessionDir || !fs.existsSync(resolvedSessionDir)) {
+    return { ok: false, error: "session directory not found", path: outPath || null };
+  }
+
+  const meta = readJson(path.join(resolvedSessionDir, "meta.json")) || {};
+  const syncReport = readJson(path.join(resolvedSessionDir, "sync_report.json")) || {};
+  const syncModels = loadSyncModels(syncReport);
+  const deviceIds = listSessionDeviceIds(resolvedSessionDir, meta);
+  const deviceInfos = deviceIds.map((deviceId) => loadDeviceInfo({
+    sessionDir: resolvedSessionDir,
+    deviceId,
+    meta,
+    syncReport,
+    syncModels
+  }));
+
+  return exportSessionGpsPlayback({
+    sessionDir: resolvedSessionDir,
+    outPath: outPath || path.join(resolvedSessionDir, EXPORTS_DIRNAME, SESSION_GPS_PLAYBACK_NAME),
+    meta,
+    syncReport,
+    syncModels,
+    deviceInfos
+  });
+}
+
+function renderGpsPlaybackVideo({
+  inputJsonPath,
+  outPath,
+  ffmpegBin = process.env.FFMPEG_BIN || "ffmpeg",
+  pythonBin = process.env.GPS_PLAYBACK_PYTHON_BIN || "python",
+  width = ensurePositiveNumber(process.env.GPS_PLAYBACK_WIDTH, 960),
+  height = ensurePositiveNumber(process.env.GPS_PLAYBACK_HEIGHT, 540),
+  fps = ensurePositiveNumber(process.env.GPS_PLAYBACK_FPS, 4),
+  crf = ensurePositiveNumber(process.env.GPS_PLAYBACK_CRF, 23),
+  timeoutMs = ensurePositiveNumber(process.env.GPS_PLAYBACK_TIMEOUT_MS, 10 * 60 * 1000)
+} = {}) {
+  const scriptPath = path.join(__dirname, "render_gps_playback.py");
+  return new Promise((resolve) => {
+    const proc = spawn(pythonBin, [
+      scriptPath,
+      "--input-json", String(inputJsonPath || ""),
+      "--output", String(outPath || ""),
+      "--ffmpeg-bin", String(ffmpegBin || "ffmpeg"),
+      "--width", String(width || 960),
+      "--height", String(height || 540),
+      "--fps", String(fps || 6),
+      "--crf", String(crf || 23)
+    ], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { proc.kill(); } catch {}
+      resolve({ ok: false, error: `gps playback render timeout after ${timeoutMs}ms`, path: outPath, stdout, stderr });
+    }, timeoutMs);
+
+    proc.stdout.on("data", (buf) => {
+      stdout += buf.toString();
+    });
+    proc.stderr.on("data", (buf) => {
+      stderr += buf.toString();
+    });
+
+    proc.on("error", (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ ok: false, error: String(err?.message || err), path: outPath, stdout, stderr });
+    });
+
+    proc.on("close", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      let parsed = null;
+      try { parsed = JSON.parse(stdout || "{}"); } catch {}
+      if (code !== 0) {
+        resolve(parsed && typeof parsed === "object"
+          ? { ...parsed, ok: false, path: parsed.path || outPath, stdout, stderr }
+          : { ok: false, error: `python exit ${code}`, path: outPath, stdout, stderr });
+        return;
+      }
+      resolve(parsed && typeof parsed === "object"
+        ? { ...parsed, path: parsed.path || outPath, stdout, stderr }
+        : { ok: true, skipped: false, path: outPath, stdout, stderr });
+    });
+  });
+}
+
+function buildSessionGpsPlayback({ sessionDir, meta, syncReport, syncModels, deviceInfos }) {
+  const devices = deviceInfos
+    .map((info) => buildGpsPlaybackDevice({ sessionDir, info, syncModels }))
+    .filter(Boolean);
+  const window = computeGpsPlaybackWindow(devices);
+  return {
+    generated_at_iso: new Date().toISOString(),
+    session_dir: sessionDir,
+    session_name: meta?.session_name || null,
+    recording_mode: meta?.recording_mode || null,
+    focused_device_id: meta?.focused_device_id || null,
+    target_device_ids: Array.isArray(meta?.target_device_ids) ? meta.target_device_ids : [],
+    global_timeline: window,
+    sync_report_generated_at_iso: syncReport?.generated_at_iso || null,
+    devices
+  };
+}
+
+function buildGpsPlaybackDevice({ sessionDir, info, syncModels }) {
+  const rows = readCsvLines(info.gpsCsvPath).slice(1).map(parseGpsCsvRow).filter(Boolean);
+  if (!rows.length) return null;
+  const points = buildGpsPlaybackRows(rows, info.deviceId, syncModels);
+  if (!points.length) return null;
+  const startMs = points[0].t_playback_ms;
+  const endMs = points[points.length - 1].t_playback_ms;
+  const stats = {
+    aligned_utc_ms: points.filter((point) => point.playback_source === "aligned_utc_ms").length,
+    server_receive_ms: points.filter((point) => point.playback_source === "server_receive_ms").length,
+    recv_ms: points.filter((point) => point.playback_source === "recv_ms").length
+  };
+  return {
+    device_id: info.deviceId,
+    device_name: info.deviceName,
+    gps_csv: relativize(sessionDir, info.gpsCsvPath),
+    sample_count: points.length,
+    start_ms: roundNumber(startMs),
+    end_ms: roundNumber(endMs),
+    duration_ms: roundNumber(endMs - startMs),
+    bounds: buildGpsBounds(points),
+    playback_source: summarizeGpsPlaybackSource(stats),
+    playback_source_counts: stats,
+    points: points.map((point) => ({
+      t_playback_ms: roundNumber(point.t_playback_ms),
+      t_offset_ms: roundNumber(point.t_playback_ms - startMs),
+      t_aligned_utc_ms: roundNumber(point.t_aligned_utc_ms),
+      t_recv_ms: roundNumber(point.tRecvMs),
+      t_device_ms: roundNumber(point.tDeviceMs),
+      t_server_rx_ns: point.tServerRxNs,
+      lat: roundCoordinate(point.lat),
+      lon: roundCoordinate(point.lon),
+      accuracy_m: roundNumber(point.accuracy_m),
+      speed_mps: roundNumber(point.speed_mps),
+      heading_deg: roundNumber(point.heading_deg),
+      altitude_m: roundNumber(point.altitude_m),
+      playback_source: point.playback_source
+    }))
+  };
+}
+
+function buildGpsPlaybackRows(rows, deviceId, syncModels) {
+  const points = [];
+  let lastPlaybackMs = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    const playback = resolveGpsPlaybackTime(row, deviceId, syncModels);
+    if (!Number.isFinite(playback.tPlaybackMs) || playback.tPlaybackMs <= lastPlaybackMs) continue;
+    points.push({
+      ...row,
+      t_playback_ms: playback.tPlaybackMs,
+      t_aligned_utc_ms: playback.tAlignedUtcMs,
+      playback_source: playback.source
+    });
+    lastPlaybackMs = playback.tPlaybackMs;
+  }
+  return points;
+}
+
+function resolveGpsPlaybackTime(row, deviceId, syncModels) {
+  const serverMs = Number.isFinite(row.tServerRxNs)
+    ? row.tServerRxNs / 1_000_000
+    : (Number.isFinite(row.tRecvMs) ? row.tRecvMs : null);
+  const alignedUtcMs = alignUtcMs(syncModels, deviceId, row.tDeviceMs, row.tServerRxNs);
+  if (
+    Number.isFinite(alignedUtcMs) &&
+    Number.isFinite(serverMs) &&
+    Math.abs(alignedUtcMs - serverMs) <= 3000
+  ) {
+    return { tPlaybackMs: alignedUtcMs, tAlignedUtcMs: alignedUtcMs, source: "aligned_utc_ms" };
+  }
+  if (Number.isFinite(serverMs)) {
+    return { tPlaybackMs: serverMs, tAlignedUtcMs: alignedUtcMs, source: "server_receive_ms" };
+  }
+  if (Number.isFinite(row.tRecvMs)) {
+    return { tPlaybackMs: row.tRecvMs, tAlignedUtcMs: alignedUtcMs, source: "recv_ms" };
+  }
+  return { tPlaybackMs: null, tAlignedUtcMs: alignedUtcMs, source: "missing" };
+}
+
+function buildGpsBounds(points) {
+  if (!points.length) return null;
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+  let minLon = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    minLat = Math.min(minLat, point.lat);
+    maxLat = Math.max(maxLat, point.lat);
+    minLon = Math.min(minLon, point.lon);
+    maxLon = Math.max(maxLon, point.lon);
+  }
+  return {
+    min_lat: roundCoordinate(minLat),
+    max_lat: roundCoordinate(maxLat),
+    min_lon: roundCoordinate(minLon),
+    max_lon: roundCoordinate(maxLon)
+  };
+}
+
+function computeGpsPlaybackWindow(devices) {
+  const starts = devices.map((device) => device.start_ms).filter(Number.isFinite);
+  const ends = devices.map((device) => device.end_ms).filter(Number.isFinite);
+  if (!starts.length || !ends.length) return null;
+  const startMs = Math.min(...starts);
+  const endMs = Math.max(...ends);
+  return {
+    start_ms: roundNumber(startMs),
+    end_ms: roundNumber(endMs),
+    duration_ms: roundNumber(endMs - startMs)
+  };
+}
+
+function chooseGpsInsetWidth(layout) {
+  const overrideWidth = ensurePositiveNumber(process.env.GPS_OVERLAY_WIDTH, null);
+  if (overrideWidth) return Math.round(overrideWidth);
+  const baseWidth = ensurePositiveNumber(layout?.canvas_width, TILE_WIDTH);
+  return Math.min(620, Math.max(360, Math.round(baseWidth * 0.42)));
+}
+
+function chooseOverviewGap(layout) {
+  const baseWidth = ensurePositiveNumber(layout?.canvas_width, TILE_WIDTH);
+  const baseHeight = ensurePositiveNumber(layout?.canvas_height, TILE_HEIGHT);
+  return Math.max(18, Math.round(Math.min(baseWidth, baseHeight) * 0.03));
+}
+
+function chooseWaveformPanelHeight(layout) {
+  const baseHeight = ensurePositiveNumber(layout?.canvas_height, TILE_HEIGHT);
+  return Math.min(180, Math.max(120, Math.round(baseHeight * 0.26)));
+}
+
+function summarizeGpsPlaybackSource(stats) {
+  const ordered = Object.entries(stats)
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (!ordered.length) return null;
+  if (ordered.length === 1) return ordered[0][0];
+  return `mixed:${ordered.map(([name]) => name).join(",")}`;
 }
 
 function pickLocalCameraStartMs(cameraTimeline) {
@@ -797,6 +1290,26 @@ function parseAudioChunkRow(line) {
   };
 }
 
+function parseGpsCsvRow(line) {
+  const parts = line.split(",");
+  if (parts.length < 9) return null;
+  const lat = toFiniteNumber(parts[2]);
+  const lon = toFiniteNumber(parts[3]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  return {
+    tRecvMs: toFiniteNumber(parts[0]),
+    tDeviceMs: toFiniteNumber(parts[1]),
+    lat,
+    lon,
+    accuracy_m: toFiniteNumber(parts[4]),
+    speed_mps: toFiniteNumber(parts[5]),
+    heading_deg: toFiniteNumber(parts[6]),
+    altitude_m: toFiniteNumber(parts[7]),
+    tServerRxNs: toFiniteNumber(parts[8])
+  };
+}
+
 function chooseTimeline(rows) {
   const candidates = [
     buildMonotonicTimeline(rows, "t_aligned_utc_ms", (row) => row.timelineMs),
@@ -879,6 +1392,10 @@ function roundNumber(value) {
   return Number.isFinite(value) ? Number(value.toFixed(3)) : null;
 }
 
+function roundCoordinate(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(6)) : null;
+}
+
 function formatFfmpegNumber(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "0";
@@ -890,6 +1407,13 @@ module.exports = {
   EXPORTS_DIRNAME,
   SESSION_MULTIVIEW_NAME,
   SESSION_MULTIVIEW_WITH_AUDIO_NAME,
+  SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME,
   SESSION_MULTIVIEW_MANIFEST_NAME,
+  SESSION_GPS_PLAYBACK_NAME,
+  SESSION_GPS_PLAYBACK_VIDEO_NAME,
+  exportSessionGpsPlayback,
+  exportSessionGpsPlaybackForSession,
+  renderGpsPlaybackVideo,
+  composeMultiviewWithAudioAndGps,
   CAMERA_WITH_AUDIO_NAME
 };

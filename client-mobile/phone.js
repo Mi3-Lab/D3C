@@ -14,6 +14,7 @@
   const phoneReadySummary = document.getElementById("phoneReadySummary");
   const phoneReadyMissing = document.getElementById("phoneReadyMissing");
   const phoneReadinessList = document.getElementById("phoneReadinessList");
+  const phonePermissionActions = document.getElementById("phonePermissionActions");
   const cameraFlipBtn = document.getElementById("cameraFlipBtn");
   const cameraPreviewBadge = document.getElementById("cameraPreviewBadge");
   const cameraPreviewFps = document.getElementById("cameraPreviewFps");
@@ -25,7 +26,7 @@
     device_id: resolveDeviceId(),
     streams: {
       imu: { enabled: true, rate_hz: 30, record: false },
-      camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg" },
+      camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", video_fps: 30 },
       gps: { enabled: false, rate_hz: 1, record: false },
       audio: { enabled: false, rate_hz: 10, record: false },
       device: { enabled: true, rate_hz: 1, record: false },
@@ -86,6 +87,13 @@
   let wakeLock = null;
   const deviceMonoOriginWallMs = Date.now() - performance.now();
   let silentAudio = null;
+  let alertAudioCtx = null;
+  let alertFeedbackText = "";
+  let alertFeedbackTone = "muted";
+  let alertFeedbackTimer = null;
+  let alertCooldownTimer = null;
+  let lastAlertSentAtMs = 0;
+  let lastAlertPlayedAtMs = 0;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
 
@@ -137,6 +145,7 @@
       setJoinStatus("Enter a device name and join code");
       return;
     }
+    await primeAlertAudio();
     started = true;
     startBtn.disabled = true;
     updateJoinFieldLock();
@@ -229,6 +238,10 @@
           updateCameraTransport();
           void ensureAudioRunning();
           renderStatus();
+          return;
+        }
+        if (msg.type === "fleet_alert") {
+          void handleFleetAlert(msg);
           return;
         }
         if (msg.type === "webrtc_signal") {
@@ -390,13 +403,28 @@
       } finally {
         capturing = false;
       }
-    }, Math.max(50, Math.floor(1000 / Math.max(1, Number(runConfig.streams.camera.fps || 10)))));
+    }, Math.max(16, Math.floor(1000 / getActiveCameraCaptureFps())));
   }
 
   function stopFrameLoop() {
     if (!frameTimer) return;
     clearInterval(frameTimer);
     frameTimer = null;
+  }
+
+  function getPreviewCameraFps() {
+    return Math.max(1, Number(runConfig.streams.camera?.fps || 10));
+  }
+
+  function getRecordingCameraFps() {
+    return Math.max(getPreviewCameraFps(), Number(runConfig.streams.camera?.video_fps || runConfig.streams.camera?.fps || 10));
+  }
+
+  function getActiveCameraCaptureFps() {
+    if (sessionRecordingActive && runConfig.streams.camera?.record) {
+      return getRecordingCameraFps();
+    }
+    return getPreviewCameraFps();
   }
 
   function shouldRunSnapshotLoop() {
@@ -576,7 +604,121 @@
     try {
       if (silentAudio?.ctx?.state === "suspended") await silentAudio.ctx.resume();
     } catch {}
+    try {
+      if (alertAudioCtx && alertAudioCtx.state === "suspended") await alertAudioCtx.resume();
+    } catch {}
     if (!wakeLock) await requestWakeLock();
+  }
+
+  function isAlertCoolingDown() {
+    return Date.now() - lastAlertSentAtMs < 1500;
+  }
+
+  function scheduleAlertCooldownRefresh() {
+    if (alertCooldownTimer) clearTimeout(alertCooldownTimer);
+    if (!isAlertCoolingDown()) return;
+    alertCooldownTimer = setTimeout(() => {
+      alertCooldownTimer = null;
+      renderPrimaryAction();
+    }, Math.max(0, 1500 - (Date.now() - lastAlertSentAtMs)) + 20);
+  }
+
+  function setAlertFeedback(text, tone = "muted", ttlMs = 2600) {
+    alertFeedbackText = String(text || "").trim();
+    alertFeedbackTone = tone || "muted";
+    if (alertFeedbackTimer) clearTimeout(alertFeedbackTimer);
+    if (!alertFeedbackText || ttlMs <= 0) {
+      renderPrimaryAction();
+      return;
+    }
+    alertFeedbackTimer = setTimeout(() => {
+      alertFeedbackTimer = null;
+      alertFeedbackText = "";
+      alertFeedbackTone = "muted";
+      renderPrimaryAction();
+    }, ttlMs);
+    renderPrimaryAction();
+  }
+
+  async function primeAlertAudio() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return false;
+    try {
+      if (!alertAudioCtx || alertAudioCtx.state === "closed") {
+        alertAudioCtx = new Ctx();
+      }
+      if (alertAudioCtx.state === "suspended") {
+        await alertAudioCtx.resume();
+      }
+    } catch {}
+    return !!alertAudioCtx && alertAudioCtx.state === "running";
+  }
+
+  async function playAlertTone() {
+    const nowMs = Date.now();
+    if (nowMs - lastAlertPlayedAtMs < 400) return true;
+    const ready = await primeAlertAudio();
+    if (!ready || !alertAudioCtx) return false;
+    lastAlertPlayedAtMs = nowMs;
+    const pattern = [
+      { delay: 0, duration: 0.12, freq: 880 },
+      { delay: 0.18, duration: 0.12, freq: 880 },
+      { delay: 0.36, duration: 0.18, freq: 660 }
+    ];
+    const startedAt = alertAudioCtx.currentTime + 0.02;
+    for (const step of pattern) {
+      const osc = alertAudioCtx.createOscillator();
+      const gain = alertAudioCtx.createGain();
+      const t0 = startedAt + step.delay;
+      const t1 = t0 + step.duration;
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(step.freq, t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.05, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t1);
+      osc.connect(gain);
+      gain.connect(alertAudioCtx.destination);
+      osc.start(t0);
+      osc.stop(t1 + 0.02);
+      osc.onended = () => {
+        try { osc.disconnect(); } catch {}
+        try { gain.disconnect(); } catch {}
+      };
+    }
+    return true;
+  }
+
+  async function triggerFleetAlert() {
+    if (!started || !authState?.joinToken || !ws || ws.readyState !== WebSocket.OPEN) {
+      setAlertFeedback("Reconnect to send alerts.", "warning");
+      return;
+    }
+    if (isAlertCoolingDown()) return;
+    lastAlertSentAtMs = Date.now();
+    scheduleAlertCooldownRefresh();
+    await primeAlertAudio();
+    setAlertFeedback("Sending alert...", "muted", 1200);
+    queueJson({
+      type: "fleet_alert",
+      device_id: runConfig.device_id
+    });
+  }
+
+  async function handleFleetAlert(msg) {
+    const sourceDeviceId = String(msg.source_device_id || "").trim();
+    const sourceDeviceName = String(msg.source_device_name || sourceDeviceId || "another phone").trim();
+    const targetCount = Math.max(1, Number(msg.target_count || 0) || 1);
+    const fromSelf = !!sourceDeviceId && sourceDeviceId === runConfig.device_id;
+    const played = await playAlertTone();
+    if (fromSelf) {
+      setAlertFeedback(`Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success");
+      return;
+    }
+    if (played) {
+      setAlertFeedback(`Alert from ${sourceDeviceName}.`, "muted");
+      return;
+    }
+    setAlertFeedback(`Alert from ${sourceDeviceName}. Tap Alert once on this phone if Safari kept sound blocked.`, "warning", 4200);
   }
 
   async function restartPcmCapture() {
@@ -638,31 +780,60 @@
     if (!navigator.geolocation) return;
     if (gpsWatchId != null) return;
     gpsWatchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        gpsPermissionState = "granted";
-        const hz = Math.max(0.2, Number(runConfig.streams.gps?.rate_hz || 1));
-        const now = performance.now();
-        if (now - lastGpsSent < 1000 / hz) return;
-        lastGpsSent = now;
-        lastGpsEventMs = Date.now();
-        queueJson({
-          type: "gps",
-          device_id: runConfig.device_id,
-          t_device_ms: now,
-          lat: Number(pos.coords?.latitude || 0),
-          lon: Number(pos.coords?.longitude || 0),
-          accuracy_m: Number(pos.coords?.accuracy ?? -1),
-          speed_mps: Number(pos.coords?.speed ?? -1),
-          heading_deg: Number(pos.coords?.heading ?? -1),
-          altitude_m: Number(pos.coords?.altitude ?? -1)
-        });
-      },
-      () => {
-        gpsPermissionState = "denied";
+      (pos) => emitGpsPosition(pos),
+      (err) => {
+        gpsPermissionState = normalizeGpsErrorState(err);
         renderStatus();
       },
       { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
     );
+  }
+
+  function retryGpsAccess() {
+    if (!runConfig.streams.gps?.enabled) return;
+    if (!navigator.geolocation) {
+      gpsPermissionState = "unsupported";
+      renderStatus();
+      return;
+    }
+    if (gpsWatchId != null) {
+      try { navigator.geolocation.clearWatch(gpsWatchId); } catch {}
+      gpsWatchId = null;
+    }
+    gpsPermissionState = "unknown";
+    renderStatus();
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        emitGpsPosition(pos, { rateLimit: false });
+        applyGpsConfig();
+        renderStatus();
+      },
+      (err) => {
+        gpsPermissionState = normalizeGpsErrorState(err);
+        renderStatus();
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+    );
+  }
+
+  function emitGpsPosition(pos, { rateLimit = true } = {}) {
+    gpsPermissionState = "granted";
+    const hz = Math.max(0.2, Number(runConfig.streams.gps?.rate_hz || 1));
+    const now = performance.now();
+    if (rateLimit && now - lastGpsSent < 1000 / hz) return;
+    lastGpsSent = now;
+    lastGpsEventMs = Date.now();
+    queueJson({
+      type: "gps",
+      device_id: runConfig.device_id,
+      t_device_ms: now,
+      lat: Number(pos.coords?.latitude || 0),
+      lon: Number(pos.coords?.longitude || 0),
+      accuracy_m: Number(pos.coords?.accuracy ?? -1),
+      speed_mps: Number(pos.coords?.speed ?? -1),
+      heading_deg: Number(pos.coords?.heading ?? -1),
+      altitude_m: Number(pos.coords?.altitude ?? -1)
+    });
   }
   function applyDeviceConfig() {
     if (!runConfig.streams.device?.enabled) {
@@ -820,6 +991,24 @@
       `;
       phoneReadinessList.appendChild(li);
     }
+
+    if (phonePermissionActions) {
+      phonePermissionActions.innerHTML = "";
+      phonePermissionActions.hidden = true;
+      if (runConfig.streams.gps.enabled && ["denied", "error", "timeout", "unavailable"].includes(gpsPermissionState)) {
+        const note = document.createElement("p");
+        note.className = "phone-status-note";
+        note.textContent = gpsPermissionState === "denied"
+          ? "Retry Location will re-ask if Safari still allows a prompt. If this site is blocked in Safari or iPhone settings, re-enable Location there first."
+          : "Retry Location will issue a fresh location request. If Safari has this site blocked, re-enable Location there first.";
+        const btn = document.createElement("button");
+        btn.className = "btn btn-alt btn-small";
+        btn.textContent = "Retry Location";
+        btn.addEventListener("click", retryGpsAccess);
+        phonePermissionActions.append(note, btn);
+        phonePermissionActions.hidden = false;
+      }
+    }
   }
 
   function renderDeviceIdentity() {
@@ -833,8 +1022,11 @@
   function renderJoinFields() {
     const savedName = localStorage.getItem("d3c_phone_device_name") || "";
     const savedCode = localStorage.getItem("d3c_phone_join_code") || "";
+    const qp = new URLSearchParams(location.search);
+    const urlCode = normalizeJoinCode(qp.get("join_code") || qp.get("code") || "").slice(0, 6);
     if (deviceNameInput) deviceNameInput.value = savedName;
-    if (joinCodeInput) joinCodeInput.value = normalizeJoinCode(savedCode).slice(0, 6);
+    if (joinCodeInput) joinCodeInput.value = urlCode || normalizeJoinCode(savedCode).slice(0, 6);
+    if (urlCode) localStorage.setItem("d3c_phone_join_code", urlCode);
     updateJoinFieldLock();
   }
 
@@ -877,6 +1069,8 @@
     if (existing) existing.remove();
     const existingHint = primaryActionArea.querySelector(".primary-action-hint");
     if (existingHint) existingHint.remove();
+    const existingQuickActions = primaryActionArea.querySelector(".phone-quick-actions");
+    if (existingQuickActions) existingQuickActions.remove();
 
     if (canStartDevice) {
       const hint = document.createElement("div");
@@ -912,6 +1106,22 @@
       </div>
     `;
     primaryActionArea.appendChild(state);
+
+    const actions = document.createElement("div");
+    actions.className = "phone-quick-actions";
+    const alertBtn = document.createElement("button");
+    alertBtn.type = "button";
+    alertBtn.className = "btn btn-alt btn-small phone-alert-btn";
+    alertBtn.textContent = isAlertCoolingDown() ? "Alerting..." : "Alert";
+    alertBtn.disabled = !connected || isAlertCoolingDown();
+    alertBtn.addEventListener("click", () => { void triggerFleetAlert(); });
+    const hint = document.createElement("div");
+    hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
+    hint.textContent = alertFeedbackText || (connected
+      ? "Plays a short tone on every connected phone."
+      : "Reconnect to send alerts.");
+    actions.append(alertBtn, hint);
+    primaryActionArea.appendChild(actions);
   }
 
   function renderCameraPreviewStatus() {
@@ -920,12 +1130,18 @@
     const streaming = active && !!cameraStream;
     const width = Number(previewEl?.videoWidth || 0);
     const height = Number(previewEl?.videoHeight || 0);
-    const fps = Number(runConfig.streams.camera?.fps || 0);
+    const previewFps = getPreviewCameraFps();
+    const recordFps = getRecordingCameraFps();
+    const recordingCaptureActive = sessionRecordingActive && !!runConfig.streams.camera?.record;
     cameraPreviewBadge.textContent = streaming ? "LIVE" : (active ? "WAITING" : "OFF");
     cameraPreviewBadge.className = `badge ${streaming ? "live" : active ? "pending" : "off"}`;
-    cameraPreviewFps.textContent = streaming ? (connectedPreviewPeerCount() > 0 ? "RTC" : `${fps} FPS`) : "0 FPS";
+    cameraPreviewFps.textContent = streaming
+      ? (connectedPreviewPeerCount() > 0
+        ? (recordingCaptureActive ? `RTC + ${recordFps} REC` : "RTC")
+        : `${getActiveCameraCaptureFps()} FPS`)
+      : "0 FPS";
     const parts = [];
-    parts.push(`Camera: ${active ? (connectedPreviewPeerCount() > 0 ? "WebRTC live" : `${fps} FPS`) : "Off"}`);
+    parts.push(`Camera: ${active ? (connectedPreviewPeerCount() > 0 ? (recordingCaptureActive ? `WebRTC live / ${recordFps} FPS record` : "WebRTC live") : `${previewFps} FPS preview`) : "Off"}`);
     parts.push(width && height ? `Resolution: ${width}x${height}` : "Resolution: --");
     parts.push(`Facing: ${cameraFacingMode === "user" ? "Front" : "Rear"}`);
     cameraPreviewMeta.innerHTML = parts.map((part) => `<span>${part}</span>`).join("<span>•</span>");
@@ -968,8 +1184,18 @@
     if (state === "granted") return `${label} ready`;
     if (state === "idle") return `${label} off`;
     if (state === "unsupported") return `${label} unsupported`;
+    if (state === "unavailable") return `${label} unavailable`;
+    if (state === "timeout") return `${label} timed out`;
     if (state === "error") return `${label} request failed`;
     return `${label} pending`;
+  }
+
+  function normalizeGpsErrorState(err) {
+    const code = Number(err?.code || 0);
+    if (code === 1) return "denied";
+    if (code === 2) return "unavailable";
+    if (code === 3) return "timeout";
+    return "error";
   }
 
   function describeMotionDetail(now = Date.now()) {

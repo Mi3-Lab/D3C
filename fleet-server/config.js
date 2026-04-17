@@ -13,7 +13,7 @@ const DEFAULT_RUN_CONFIG = {
       encode_timing: "post_session",
       auto_mp4_on_stop: true,
       jpg_quality: 85,
-      video_fps: 10,
+      video_fps: 30,
       video_bitrate: "2M",
       video_crf: 23,
       downsample_factor: 1
@@ -70,5 +70,3 @@ module.exports = {
   MOTION_THRESHOLDS,
   DATASETS_ROOT
 };
-
-

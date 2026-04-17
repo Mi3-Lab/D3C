@@ -17,7 +17,10 @@ const {
   EXPORTS_DIRNAME,
   SESSION_MULTIVIEW_NAME,
   SESSION_MULTIVIEW_WITH_AUDIO_NAME,
+  SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME,
   SESSION_MULTIVIEW_MANIFEST_NAME,
+  SESSION_GPS_PLAYBACK_NAME,
+  SESSION_GPS_PLAYBACK_VIDEO_NAME,
   CAMERA_WITH_AUDIO_NAME
 } = require("./session/export_session_media");
 
@@ -239,9 +242,21 @@ app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) =>
         path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_WITH_AUDIO_NAME),
         `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_WITH_AUDIO_NAME}`
       ),
+      multiviewWithAudioAndGps: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME}`
+      ),
       manifestJson: toUrlIfExists(
         path.join(root, EXPORTS_DIRNAME, SESSION_MULTIVIEW_MANIFEST_NAME),
         `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_MULTIVIEW_MANIFEST_NAME}`
+      ),
+      gpsPlaybackJson: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_GPS_PLAYBACK_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_GPS_PLAYBACK_NAME}`
+      ),
+      gpsPlaybackVideo: toUrlIfExists(
+        path.join(root, EXPORTS_DIRNAME, SESSION_GPS_PLAYBACK_VIDEO_NAME),
+        `/datasets/${id}/${EXPORTS_DIRNAME}/${SESSION_GPS_PLAYBACK_VIDEO_NAME}`
       )
     },
     imuCsv: toUrlIfExists(path.join(streamRoot, "imu.csv"), `/datasets/${id}/devices/${deviceId}/streams/imu.csv`),
@@ -369,7 +384,7 @@ setInterval(() => {
   publicRuntimeInfo = loadPublicRuntimeInfo();
   for (const [id, d] of devices.entries()) {
     const expectedImu = d.config.streams.imu.enabled ? d.config.streams.imu.rate_hz : 0;
-    const expectedCam = d.config.streams.camera.mode === "stream" ? d.config.streams.camera.fps : 0;
+    const expectedCam = getExpectedCameraIngressFps(d, { recordingActive: !!d.recordingStatus?.recording });
     d.stats.imu_hz = d.stats.imu_count;
     d.stats.camera_fps = d.stats.camera_count;
     d.stats.dropped_frames = Math.max(0, Math.round(expectedCam - d.stats.camera_count));
@@ -529,6 +544,28 @@ function handlePhoneJson(ws, msg) {
   if (!d) return;
   d.lastSeenTs = Date.now();
 
+  if (msg.type === "fleet_alert") {
+    const tRecvMs = Date.now();
+    const sourceDeviceName = d.device_name || deviceId;
+    let targetCount = 0;
+    for (const [, target] of devices.entries()) {
+      if (!target.connected || !isSocketOpen(target.ws)) continue;
+      targetCount += 1;
+    }
+    if (!targetCount) return;
+    for (const [, target] of devices.entries()) {
+      if (!target.connected || !isSocketOpen(target.ws)) continue;
+      sendWs(target.ws, {
+        type: "fleet_alert",
+        source_device_id: deviceId,
+        source_device_name: sourceDeviceName,
+        target_count: targetCount,
+        t_server_ms: tRecvMs
+      }, { critical: true });
+    }
+    return;
+  }
+
   if (msg.type === "webrtc_signal") {
     const dashboardId = String(msg.dashboard_id || "").trim();
     const signal = sanitizeWebRtcSignal(msg.signal);
@@ -595,7 +632,7 @@ function handlePhoneJson(ws, msg) {
   }
 
   if (msg.type === "camera_header") {
-    if (!allowByRate(d, "camera", d.config.streams.camera.fps || 10)) return;
+    if (!allowByRate(d, "camera", getExpectedCameraIngressFps(d, { recordingActive: !!d.recordingStatus?.recording }) || 10)) return;
     pendingCameraHeaderBySocket.set(ws, {
       device_id: deviceId,
       t_device_ms: Number(msg.t_device_ms || 0),
@@ -1257,16 +1294,45 @@ function deviceSummaries() {
   return out.sort((a, b) => a.device_id.localeCompare(b.device_id));
 }
 
+function getConfiguredPreviewCameraFps(config) {
+  const fps = Number(config?.streams?.camera?.fps || 0);
+  return fps > 0 ? fps : 0;
+}
+
+function getConfiguredRecordingCameraFps(config) {
+  const previewFps = getConfiguredPreviewCameraFps(config);
+  const camera = config?.streams?.camera || {};
+  const requestedFps = Number(camera.video_fps || camera.fps || 0);
+  if (camera.mode !== "stream" || !camera.record) return previewFps;
+  return Math.max(previewFps, requestedFps > 0 ? requestedFps : previewFps);
+}
+
+function getExpectedCameraIngressFps(device, { recordingActive = false } = {}) {
+  const config = device?.config || {};
+  const camera = config?.streams?.camera || {};
+  if (camera.mode !== "stream") return 0;
+  if (!recordingActive || !camera.record) {
+    return getConfiguredPreviewCameraFps(config);
+  }
+  return getConfiguredRecordingCameraFps(config);
+}
+
 function buildStreamStatus(config, d) {
   const s = config.streams;
   const now = Date.now();
   const cameraSeenMs = cameraActivityTsForDevice(d);
+  const previewCameraFps = getConfiguredPreviewCameraFps(config);
+  const recordCameraFps = getConfiguredRecordingCameraFps(config);
   return {
     imu: { enabled: !!s.imu.enabled, recording: !!s.imu.record, rate: `${s.imu.rate_hz} Hz`, last_seen_ms: d.state.imu_latest?.t_recv_ms || null },
     camera: {
       enabled: s.camera.mode !== "off",
       recording: !!s.camera.record && s.camera.mode === "stream",
-      rate: s.camera.mode === "stream" ? `${s.camera.fps} fps (${s.camera.record_mode || "jpg"})` : s.camera.mode,
+      rate: s.camera.mode === "stream"
+        ? (s.camera.record && recordCameraFps > previewCameraFps
+          ? `${previewCameraFps} FPS preview / ${recordCameraFps} FPS recorded (${s.camera.record_mode || "jpg"})`
+          : `${previewCameraFps} FPS (${s.camera.record_mode || "jpg"})`)
+        : s.camera.mode,
       last_seen_ms: cameraSeenMs || null
     },
     gps: { enabled: !!s.gps.enabled, recording: !!s.gps.record, rate: `${s.gps.rate_hz} Hz`, last_seen_ms: d.state.gps_latest?.t_recv_ms || null },
@@ -1999,7 +2065,7 @@ function computeDeviceAlerts(d) {
   }
 
   if (stream.camera?.mode === "stream") {
-    const target = Number(stream.camera.fps || 0);
+    const target = getExpectedCameraIngressFps(d, { recordingActive: !!d.recordingStatus?.recording });
     const actual = Number(d.stats.camera_fps || 0);
     const previewLive = !!d.state?.camera_preview?.live;
     if (target > 0 && actual < Math.max(1, target * 0.6) && !(previewLive && actual === 0)) {

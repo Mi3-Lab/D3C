@@ -6,15 +6,20 @@
   <title>D3C / Fleet Node</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
-<body class="app-body">
+<body class="app-body phone-body">
 
   <header class="topbar">
     <div class="topbar-left">
-      <span class="topbar-logo">D3C</span>
-      <span class="topbar-title">Fleet Node</span>
+      <div class="brand-lockup">
+        <span class="topbar-logo">D3C</span>
+        <div class="topbar-copy">
+          <span class="topbar-kicker">Distributed Driving Data Collective</span>
+          <span class="topbar-title">Fleet Node</span>
+        </div>
+      </div>
     </div>
     <div class="topbar-right">
       <button id="disconnectBtn" class="btn btn-alt btn-small">Disconnect</button>
@@ -23,6 +28,12 @@
 
   <main class="phone-main">
     <div class="phone-stack">
+
+      <section class="phone-hero">
+        <span class="section-eyebrow">Phone Setup</span>
+        <h1>Join the session in one step.</h1>
+        <p class="phone-hero-text">Enter your device name, paste the 6-character join code from the dashboard, then keep this page open while recording runs.</p>
+      </section>
 
       <section class="card phone-join-card">
         <h2>Join Session</h2>
@@ -60,6 +71,7 @@
           <div id="phoneReadyMissing" class="phone-ready-missing muted"></div>
         </div>
         <ul id="phoneReadinessList" class="checklist"></ul>
+        <div id="phonePermissionActions" class="phone-status-actions"></div>
       </section>
 
       <section class="card camera-section">
