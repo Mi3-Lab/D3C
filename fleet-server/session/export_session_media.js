@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { encodeCameraDirToMp4 } = require("./recorders/camera_recorder");
 
 const EXPORTS_DIRNAME = "exports";
@@ -53,6 +53,7 @@ async function exportSessionMedia({ sessionDir, ffmpegBin = "ffmpeg", audioDevic
       camera_video: summarizeExistingFile(info.cameraVideoPath),
       camera_with_audio: null,
       audio_wav: summarizeExistingFile(info.audioWavPath),
+      imu_csv: summarizeExistingFile(info.imuCsvPath),
       gps_csv: summarizeExistingFile(info.gpsCsvPath),
       timeline: summarizeTimeline(info)
     };
@@ -354,6 +355,57 @@ function computeGlobalWindow(inputs) {
   return { startMs, endMs, durationMs: endMs - startMs };
 }
 
+function buildTileLabel(info) {
+  const title = String(info?.deviceName || info?.deviceId || "Device");
+  const badges = [];
+  if (info?.gpsCsvPath && fs.existsSync(info.gpsCsvPath)) badges.push("GPS");
+  if (info?.imuCsvPath && fs.existsSync(info.imuCsvPath)) badges.push("IMU");
+  if (info?.audioWavPath && fs.existsSync(info.audioWavPath)) badges.push("AUD");
+  return badges.length ? `${title} | ${badges.join(" ")}` : title;
+}
+
+function escapeFfmpegText(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/%/g, "\\%");
+}
+
+function buildTileChromeFilters(info) {
+  const text = escapeFfmpegText(buildTileLabel(info));
+  return [
+    "drawbox=x=0:y=0:w=iw:h=42:color=black@0.55:t=fill",
+    "drawbox=x=0:y=0:w=iw:h=ih:color=white@0.14:t=2",
+    `drawtext=text='${text}':x=16:y=12:fontsize=22:fontcolor=white:shadowcolor=black@0.75:shadowx=2:shadowy=2`
+  ].join(",");
+}
+
+function probeVideoDimensions(videoPath, ffprobeBin = process.env.FFPROBE_BIN || "ffprobe") {
+  if (!videoPath || !fs.existsSync(videoPath)) return null;
+  try {
+    const res = spawnSync(ffprobeBin, [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=width,height",
+      "-of", "csv=p=0:s=x",
+      videoPath
+    ], { encoding: "utf8", windowsHide: true });
+    if (res.status !== 0) return null;
+    const raw = String(res.stdout || "").trim();
+    const [widthRaw, heightRaw] = raw.split("x");
+    const width = ensurePositiveNumber(widthRaw, null);
+    const height = ensurePositiveNumber(heightRaw, null);
+    if (!width || !height) return null;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, globalWindow }) {
   if (!inputs.length) {
     return { ok: true, skipped: true, reason: "no_inputs", path: outPath };
@@ -371,7 +423,8 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
       "-filter:v",
       `setpts=${formatFfmpegNumber(serverScale)}*(PTS-STARTPTS)+${formatFfmpegNumber(offsetSec)}/TB,` +
       `scale=${TILE_WIDTH}:${TILE_HEIGHT}:force_original_aspect_ratio=decrease,` +
-      `pad=${TILE_WIDTH}:${TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black`,
+      `pad=${TILE_WIDTH}:${TILE_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,` +
+      `${buildTileChromeFilters(info)}`,
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
@@ -400,7 +453,8 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
     filterParts.push(
       `[${idx}:v]setpts=${formatFfmpegNumber(serverScale)}*(PTS-STARTPTS)+${formatFfmpegNumber(offsetSec)}/TB,` +
       `scale=${layout.tile_width}:${layout.tile_height}:force_original_aspect_ratio=decrease,` +
-      `pad=${layout.tile_width}:${layout.tile_height}:(ow-iw)/2:(oh-ih)/2:black[${label}]`
+      `pad=${layout.tile_width}:${layout.tile_height}:(ow-iw)/2:(oh-ih)/2:black,` +
+      `${buildTileChromeFilters(info)}[${label}]`
     );
   });
 
@@ -471,15 +525,57 @@ async function composeMultiviewWithAudioAndGps({
     return { ok: true, skipped: true, reason: "gps_playback_video_missing", path: outPath };
   }
 
-  const insetWidth = chooseGpsInsetWidth(layout);
-  const insetMargin = Math.max(18, Math.round(insetWidth * 0.08));
+  const probedCanvas = probeVideoDimensions(baseVideoPath);
+  const baseWidth = Math.max(
+    ensurePositiveNumber(layout?.canvas_width, 0) || 0,
+    ensurePositiveNumber(probedCanvas?.width, 0) || 0,
+    TILE_WIDTH
+  );
+  const baseHeight = Math.max(
+    ensurePositiveNumber(layout?.canvas_height, 0) || 0,
+    ensurePositiveNumber(probedCanvas?.height, 0) || 0,
+    TILE_HEIGHT
+  );
+  const resolvedLayout = { canvas_width: baseWidth, canvas_height: baseHeight };
+  const gap = chooseOverviewGap(resolvedLayout);
+  const sidebarWidth = chooseGpsInsetWidth(resolvedLayout);
+  const waveformPanelHeight = chooseWaveformPanelHeight(resolvedLayout);
+  const finalWidth = baseWidth + sidebarWidth + gap * 3;
+  const finalHeight = baseHeight + waveformPanelHeight + gap * 3;
+  const titleFontSize = Math.max(18, Math.round(Math.min(baseWidth, baseHeight) * 0.032));
+  const gpsHeaderHeight = Math.max(40, titleFontSize + 18);
+  const gpsPanelPadding = Math.max(12, Math.round(sidebarWidth * 0.035));
+  const gpsX = gap * 2 + baseWidth;
+  const gpsY = gap;
+  const gpsContentX = gpsX + gpsPanelPadding;
+  const gpsContentY = gpsY + gpsHeaderHeight;
+  const gpsContentWidth = Math.max(240, sidebarWidth - gpsPanelPadding * 2);
+  const gpsContentHeight = Math.max(140, baseHeight - gpsHeaderHeight - gpsPanelPadding);
+  const waveformPanelY = gap * 2 + baseHeight;
+  const waveformOuterWidth = finalWidth - gap * 2;
+  const waveformHeaderHeight = Math.max(38, titleFontSize + 14);
+  const waveformPadding = Math.max(12, Math.round(waveformPanelHeight * 0.08));
+  const waveformInnerX = gap + waveformPadding;
+  const waveformInnerY = waveformPanelY + waveformHeaderHeight;
+  const waveformInnerWidth = Math.max(240, waveformOuterWidth - waveformPadding * 2);
+  const waveformInnerHeight = Math.max(44, waveformPanelHeight - waveformHeaderHeight - waveformPadding);
   const args = [
     "-y",
     "-i", baseVideoPath,
     "-i", gpsVideoPath,
     "-filter_complex",
-    `[1:v]scale=${insetWidth}:-2,format=yuv420p,drawbox=x=0:y=0:w=iw:h=ih:color=white@0.9:t=3[gps];` +
-    `[0:v][gps]overlay=W-w-${insetMargin}:H-h-${insetMargin}:eof_action=repeat[outv]`,
+    `[0:v]pad=${finalWidth}:${finalHeight}:${gap}:${gap}:color=0x091018,` +
+    `drawbox=x=${gap}:y=${gap}:w=${baseWidth}:h=${baseHeight}:color=white@0.12:t=2,` +
+    `drawbox=x=${gpsX}:y=${gpsY}:w=${sidebarWidth}:h=${baseHeight}:color=0x101923@0.96:t=fill,` +
+    `drawbox=x=${gpsX}:y=${gpsY}:w=${sidebarWidth}:h=${baseHeight}:color=white@0.12:t=2,` +
+    `drawbox=x=${gap}:y=${waveformPanelY}:w=${waveformOuterWidth}:h=${waveformPanelHeight}:color=0x101923@0.96:t=fill,` +
+    `drawbox=x=${gap}:y=${waveformPanelY}:w=${waveformOuterWidth}:h=${waveformPanelHeight}:color=white@0.12:t=2,` +
+    `drawtext=text='GPS REPLAY':x=${gpsX + 16}:y=${gpsY + 12}:fontsize=${titleFontSize}:fontcolor=white:shadowcolor=black@0.7:shadowx=2:shadowy=2,` +
+    `drawtext=text='SHARED AUDIO WAVEFORM':x=${gap + 16}:y=${waveformPanelY + 10}:fontsize=${Math.max(16, titleFontSize - 2)}:fontcolor=white:shadowcolor=black@0.7:shadowx=2:shadowy=2[canvas];` +
+    `[1:v]scale=${gpsContentWidth}:${gpsContentHeight}:force_original_aspect_ratio=decrease,format=yuv420p[gps];` +
+    `[0:a]aformat=channel_layouts=mono,volume=6,showwaves=s=${waveformInnerWidth}x${waveformInnerHeight}:mode=line:draw=full:scale=sqrt:colors=0x79d5ff,format=rgba,colorchannelmixer=aa=0.96[wave];` +
+    `[canvas][gps]overlay=${gpsContentX}+(${gpsContentWidth}-w)/2:${gpsContentY}+(${gpsContentHeight}-h)/2:eof_action=repeat[stage1];` +
+    `[stage1][wave]overlay=${waveformInnerX}:${waveformInnerY}[outv]`,
     "-map", "[outv]",
     "-map", "0:a:0?",
     "-c:v", "libx264",
@@ -579,6 +675,7 @@ function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, g
       camera_with_audio: relativize(result.session_dir, path.join(info.streamsDir, CAMERA_WITH_AUDIO_NAME)),
       audio_wav: relativize(result.session_dir, info.audioWavPath),
       audio_chunks_csv: relativize(result.session_dir, info.audioChunksPath),
+      imu_csv: relativize(result.session_dir, info.imuCsvPath),
       gps_csv: relativize(result.session_dir, info.gpsCsvPath),
       timeline: summarizeTimeline(info)
     })),
@@ -597,6 +694,7 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
   const audioCsvPath = path.join(streamsDir, "audio.csv");
   const audioChunksPath = path.join(streamsDir, "audio_chunks.csv");
   const gpsCsvPath = path.join(streamsDir, "gps.csv");
+  const imuCsvPath = path.join(streamsDir, "imu.csv");
   const runConfig = meta?.devices?.[deviceId]?.runConfig || {};
   const deviceReport = syncReport?.devices?.[deviceId] || {};
   const cameraTimeline = loadCameraTimeline(cameraTimestampsPath, deviceId, syncModels);
@@ -619,6 +717,7 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
     audioCsvPath,
     audioChunksPath,
     gpsCsvPath,
+    imuCsvPath,
     videoFps: ensurePositiveNumber(runConfig?.streams?.camera?.video_fps, ensurePositiveNumber(runConfig?.streams?.camera?.fps, 10)),
     videoBitrate: String(runConfig?.streams?.camera?.video_bitrate || "2M"),
     videoCrf: ensurePositiveNumber(runConfig?.streams?.camera?.video_crf, 23),
@@ -984,7 +1083,18 @@ function chooseGpsInsetWidth(layout) {
   const overrideWidth = ensurePositiveNumber(process.env.GPS_OVERLAY_WIDTH, null);
   if (overrideWidth) return Math.round(overrideWidth);
   const baseWidth = ensurePositiveNumber(layout?.canvas_width, TILE_WIDTH);
-  return Math.min(560, Math.max(280, Math.round(baseWidth * 0.42)));
+  return Math.min(620, Math.max(360, Math.round(baseWidth * 0.42)));
+}
+
+function chooseOverviewGap(layout) {
+  const baseWidth = ensurePositiveNumber(layout?.canvas_width, TILE_WIDTH);
+  const baseHeight = ensurePositiveNumber(layout?.canvas_height, TILE_HEIGHT);
+  return Math.max(18, Math.round(Math.min(baseWidth, baseHeight) * 0.03));
+}
+
+function chooseWaveformPanelHeight(layout) {
+  const baseHeight = ensurePositiveNumber(layout?.canvas_height, TILE_HEIGHT);
+  return Math.min(180, Math.max(120, Math.round(baseHeight * 0.26)));
 }
 
 function summarizeGpsPlaybackSource(stats) {
