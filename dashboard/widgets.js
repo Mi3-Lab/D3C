@@ -10,6 +10,16 @@ export function getWidgetDevice(settings) {
   return "";
 }
 
+const GPS_LIVE_TILE_SIZE = 256;
+const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
+const GPS_LIVE_STALE_MS = 15000;
+const GPS_LIVE_TRAIL_MAX_AGE_MS = 20 * 60 * 1000;
+const GPS_LIVE_TRAIL_MAX_POINTS = 2400;
+const GPS_LIVE_DRAW_MAX_POINTS = 700;
+const GPS_LIVE_COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#b197fc", "#63e6be", "#ffa94d", "#f783ac"];
+const gpsLiveTrailCache = new Map();
+const gpsLiveTileCache = new Map();
+
 export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRunConfig, defaultRunConfig, loadReplaySessions }) {
   return {
     fleet_health: {
@@ -69,10 +79,12 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const list = document.createElement("div");
         list.className = "device-roster";
         content.appendChild(list);
+        const pendingKicks = new Set();
 
         const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice }), () => {
           const st = store.getState();
           list.innerHTML = "";
+          const activeIds = new Set();
           if (!st.deviceList || !st.deviceList.length) {
             const empty = document.createElement("div");
             empty.className = "empty-state device-roster-empty";
@@ -81,6 +93,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             return;
           }
           for (const d of st.deviceList) {
+            activeIds.add(String(d.device_id || ""));
             const imu = Number(d.imuHz ?? d.imu_hz ?? 0);
             const cam = Number(d.camFps ?? d.cameraFps ?? d.camera_fps ?? 0);
             const connected = d?.connected !== false;
@@ -132,6 +145,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const healthTitle = healthAlerts.length
               ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
               : "No active alerts";
+            const pendingKick = pendingKicks.has(d.device_id);
             const card = document.createElement("article");
             card.className = `device-roster-card tone-${tone}`;
             card.innerHTML = `
@@ -175,7 +189,30 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
                 </div>
               </div>
             `;
+            if (connected) {
+              const actions = document.createElement("div");
+              actions.className = "device-roster-actions";
+              const kickBtn = document.createElement("button");
+              kickBtn.type = "button";
+              kickBtn.className = "btn btn-alt btn-small";
+              kickBtn.textContent = pendingKick ? "Removing..." : "Kick";
+              kickBtn.disabled = pendingKick;
+              kickBtn.addEventListener("click", () => {
+                if (pendingKicks.has(d.device_id)) return;
+                const confirmed = window.confirm(`Disconnect ${String(d.deviceName || d.device_id)} from this session?`);
+                if (!confirmed) return;
+                pendingKicks.add(d.device_id);
+                sendJson({ type: "device_kick", device_id: d.device_id });
+                kickBtn.textContent = "Removing...";
+                kickBtn.disabled = true;
+              });
+              actions.appendChild(kickBtn);
+              card.appendChild(actions);
+            }
             list.appendChild(card);
+          }
+          for (const deviceId of [...pendingKicks]) {
+            if (!activeIds.has(deviceId)) pendingKicks.delete(deviceId);
           }
         });
         return () => unsub();
@@ -188,8 +225,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
       render(content) {
         content.classList.add("session-setup-panel");
 
-        const summary = document.createElement("div");
-        summary.className = "kv-grid session-kpis";
+        const estimatePanel = document.createElement("section");
+        estimatePanel.className = "session-estimate-panel";
 
         const capturePanel = document.createElement("section");
         capturePanel.className = "session-capture-panel";
@@ -293,11 +330,27 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         joinBannerRight.append(joinBannerCopy, joinBannerCopyLink);
         joinBanner.append(joinBannerLeft, joinBannerRight);
 
-        content.append(joinBanner, capturePanel, ctaPanel, summary, setupDetails);
+        content.append(estimatePanel, joinBanner, ctaPanel, capturePanel, setupDetails);
 
         setupDetails.open = false;
         let prevIsActive = false;
         let lastFormKey = "";
+        const pendingCaptureToggles = new Map();
+        const pendingCaptureTimers = new Map();
+
+        function markCaptureTogglePending(key, nextEnabled) {
+          pendingCaptureToggles.set(String(key || ""), !!nextEnabled);
+          const existing = pendingCaptureTimers.get(key);
+          if (existing) clearTimeout(existing);
+          const timer = setTimeout(() => {
+            pendingCaptureTimers.delete(key);
+            pendingCaptureToggles.delete(key);
+            onStateChange();
+          }, 900);
+          pendingCaptureTimers.set(key, timer);
+          onStateChange();
+        }
+
         const onStateChange = () => {
           const st = store.getState();
           const cfg = mergeRunConfig(st.sessionConfig || defaultRunConfig);
@@ -309,13 +362,15 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           const estimates = computeSessionEstimates(cfg);
           const captureItems = describeCapturePlan(cfg);
 
-          summary.innerHTML = "";
-          kv(summary, "Status", isActive ? "Recording now" : "Ready to configure");
-          kv(summary, "Phones Online", String(online));
-          kv(summary, "Capture", captureItems.join(", "));
-          kv(summary, "Estimated Data", `${estimates.storageMbPerMin.toFixed(1)} MB/min/device`);
+          estimatePanel.innerHTML = `
+            <div class="session-estimate-head">
+              <span class="session-estimate-label">Estimated Data</span>
+              <strong>${escapeHtml(`${estimates.storageMbPerMin.toFixed(1)} MB/min/device`)}</strong>
+            </div>
+            <div class="session-estimate-copy">${escapeHtml(`${captureItems.join(", ")} · ${estimates.bandwidthMbps.toFixed(2)} Mbps/device live`)}</div>
+          `;
 
-          renderPrimaryCaptureToggles(captureGrid, cfg, isActive, updateSessionCfg);
+          renderPrimaryCaptureToggles(captureGrid, cfg, isActive, updateSessionCfg, pendingCaptureToggles, markCaptureTogglePending);
 
           const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
           const isStopping = phase === "STOPPING";
@@ -421,7 +476,10 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode }), onStateChange);
         onStateChange();
 
-        return () => unsub();
+        return () => {
+          unsub();
+          for (const timer of pendingCaptureTimers.values()) clearTimeout(timer);
+        };
       }
     },    imu_plot: {
       title: "IMU Time Series",
@@ -569,9 +627,53 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
       title: "Camera Views",
       defaults: { w: 12, h: 4, pinned: false, settings: { device_id: "global" } },
       settingsSchema: [deviceSettingSchema()],
-      render(content) {
+      render(content, ctx) {
         content.closest(".widget-card")?.classList.add("widget-cam-full");
-        content.classList.add("cam-content");
+        content.classList.add("cam-content", "monitor-widget-content");
+
+        const tabs = document.createElement("div");
+        tabs.className = "monitor-tabs";
+        tabs.setAttribute("role", "tablist");
+        const stage = document.createElement("div");
+        stage.className = "monitor-stage is-cameras";
+
+        const mapPanel = document.createElement("section");
+        mapPanel.className = "monitor-map-panel gps-live-content";
+
+        const cameraPanel = document.createElement("section");
+        cameraPanel.className = "monitor-camera-panel";
+
+        stage.append(mapPanel, cameraPanel);
+        content.append(tabs, stage);
+
+        let activeMode = "cameras";
+        const tabButtons = new Map();
+        const mapView = mountGpsLivePanel(mapPanel, {
+          store,
+          getDeviceId: () => getWidgetDevice(ctx.instance.settings)
+        });
+
+        const setMode = (nextMode) => {
+          activeMode = ["cameras", "map", "combined"].includes(nextMode) ? nextMode : "cameras";
+          stage.className = `monitor-stage is-${activeMode}`;
+          for (const [mode, button] of tabButtons.entries()) {
+            const selected = mode === activeMode;
+            button.classList.toggle("is-active", selected);
+            button.setAttribute("aria-selected", selected ? "true" : "false");
+          }
+          requestAnimationFrame(() => mapView.refresh());
+        };
+
+        for (const [mode, label] of [["cameras", "Cameras"], ["map", "Map"], ["combined", "All Live"]]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "monitor-tab";
+          button.textContent = label;
+          button.setAttribute("role", "tab");
+          button.addEventListener("click", () => setMode(mode));
+          tabButtons.set(mode, button);
+          tabs.appendChild(button);
+        }
 
         const grid = document.createElement("div");
         grid.className = "camview-grid";
@@ -579,7 +681,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const empty = document.createElement("div");
         empty.className = "camview-empty";
         empty.textContent = "No devices connected";
-        content.appendChild(grid);
+        cameraPanel.appendChild(grid);
         grid.appendChild(empty);
 
         function destroyCard(deviceId) {
@@ -649,10 +751,14 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
         function renderCards() {
           const st = store.getState();
+          const selectedDeviceId = getWidgetDevice(ctx.instance.settings);
+          const visibleDevices = selectedDeviceId
+            ? (st.deviceList || []).filter((summary) => String(summary?.device_id || "") === selectedDeviceId)
+            : (st.deviceList || []);
           const activeIds = new Set();
           const now = Date.now();
 
-          for (const summary of (st.deviceList || [])) {
+          for (const summary of visibleDevices) {
             const deviceId = summary.device_id;
             activeIds.add(deviceId);
             const card = ensureCard(deviceId);
@@ -722,11 +828,13 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const unsubPreview = bus.on("preview_rtc_update", ({ deviceId } = {}) => {
           if (!deviceId || cards.has(deviceId)) renderCards();
         });
+        setMode("cameras");
         renderCards();
 
         return () => {
           unsubStore();
           unsubPreview();
+          mapView.destroy();
           for (const deviceId of [...cards.keys()]) destroyCard(deviceId);
         };
       }
@@ -734,53 +842,18 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
 
     gps_live: {
-      title: "GPS Live",
-      defaults: { w: 4, h: 3, pinned: false, settings: { device_id: "global" } },
+      title: "Live Map",
+      defaults: { w: 8, h: 4, pinned: false, settings: { device_id: "global" } },
       settingsSchema: [deviceSettingSchema()],
       render(content, ctx) {
-        const note = document.createElement("div");
-        note.className = "mono muted";
-        content.appendChild(note);
-
-        const box = document.createElement("div");
-        box.className = "kv-grid";
-        content.appendChild(box);
-
-        const table = document.createElement("table");
-        table.style.display = "none";
-        table.innerHTML = "<thead><tr><th>Device</th><th>Lat</th><th>Lon</th><th>Acc(m)</th><th>Age(ms)</th></tr></thead><tbody></tbody>";
-        const tbody = table.querySelector("tbody");
-        content.appendChild(table);
-
-        const unsub = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice }), () => {
-          const st = store.getState();
-          const now = Date.now();
-
-          box.style.display = "none";
-          table.style.display = "table";
-          tbody.innerHTML = "";
-          const list = st.deviceList || [];
-          if (!list.length) {
-            const tr = document.createElement("tr");
-            tr.innerHTML = "<td colspan=\"7\" class=\"empty-state\">No devices connected</td>";
-            tbody.appendChild(tr);
-            note.textContent = "GPS active 0/0";
-            return;
-          }
-
-          let active = 0;
-          for (const d of list) {
-            const g = st.statesByDevice?.[d.device_id]?.gps_latest;
-            const age = g?.t_recv_ms ? Math.max(0, now - Number(g.t_recv_ms)) : null;
-            if (age != null && age < 4000) active += 1;
-            const tr = document.createElement("tr");
-            tr.innerHTML = `<td>${escapeHtml(String(d.deviceName || d.device_id))}</td><td>${g ? Number(g.lat).toFixed(6) : "-"}</td><td>${g ? Number(g.lon).toFixed(6) : "-"}</td><td>${g ? Number(g.accuracy_m).toFixed(1) : "-"}</td><td>${age == null ? "-" : String(age)}</td>`;
-            tbody.appendChild(tr);
-          }
-          note.textContent = `GPS active ${active}/${list.length}`;
+        content.classList.add("gps-live-content");
+        const mapView = mountGpsLivePanel(content, {
+          store,
+          getDeviceId: () => getWidgetDevice(ctx.instance.settings)
         });
-
-        return () => unsub();
+        return () => {
+          mapView.destroy();
+        };
       }
     },    events_timeline: {
       title: "Events",
@@ -1081,10 +1154,515 @@ function drawTriAxisTimeSeries(canvas, samples, key, opts) {
   }
 }
 
-function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
+function ingestGpsLiveState(state) {
+  const list = Array.isArray(state?.deviceList) ? state.deviceList : [];
+  const nameById = new Map(list.map((device) => [String(device.device_id || ""), String(device.deviceName || device.device_id || "")]));
+  const ids = new Set([
+    ...Object.keys(state?.statesByDevice || {}),
+    ...list.map((device) => String(device.device_id || ""))
+  ]);
+  for (const deviceId of ids) {
+    if (!deviceId) continue;
+    const latest = state?.statesByDevice?.[deviceId]?.gps_latest || null;
+    if (!latest) continue;
+    ingestGpsLivePoint(deviceId, latest, nameById.get(deviceId) || deviceId);
+  }
+}
+
+function ingestGpsLivePoint(deviceId, latest, deviceName = "") {
+  const lat = Number(latest?.lat);
+  const lon = Number(latest?.lon);
+  const ts = Number(latest?.t_recv_ms || 0);
+  if (!isValidGpsCoordinate(lat, lon) || !ts) return;
+  const entry = getOrCreateGpsTrail(deviceId, deviceName);
+  entry.name = deviceName || entry.name || deviceId;
+  if (entry.lastTs === ts) return;
+  entry.lastTs = ts;
+  entry.points.push({
+    ts,
+    lat,
+    lon,
+    accuracy_m: Number.isFinite(Number(latest?.accuracy_m)) ? Number(latest.accuracy_m) : -1,
+    speed_mps: Number.isFinite(Number(latest?.speed_mps)) ? Number(latest.speed_mps) : -1,
+    heading_deg: Number.isFinite(Number(latest?.heading_deg)) ? Number(latest.heading_deg) : -1
+  });
+  trimGpsTrailPoints(entry.points, ts);
+}
+
+function getOrCreateGpsTrail(deviceId, deviceName = "") {
+  const key = String(deviceId || "").trim();
+  let entry = gpsLiveTrailCache.get(key);
+  if (entry) return entry;
+  entry = {
+    deviceId: key,
+    name: deviceName || key,
+    lastTs: 0,
+    points: []
+  };
+  gpsLiveTrailCache.set(key, entry);
+  return entry;
+}
+
+function trimGpsTrailPoints(points, newestTs) {
+  const maxAgeMs = GPS_LIVE_TRAIL_MAX_AGE_MS;
+  while (points.length > GPS_LIVE_TRAIL_MAX_POINTS) points.shift();
+  while (points.length && newestTs - Number(points[0]?.ts || 0) > maxAgeMs) points.shift();
+}
+
+function buildGpsLiveTracks(state, selectedDeviceId = "") {
+  const list = Array.isArray(state?.deviceList) ? state.deviceList : [];
+  const summaryById = new Map(list.map((device) => [String(device.device_id || ""), device]));
+  const ids = selectedDeviceId
+    ? [String(selectedDeviceId)]
+    : [...new Set([...summaryById.keys(), ...gpsLiveTrailCache.keys()])];
+  const now = Date.now();
+  const tracks = [];
+
+  for (const deviceId of ids) {
+    const entry = gpsLiveTrailCache.get(deviceId);
+    const summary = summaryById.get(deviceId) || {};
+    const latest = state?.statesByDevice?.[deviceId]?.gps_latest || null;
+    if (latest) ingestGpsLivePoint(deviceId, latest, String(summary.deviceName || deviceId));
+    const freshEntry = gpsLiveTrailCache.get(deviceId);
+    const sampledPoints = sampleGpsTrailPoints(freshEntry?.points || []);
+    if (!sampledPoints.length) continue;
+    const latestPoint = sampledPoints[sampledPoints.length - 1];
+    const ageMs = latestPoint?.ts ? Math.max(0, now - Number(latestPoint.ts)) : Number.POSITIVE_INFINITY;
+    tracks.push({
+      deviceId,
+      name: String(summary.deviceName || freshEntry?.name || deviceId),
+      color: gpsLiveColorForDevice(deviceId),
+      connected: summary.connected !== false,
+      ageMs,
+      live: ageMs <= 6000,
+      stale: ageMs > 6000 && ageMs <= GPS_LIVE_STALE_MS,
+      points: sampledPoints,
+      latest: latestPoint
+    });
+  }
+
+  return tracks.sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+}
+
+function sampleGpsTrailPoints(points) {
+  if (!Array.isArray(points) || !points.length) return [];
+  if (points.length <= GPS_LIVE_DRAW_MAX_POINTS) return points.slice();
+  const step = Math.ceil(points.length / GPS_LIVE_DRAW_MAX_POINTS);
+  const sampled = [];
+  for (let i = 0; i < points.length; i += step) sampled.push(points[i]);
+  if (sampled[sampled.length - 1] !== points[points.length - 1]) sampled.push(points[points.length - 1]);
+  return sampled;
+}
+
+function gpsLiveColorForDevice(deviceId) {
+  const key = String(deviceId || "");
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) hash = ((hash * 31) + key.charCodeAt(i)) >>> 0;
+  return GPS_LIVE_COLORS[hash % GPS_LIVE_COLORS.length];
+}
+
+function computeGpsLiveView(tracks, width, height) {
+  const allPoints = tracks.flatMap((track) => track.points).filter((point) => isValidGpsCoordinate(point.lat, point.lon));
+  if (!allPoints.length || width < 40 || height < 40) return null;
+
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+
+  for (const point of allPoints) {
+    const world = latLonToWorld(point.lat, point.lon);
+    minX = Math.min(minX, world.x);
+    maxX = Math.max(maxX, world.x);
+    minY = Math.min(minY, world.y);
+    maxY = Math.max(maxY, world.y);
+  }
+
+  const pointCount = allPoints.length;
+  const paddingPx = Math.max(32, Math.min(width, height) * 0.12);
+  const usableWidth = Math.max(1, width - paddingPx * 2);
+  const usableHeight = Math.max(1, height - paddingPx * 2);
+  const spanX = Math.max(maxX - minX, pointCount === 1 ? 0 : 1e-6);
+  const spanY = Math.max(maxY - minY, pointCount === 1 ? 0 : 1e-6);
+
+  let zoom = 16;
+  if (pointCount > 1) {
+    const zoomX = Math.log2(usableWidth / (GPS_LIVE_TILE_SIZE * Math.max(spanX, 1e-9)));
+    const zoomY = Math.log2(usableHeight / (GPS_LIVE_TILE_SIZE * Math.max(spanY, 1e-9)));
+    zoom = Math.floor(Math.min(zoomX, zoomY));
+  }
+  zoom = Math.max(2, Math.min(18, Number.isFinite(zoom) ? zoom : 16));
+
+  const scale = GPS_LIVE_TILE_SIZE * (2 ** zoom);
+  const centerWorldX = (minX + maxX) / 2;
+  const centerWorldY = (minY + maxY) / 2;
+  const centerPxX = centerWorldX * scale;
+  const centerPxY = centerWorldY * scale;
+  const centerLat = allPoints[Math.floor(allPoints.length / 2)]?.lat ?? tracks[0]?.latest?.lat ?? 0;
+  const metersPerPx = 156543.03392 * Math.cos((centerLat * Math.PI) / 180) / (2 ** zoom);
+
+  return {
+    width,
+    height,
+    zoom,
+    scale,
+    centerWorldX,
+    centerWorldY,
+    centerPxX,
+    centerPxY,
+    metersPerPx,
+    project(lat, lon) {
+      const world = latLonToWorld(lat, lon);
+      return {
+        x: (world.x * scale) - centerPxX + (width / 2),
+        y: (world.y * scale) - centerPxY + (height / 2)
+      };
+    }
+  };
+}
+
+function latLonToWorld(lat, lon) {
+  const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, Number(lat || 0)));
+  const normalizedLon = Math.max(-180, Math.min(180, Number(lon || 0)));
+  const x = (normalizedLon + 180) / 360;
+  const sin = Math.sin((clampedLat * Math.PI) / 180);
+  const y = 0.5 - (Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI));
+  return { x, y };
+}
+
+function drawGpsLiveBackdrop(ctx, width, height) {
+  const gradient = ctx.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, "#0d1527");
+  gradient.addColorStop(1, "#12203b");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+  ctx.lineWidth = 1;
+  const step = 48;
+  for (let x = 0; x <= width; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= height; y += step) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawGpsLiveTiles(ctx, view, onInvalidate) {
+  const tileSpan = 2 ** view.zoom;
+  const left = view.centerPxX - (view.width / 2);
+  const top = view.centerPxY - (view.height / 2);
+  const startTileX = Math.floor(left / GPS_LIVE_TILE_SIZE);
+  const endTileX = Math.floor((left + view.width) / GPS_LIVE_TILE_SIZE);
+  const startTileY = Math.floor(top / GPS_LIVE_TILE_SIZE);
+  const endTileY = Math.floor((top + view.height) / GPS_LIVE_TILE_SIZE);
+  let total = 0;
+  let loaded = 0;
+
+  for (let rawTileX = startTileX; rawTileX <= endTileX; rawTileX += 1) {
+    for (let rawTileY = startTileY; rawTileY <= endTileY; rawTileY += 1) {
+      if (rawTileY < 0 || rawTileY >= tileSpan) continue;
+      total += 1;
+      const wrappedTileX = ((rawTileX % tileSpan) + tileSpan) % tileSpan;
+      const tile = ensureGpsLiveTile(view.zoom, wrappedTileX, rawTileY, onInvalidate);
+      const dx = Math.round((rawTileX * GPS_LIVE_TILE_SIZE) - left);
+      const dy = Math.round((rawTileY * GPS_LIVE_TILE_SIZE) - top);
+
+      if (tile?.status === "loaded" && tile.image?.complete) {
+        ctx.drawImage(tile.image, dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+        loaded += 1;
+      } else {
+        ctx.save();
+        ctx.fillStyle = tile?.status === "error" ? "rgba(120, 17, 34, 0.14)" : "rgba(255, 255, 255, 0.03)";
+        ctx.fillRect(dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.04)";
+        ctx.strokeRect(dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+        ctx.restore();
+      }
+    }
+  }
+
+  return { total, loaded };
+}
+
+function ensureGpsLiveTile(z, x, y, onInvalidate) {
+  const key = `${z}/${x}/${y}`;
+  let entry = gpsLiveTileCache.get(key);
+  if (entry) return entry;
+  const image = new Image();
+  entry = { status: "loading", image };
+  gpsLiveTileCache.set(key, entry);
+  image.crossOrigin = "anonymous";
+  image.decoding = "async";
+  image.onload = () => {
+    entry.status = "loaded";
+    onInvalidate?.();
+  };
+  image.onerror = () => {
+    entry.status = "error";
+    onInvalidate?.();
+  };
+  image.src = GPS_LIVE_TILE_TEMPLATE
+    .replace("{z}", String(z))
+    .replace("{x}", String(x))
+    .replace("{y}", String(y));
+  return entry;
+}
+
+function drawGpsLiveTrack(ctx, track, view) {
+  if (!track?.points?.length) return;
+  const projected = track.points.map((point) => ({
+    ...view.project(point.lat, point.lon),
+    accuracy_m: point.accuracy_m
+  }));
+  if (!projected.length) return;
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  ctx.strokeStyle = "rgba(9, 12, 20, 0.80)";
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  for (let i = 0; i < projected.length; i += 1) {
+    const point = projected[i];
+    if (i === 0) ctx.moveTo(point.x, point.y);
+    else ctx.lineTo(point.x, point.y);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = track.color;
+  ctx.lineWidth = track.live ? 3 : 2.5;
+  ctx.globalAlpha = track.live ? 0.95 : 0.68;
+  ctx.beginPath();
+  for (let i = 0; i < projected.length; i += 1) {
+    const point = projected[i];
+    if (i === 0) ctx.moveTo(point.x, point.y);
+    else ctx.lineTo(point.x, point.y);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  const last = projected[projected.length - 1];
+  const accuracyRadius = Number.isFinite(last.accuracy_m) && last.accuracy_m > 0
+    ? Math.max(8, Math.min(80, last.accuracy_m / Math.max(0.5, view.metersPerPx)))
+    : 0;
+  if (accuracyRadius > 0) {
+    ctx.fillStyle = `${track.color}22`;
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, accuracyRadius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = track.color;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(last.x, last.y, track.live ? 6 : 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  const label = `${track.name}${track.live ? "" : ` · ${Math.round(track.ageMs / 1000)}s`}`;
+  ctx.font = '600 12px "IBM Plex Mono", ui-monospace, monospace';
+  const metrics = ctx.measureText(label);
+  const labelX = Math.max(8, Math.min(view.width - metrics.width - 18, last.x + 10));
+  const labelY = Math.max(18, Math.min(view.height - 10, last.y - 10));
+
+  ctx.fillStyle = "rgba(8, 12, 20, 0.78)";
+  ctx.fillRect(labelX - 6, labelY - 13, metrics.width + 12, 20);
+  ctx.strokeStyle = `${track.color}88`;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(labelX - 6, labelY - 13, metrics.width + 12, 20);
+  ctx.fillStyle = "#f8fafc";
+  ctx.fillText(label, labelX, labelY + 1);
+  ctx.restore();
+}
+
+function drawGpsLiveCrosshair(ctx, width, height) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo((width / 2) - 8, height / 2);
+  ctx.lineTo((width / 2) + 8, height / 2);
+  ctx.moveTo(width / 2, (height / 2) - 8);
+  ctx.lineTo(width / 2, (height / 2) + 8);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function renderGpsLiveLegend(container, tracks) {
+  container.innerHTML = "";
+  for (const track of tracks) {
+    const item = document.createElement("div");
+    item.className = `gps-live-chip ${track.live ? "is-live" : track.stale ? "is-stale" : "is-old"}`;
+    const swatch = document.createElement("span");
+    swatch.className = "gps-live-chip-swatch";
+    swatch.style.background = track.color;
+    const text = document.createElement("span");
+    text.textContent = `${track.name} · ${track.latest?.lat?.toFixed?.(5) || "-"}, ${track.latest?.lon?.toFixed?.(5) || "-"}`;
+    item.append(swatch, text);
+    container.appendChild(item);
+  }
+}
+
+function formatGpsLiveMetersPerPx(metersPerPx) {
+  const value = Math.max(0, Number(metersPerPx || 0));
+  if (!value) return "scale --";
+  if (value >= 1000) return `${(value / 1000).toFixed(2)} km/px`;
+  if (value >= 100) return `${Math.round(value)} m/px`;
+  return `${value.toFixed(1)} m/px`;
+}
+
+function isValidGpsCoordinate(lat, lon) {
+  return Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+}
+
+function mountGpsLivePanel(container, { store, getDeviceId = () => "" } = {}) {
+  container.innerHTML = "";
+
+  const shell = document.createElement("div");
+  shell.className = "gps-live-shell";
+
+  const meta = document.createElement("div");
+  meta.className = "gps-live-meta mono";
+
+  const legend = document.createElement("div");
+  legend.className = "gps-live-legend";
+
+  const viewport = document.createElement("div");
+  viewport.className = "gps-live-viewport";
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "gps-live-canvas";
+  viewport.appendChild(canvas);
+
+  const overlay = document.createElement("div");
+  overlay.className = "gps-live-overlay";
+  const status = document.createElement("div");
+  status.className = "gps-live-status";
+  const attribution = document.createElement("div");
+  attribution.className = "gps-live-attribution";
+  attribution.innerHTML = '<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer noopener">© OpenStreetMap</a> · <a href="https://carto.com/attributions" target="_blank" rel="noreferrer noopener">© CARTO</a>';
+  overlay.append(status, attribution);
+  viewport.appendChild(overlay);
+
+  shell.append(meta, viewport, legend);
+  container.appendChild(shell);
+
+  let disposed = false;
+  let framePending = false;
+  let resizeObserver = null;
+  let windowResizeHandler = null;
+
+  const scheduleRender = () => {
+    if (disposed || framePending) return;
+    framePending = true;
+    requestAnimationFrame(() => {
+      framePending = false;
+      renderMap();
+    });
+  };
+
+  const syncCanvasSize = () => {
+    const rect = viewport.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const nextWidth = Math.max(1, Math.round(width * dpr));
+    const nextHeight = Math.max(1, Math.round(height * dpr));
+    if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
+    }
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    return { width, height, dpr };
+  };
+
+  const renderMap = () => {
+    if (disposed) return;
+    const size = syncCanvasSize();
+    if (!size.width || !size.height) return;
+    const st = store.getState();
+    ingestGpsLiveState(st);
+    const tracks = buildGpsLiveTracks(st, String(getDeviceId?.() || ""));
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return;
+    ctx2d.setTransform(1, 0, 0, 1, 0, 0);
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+    ctx2d.scale(size.dpr, size.dpr);
+
+    const view = computeGpsLiveView(tracks, size.width, size.height);
+    drawGpsLiveBackdrop(ctx2d, size.width, size.height);
+
+    if (!tracks.length || !view) {
+      const selectedDeviceId = String(getDeviceId?.() || "");
+      status.hidden = false;
+      status.textContent = selectedDeviceId
+        ? "Waiting for live GPS fixes from this phone."
+        : "Waiting for phones to report location.";
+      meta.textContent = tracks.length ? "Map view unavailable" : "No live GPS tracks yet";
+      legend.innerHTML = "";
+      return;
+    }
+
+    const tileStats = drawGpsLiveTiles(ctx2d, view, scheduleRender);
+    for (const track of tracks) drawGpsLiveTrack(ctx2d, track, view);
+    if (!tileStats.loaded && tileStats.total) {
+      ctx2d.save();
+      ctx2d.fillStyle = "rgba(15, 23, 40, 0.10)";
+      ctx2d.fillRect(0, 0, size.width, size.height);
+      ctx2d.restore();
+    }
+    drawGpsLiveCrosshair(ctx2d, size.width, size.height);
+
+    const liveCount = tracks.filter((track) => track.ageMs <= 6000).length;
+    const totalPoints = tracks.reduce((sum, track) => sum + track.points.length, 0);
+    meta.textContent = `${liveCount}/${tracks.length} live · ${totalPoints} pts · ${formatGpsLiveMetersPerPx(view.metersPerPx)} · ${tileStats.loaded}/${tileStats.total || 0} tiles`;
+    renderGpsLiveLegend(legend, tracks);
+    status.hidden = true;
+  };
+
+  const unsub = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice }), () => {
+    scheduleRender();
+  });
+
+  if (typeof ResizeObserver === "function") {
+    resizeObserver = new ResizeObserver(() => scheduleRender());
+    resizeObserver.observe(viewport);
+  } else {
+    windowResizeHandler = () => scheduleRender();
+    window.addEventListener("resize", windowResizeHandler);
+  }
+
+  ingestGpsLiveState(store.getState());
+  scheduleRender();
+
+  return {
+    refresh: scheduleRender,
+    destroy() {
+      disposed = true;
+      unsub();
+      resizeObserver?.disconnect();
+      if (windowResizeHandler) window.removeEventListener("resize", windowResizeHandler);
+    }
+  };
+}
+
+function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg, pendingToggles = new Map(), onToggleStart = null) {
   parent.innerHTML = "";
   const items = [
     {
+      key: "imu",
       title: "Motion",
       description: "Accelerometer and gyroscope",
       isEnabled(currentCfg) {
@@ -1099,6 +1677,7 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
       }
     },
     {
+      key: "camera",
       title: "Camera",
       description: "Live preview frames",
       isEnabled(currentCfg) {
@@ -1113,6 +1692,7 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
       }
     },
     {
+      key: "audio",
       title: "Audio",
       description: "Microphone capture",
       isEnabled(currentCfg) {
@@ -1127,6 +1707,7 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
       }
     },
     {
+      key: "location",
       title: "Location",
       description: "GPS fixes",
       isEnabled(currentCfg) {
@@ -1144,26 +1725,31 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg) {
 
   for (const item of items) {
     const enabled = item.isEnabled(cfg);
+    const isPending = pendingToggles.has(item.key);
+    const pendingEnabled = pendingToggles.get(item.key);
+    const nextEnabled = isPending ? !!pendingEnabled : enabled;
     const card = document.createElement("article");
-    card.className = `session-capture-card ${enabled ? "is-on" : "is-off"}${disabled ? " is-disabled" : ""}`;
+    card.className = `session-capture-card ${nextEnabled ? "is-on" : "is-off"}${disabled ? " is-disabled" : ""}${isPending ? " is-pending" : ""}`;
 
     const copy = document.createElement("div");
     copy.className = "session-capture-copy";
     copy.innerHTML = `
       <div class="session-capture-head">
         <strong>${escapeHtml(item.title)}</strong>
-        <span class="session-capture-status">${enabled ? "On" : "Off"}</span>
+        <span class="session-capture-status">${isPending ? (nextEnabled ? "Turning On" : "Turning Off") : (enabled ? "On" : "Off")}</span>
       </div>
       <span class="session-capture-desc">${escapeHtml(item.description)}</span>
-      <span class="session-capture-detail mono">${escapeHtml(item.detail(cfg))}</span>
+      <span class="session-capture-detail mono">${escapeHtml(isPending ? "Applying..." : item.detail(cfg))}</span>
     `;
 
     const action = document.createElement("button");
-    action.className = enabled ? "btn btn-small session-capture-action" : "btn btn-alt btn-small session-capture-action";
-    action.textContent = enabled ? "Turn Off" : "Turn On";
-    action.disabled = !!disabled;
+    action.className = nextEnabled ? "btn btn-small session-capture-action" : "btn btn-alt btn-small session-capture-action";
+    action.textContent = isPending ? "Working..." : (enabled ? "Turn Off" : "Turn On");
+    action.disabled = !!disabled || isPending;
     action.addEventListener("click", () => {
-      if (disabled) return;
+      if (disabled || isPending) return;
+      const targetEnabled = !enabled;
+      onToggleStart?.(item.key, targetEnabled);
       updateSessionCfg((nextCfg) => {
         const currentEnabled = item.isEnabled(nextCfg);
         item.toggle(nextCfg, !currentEnabled);

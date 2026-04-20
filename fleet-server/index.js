@@ -38,6 +38,7 @@ const PUBLIC_RUNTIME_STATE_PATH = process.env.PUBLIC_RUNTIME_STATE_PATH
   ? path.resolve(process.env.PUBLIC_RUNTIME_STATE_PATH)
   : "";
 const SERVER_STARTED_AT_MS = Date.now();
+const FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS = 500;
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -304,6 +305,9 @@ const devices = new Map(); // device_id -> device entry
 const dashboardSockets = new Set();
 const pendingCameraHeaderBySocket = new Map(); // ws -> header
 const dashboardSessions = new Map();
+let fleetOverviewBroadcastTimer = null;
+let fleetOverviewBroadcastDirty = false;
+let lastFleetOverviewBroadcastAtMs = 0;
 
 let focusedDeviceId = null;
 let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
@@ -370,6 +374,7 @@ wss.on("connection", (ws, req) => {
         focusedDeviceId = firstConnectedDeviceId() || null;
       }
       broadcastDeviceList();
+      queueFleetOverviewBroadcast({ immediate: true });
     }
     if (ws.role === "dashboard" && ws.client_id) {
       relayPreviewDisconnectToPhones(ws.client_id, "dashboard_disconnected");
@@ -535,6 +540,8 @@ function handleHello(ws, msg) {
   });
   sendWs(ws, { type: "config", device_id: unique, runConfig: sessionConfig });
   sendWs(ws, { type: "recording_state", active: recording.active, session_id: recording.session_id || null });
+  sendWs(ws, buildFleetOverviewPayload(), { critical: true });
+  queueFleetOverviewBroadcast({ immediate: true });
   broadcastDeviceList();
   broadcastState();
 }
@@ -695,6 +702,7 @@ function handlePhoneJson(ws, msg) {
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
+    queueFleetOverviewBroadcast();
     return;
   }
 
@@ -871,14 +879,7 @@ function handleDashboardJson(ws, msg) {
       sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
       return;
     }
-    sessionConfig = sanitizeRunConfig(incoming, sessionConfig);
-    for (const [id, d] of devices.entries()) {
-      d.config = clone(sessionConfig);
-      sessionManager.updateDeviceConfig(id, d.config);
-      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
-    }
-    broadcastToDashboards(buildSessionConfigPayload());
-    broadcastState();
+    applySessionConfigUpdate(incoming);
     return;
   }
 
@@ -906,14 +907,14 @@ function handleDashboardJson(ws, msg) {
       sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
       return;
     }
-    sessionConfig = sanitizeRunConfig(msg.sessionConfig, sessionConfig);
-    for (const [id, d] of devices.entries()) {
-      d.config = clone(sessionConfig);
-      sessionManager.updateDeviceConfig(id, d.config);
-      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
-    }
-    broadcastToDashboards(buildSessionConfigPayload());
-    broadcastState();
+    applySessionConfigUpdate(msg.sessionConfig);
+    return;
+  }
+
+  if (msg.type === "device_kick") {
+    const deviceId = sanitizeDeviceId(String(msg.device_id || "").trim());
+    if (!deviceId || !devices.has(deviceId)) return;
+    kickDeviceFromDashboard(deviceId);
     return;
   }
 
@@ -1561,6 +1562,74 @@ function broadcastToDashboards(payload) {
   }
 }
 
+function broadcastToPhones(payload, opts = {}) {
+  const text = JSON.stringify(payload);
+  const maxBufferedBytes = (DEFAULT_RUN_CONFIG.performance?.max_ws_buffer_kb || 1024) * 1024;
+  for (const [, device] of devices.entries()) {
+    const ws = device?.ws;
+    if (!device?.connected || !ws || ws.readyState !== WebSocket.OPEN) continue;
+    if (!opts.critical && ws.bufferedAmount > maxBufferedBytes) continue;
+    ws.send(text);
+  }
+}
+
+function buildFleetOverviewPayload() {
+  const devicesOverview = [];
+  for (const [deviceId, device] of devices.entries()) {
+    if (!device.connected) continue;
+    devicesOverview.push({
+      device_id: deviceId,
+      device_name: device.device_name || deviceId,
+      connected: true,
+      recording: !!device.recordingStatus?.recording,
+      motion_state: device.state?.motion_state || "UNKNOWN",
+      camera_preview_live: !!device.state?.camera_preview?.live,
+      gps_latest: device.state?.gps_latest
+        ? {
+            t_recv_ms: Number(device.state.gps_latest.t_recv_ms || 0),
+            lat: Number(device.state.gps_latest.lat || 0),
+            lon: Number(device.state.gps_latest.lon || 0),
+            accuracy_m: Number.isFinite(Number(device.state.gps_latest.accuracy_m)) ? Number(device.state.gps_latest.accuracy_m) : -1,
+            speed_mps: Number.isFinite(Number(device.state.gps_latest.speed_mps)) ? Number(device.state.gps_latest.speed_mps) : -1,
+            heading_deg: Number.isFinite(Number(device.state.gps_latest.heading_deg)) ? Number(device.state.gps_latest.heading_deg) : -1
+          }
+        : null
+    });
+  }
+  devicesOverview.sort((a, b) => a.device_id.localeCompare(b.device_id));
+  return {
+    type: "fleet_overview",
+    generated_at_ms: Date.now(),
+    devices: devicesOverview
+  };
+}
+
+function flushFleetOverviewBroadcast() {
+  fleetOverviewBroadcastTimer = null;
+  if (!fleetOverviewBroadcastDirty) return;
+  fleetOverviewBroadcastDirty = false;
+  lastFleetOverviewBroadcastAtMs = Date.now();
+  broadcastToPhones(buildFleetOverviewPayload());
+}
+
+function queueFleetOverviewBroadcast({ immediate = false } = {}) {
+  fleetOverviewBroadcastDirty = true;
+  const now = Date.now();
+  const delay = immediate
+    ? 0
+    : Math.max(0, FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS - (now - lastFleetOverviewBroadcastAtMs));
+  if (fleetOverviewBroadcastTimer && delay > 0) return;
+  if (fleetOverviewBroadcastTimer) {
+    clearTimeout(fleetOverviewBroadcastTimer);
+    fleetOverviewBroadcastTimer = null;
+  }
+  if (delay === 0) {
+    flushFleetOverviewBroadcast();
+    return;
+  }
+  fleetOverviewBroadcastTimer = setTimeout(flushFleetOverviewBroadcast, delay);
+}
+
 function buildSessionConfigPayload() {
   return {
     type: "session_config",
@@ -1911,6 +1980,16 @@ function prunePhoneAuthTokens() {
   }
 }
 
+function revokePhoneAuthTokensForDevice(deviceId) {
+  const targetId = sanitizeDeviceId(deviceId);
+  if (!targetId) return;
+  for (const [token, grant] of phoneAuthTokens.entries()) {
+    if (sanitizeDeviceId(grant?.device_id) === targetId) {
+      phoneAuthTokens.delete(token);
+    }
+  }
+}
+
 function validatePhoneAuthGrant(token) {
   if (typeof token !== "string" || !token) return null;
   const grant = phoneAuthTokens.get(token);
@@ -1920,6 +1999,37 @@ function validatePhoneAuthGrant(token) {
     return null;
   }
   return grant;
+}
+
+function kickDeviceFromDashboard(deviceId) {
+  const targetId = sanitizeDeviceId(deviceId);
+  if (!targetId) return false;
+  const entry = devices.get(targetId);
+  if (!entry) return false;
+
+  revokePhoneAuthTokensForDevice(targetId);
+  const targetWs = entry.ws;
+  recording.target_device_ids = (recording.target_device_ids || []).filter((id) => id !== targetId);
+  if (targetWs && isSocketOpen(targetWs)) {
+    sendWs(targetWs, {
+      type: "force_disconnect",
+      reason: "removed_by_dashboard",
+      message: "Dashboard removed this phone from the session. Tap Start Device to join again."
+    }, { critical: true });
+    setTimeout(() => {
+      try { targetWs.close(4002, "removed_by_dashboard"); } catch {}
+    }, 80);
+  }
+
+  devices.delete(targetId);
+  if (focusedDeviceId === targetId) {
+    focusedDeviceId = firstConnectedDeviceId() || null;
+  }
+  broadcastDeviceList();
+  queueFleetOverviewBroadcast({ immediate: true });
+  broadcastState();
+  broadcastRecordStatuses();
+  return true;
 }
 
 function getClientIp(req) {
@@ -2015,6 +2125,75 @@ function firstDeviceId(sessionRoot) {
 
 function clone(v) {
   return JSON.parse(JSON.stringify(v));
+}
+
+function applySessionConfigUpdate(nextConfigInput) {
+  const previousSessionConfig = clone(sessionConfig);
+  sessionConfig = sanitizeRunConfig(nextConfigInput, sessionConfig);
+  const newlyEnabledPermissions = diffNewlyEnabledPermissions(previousSessionConfig, sessionConfig);
+  for (const [id, d] of devices.entries()) {
+    d.config = clone(sessionConfig);
+    sessionManager.updateDeviceConfig(id, d.config);
+    sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
+  }
+  if (newlyEnabledPermissions.length) {
+    notifyConnectedPhonesPermissionRefresh(newlyEnabledPermissions);
+  }
+  broadcastToDashboards(buildSessionConfigPayload());
+  broadcastState();
+}
+
+function diffNewlyEnabledPermissions(previousConfig, nextConfig) {
+  const prev = capturePermissionToggleState(previousConfig);
+  const next = capturePermissionToggleState(nextConfig);
+  const enabled = [];
+  if (!prev.camera && next.camera) enabled.push("camera");
+  if (!prev.audio && next.audio) enabled.push("audio");
+  if (!prev.location && next.location) enabled.push("location");
+  return enabled;
+}
+
+function capturePermissionToggleState(config) {
+  return {
+    camera: String(config?.streams?.camera?.mode || "off") !== "off",
+    audio: !!config?.streams?.audio?.enabled,
+    location: !!config?.streams?.gps?.enabled
+  };
+}
+
+function notifyConnectedPhonesPermissionRefresh(modalities) {
+  const cleanModalities = [...new Set((Array.isArray(modalities) ? modalities : [])
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter((value) => ["camera", "audio", "location"].includes(value)))];
+  if (!cleanModalities.length) return;
+  const friendly = cleanModalities.map((value) => {
+    if (value === "audio") return "microphone";
+    return value;
+  });
+  const humanList = joinHumanList(friendly);
+  const title = `Dashboard turned on ${humanList}`;
+  const message = `The dashboard just enabled ${humanList}. Tap Enable Now on this phone so Safari can show the permission prompt. If it still gets stuck, use Refresh Page as a fallback.`;
+  const now = Date.now();
+  for (const [, device] of devices.entries()) {
+    if (!device.connected || !isSocketOpen(device.ws)) continue;
+    sendWs(device.ws, {
+      type: "fleet_alert",
+      kind: "permission_refresh",
+      source_device_name: "Dashboard",
+      title,
+      message,
+      modalities: cleanModalities,
+      t_server_ms: now
+    }, { critical: true });
+  }
+}
+
+function joinHumanList(items) {
+  const clean = (Array.isArray(items) ? items : []).filter(Boolean);
+  if (!clean.length) return "permissions";
+  if (clean.length === 1) return clean[0];
+  if (clean.length === 2) return `${clean[0]} and ${clean[1]}`;
+  return `${clean.slice(0, -1).join(", ")}, and ${clean[clean.length - 1]}`;
 }
 
 function allowByRate(deviceEntry, streamKey, targetHz) {

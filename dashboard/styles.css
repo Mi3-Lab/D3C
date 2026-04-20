@@ -1700,6 +1700,137 @@ canvas {
 
 
 /* ================================================================
+   LIVE MAP
+   ================================================================ */
+
+.widget-content.gps-live-content {
+  overflow: hidden;
+}
+
+.gps-live-shell {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.gps-live-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.gps-live-viewport {
+  position: relative;
+  min-height: 220px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: linear-gradient(135deg, #0d1527, #12203b);
+}
+
+.gps-live-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.gps-live-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 12px;
+}
+
+.gps-live-status {
+  max-width: 280px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(8, 12, 20, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #f8fafc;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.gps-live-attribution {
+  align-self: flex-end;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(8, 12, 20, 0.58);
+  color: rgba(226, 232, 240, 0.84);
+  font-size: 10px;
+  pointer-events: auto;
+}
+
+.gps-live-attribution a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.gps-live-attribution a:hover {
+  text-decoration: underline;
+}
+
+.gps-live-legend {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gps-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.gps-live-chip.is-live {
+  border-color: var(--green-border);
+  background: var(--green-bg);
+}
+
+.gps-live-chip.is-stale {
+  border-color: var(--yellow-border);
+  background: var(--yellow-bg);
+}
+
+.gps-live-chip.is-old {
+  opacity: 0.75;
+}
+
+.gps-live-chip-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18);
+}
+
+.gps-live-chip > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+/* ================================================================
    MISC COMPONENTS
    ================================================================ */
 
@@ -1771,6 +1902,155 @@ canvas {
 
 .phone-alert-feedback.warning {
   color: var(--yellow);
+}
+
+.phone-remote-notice {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--yellow-bg);
+  border: 1px solid var(--yellow-border);
+}
+
+.phone-remote-notice strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.phone-remote-notice p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.phone-remote-notice-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.phone-modal-open {
+  overflow: hidden;
+}
+
+.phone-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.phone-modal[hidden] {
+  display: none;
+}
+
+.phone-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 6, 15, 0.72);
+  backdrop-filter: blur(8px);
+}
+
+.phone-modal-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 420px);
+  display: grid;
+  gap: 14px;
+  padding: 20px 18px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 216, 160, 0.26);
+  background:
+    linear-gradient(180deg, rgba(22, 33, 53, 0.98), rgba(10, 16, 28, 0.98)),
+    var(--card);
+  box-shadow: 0 28px 60px rgba(0, 0, 0, 0.45);
+}
+
+.phone-modal-head {
+  display: grid;
+  gap: 4px;
+}
+
+.phone-modal-head h2 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+.phone-modal-copy {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: rgba(226, 232, 240, 0.88);
+}
+
+.phone-modal-meta {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.phone-modal-actions {
+  display: grid;
+  gap: 9px;
+}
+
+.phone-modal-actions .btn {
+  width: 100%;
+  min-height: 46px;
+}
+
+.phone-overview-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.phone-overview-details {
+  padding: 14px 16px;
+}
+
+.phone-overview-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.phone-overview-summary::-webkit-details-marker {
+  display: none;
+}
+
+.phone-overview-copy h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.phone-overview-copy p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.phone-overview-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.phone-overview-viewport {
+  min-height: 260px;
 }
 
 .phone-validation-message {
@@ -3285,6 +3565,156 @@ body {
   margin-top: 12px;
 }
 
+.session-estimate-panel {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 18px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(135deg, rgba(77, 171, 247, 0.10), rgba(99, 230, 190, 0.05)),
+    var(--surface-2);
+}
+
+.session-estimate-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.session-estimate-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.session-estimate-head strong {
+  font-size: clamp(1rem, 1.7vw, 1.45rem);
+  color: var(--ink);
+}
+
+.session-estimate-copy {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.session-capture-card.is-pending {
+  border-style: dashed;
+}
+
+.session-capture-card.is-pending .session-capture-status,
+.session-capture-card.is-pending .session-capture-detail {
+  color: var(--yellow);
+}
+
+.device-roster-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.monitor-widget-content {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.monitor-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.monitor-tab {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--muted);
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease;
+}
+
+.monitor-tab:hover {
+  color: var(--ink);
+}
+
+.monitor-tab.is-active {
+  color: var(--ink);
+  border-color: var(--green-border);
+  background: rgba(99, 230, 190, 0.08);
+}
+
+.monitor-stage {
+  min-height: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.monitor-camera-panel,
+.monitor-map-panel {
+  min-height: 0;
+}
+
+.monitor-camera-panel {
+  display: flex;
+  min-width: 0;
+}
+
+.monitor-camera-panel .camview-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.monitor-stage.is-cameras {
+  grid-template-columns: 1fr;
+}
+
+.monitor-stage.is-cameras .monitor-map-panel {
+  display: none;
+}
+
+.monitor-stage.is-map {
+  grid-template-columns: 1fr;
+}
+
+.monitor-stage.is-map .monitor-camera-panel {
+  display: none;
+}
+
+.monitor-stage.is-map .monitor-map-panel .gps-live-viewport {
+  min-height: 420px;
+}
+
+.monitor-stage.is-combined {
+  grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.2fr);
+  align-items: stretch;
+}
+
+.monitor-stage.is-combined .monitor-map-panel .gps-live-viewport {
+  min-height: 260px;
+  height: 100%;
+}
+
+.monitor-stage.is-combined .monitor-map-panel .gps-live-shell,
+.monitor-stage.is-combined .monitor-camera-panel {
+  height: 100%;
+}
+
+.monitor-stage.is-combined .monitor-camera-panel .camview-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+}
+
 @media (max-width: 1160px) {
   .dashboard-hero {
     grid-template-columns: 1fr;
@@ -3293,6 +3723,10 @@ body {
   .session-capture-grid,
   .device-roster-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .monitor-stage.is-combined {
+    grid-template-columns: 1fr;
   }
 }
 
