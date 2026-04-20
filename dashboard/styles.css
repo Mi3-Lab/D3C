@@ -1282,11 +1282,13 @@ canvas {
 }
 
 .widget-card.widget-cam-full .widget-head {
-  padding: 10px 14px;
+  padding: 16px 18px 12px;
   margin-bottom: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .widget-card.widget-cam-full .widget-content {
+  padding: 14px;
   overflow: hidden;
 }
 
@@ -1303,8 +1305,8 @@ canvas {
   flex: 1;
   display: grid;
   grid-template-columns: repeat(2, minmax(260px, 1fr));
-  gap: 2px;
-  background: #000;
+  gap: 10px;
+  background: transparent;
   min-height: 0;
   align-content: start;
 }
@@ -1368,7 +1370,7 @@ canvas {
 .camview-frame {
   flex: 1;
   position: relative;
-  background: #000;
+  background: linear-gradient(180deg, #050915, #09101d);
   overflow: hidden;
   min-height: 0;
 }
@@ -1391,7 +1393,7 @@ canvas {
   justify-content: center;
   gap: 10px;
   color: rgba(176, 195, 219, 0.25);
-  background: #000;
+  background: linear-gradient(180deg, rgba(5, 9, 21, 0.66), rgba(5, 9, 21, 0.84));
 }
 
 .camview-placeholder p { margin: 0; font-size: 12px; }
@@ -1401,9 +1403,13 @@ canvas {
   align-items: center;
   justify-content: center;
   height: 100%;
+  padding: 24px;
   font-size: 13px;
   color: var(--muted);
-  background: #000;
+  text-align: center;
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.015));
   grid-column: 1 / -1;
 }
 
@@ -1703,7 +1709,8 @@ canvas {
    LIVE MAP
    ================================================================ */
 
-.widget-content.gps-live-content {
+.widget-content.gps-live-content,
+.monitor-panel-body.gps-live-content {
   overflow: hidden;
 }
 
@@ -2605,9 +2612,12 @@ input[type="file"],
 }
 
 .topbar,
-.workspace-bar,
-.widget-area {
+.workspace-bar {
   background: var(--bg);
+}
+
+.widget-area {
+  background: transparent;
 }
 
 .topbar,
@@ -2851,8 +2861,9 @@ td,
 }
 
 .widget-card.widget-cam-full {
-  background: #09101d;
-  border-color: #202b45;
+  background: linear-gradient(180deg, rgba(13, 21, 38, 0.96), rgba(9, 16, 29, 0.96));
+  border-color: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
 }
 
 .widget-card.widget-control,
@@ -3459,15 +3470,15 @@ body {
 }
 
 .camview-grid {
-  gap: 10px;
-  padding: 10px;
+  gap: 12px;
+  padding: 0;
   background: transparent;
 }
 
 .camview-card {
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.07);
-  background: rgba(6, 11, 20, 0.94);
+  background: linear-gradient(180deg, rgba(10, 17, 31, 0.96), rgba(6, 11, 20, 0.96));
 }
 
 .camview-header {
@@ -3622,7 +3633,7 @@ body {
 .monitor-widget-content {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
+  gap: 14px;
   min-height: 0;
   overflow: hidden;
 }
@@ -3631,6 +3642,7 @@ body {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  padding: 0 2px;
 }
 
 .monitor-tab {
@@ -3658,16 +3670,96 @@ body {
 .monitor-stage {
   min-height: 0;
   display: grid;
-  gap: 12px;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.015));
 }
 
+.monitor-panel,
 .monitor-camera-panel,
 .monitor-map-panel {
   min-height: 0;
 }
 
-.monitor-camera-panel {
+.monitor-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: linear-gradient(180deg, rgba(11, 18, 32, 0.62), rgba(8, 13, 24, 0.56));
+}
+
+.monitor-panel-head {
+  display: grid;
+  gap: 8px;
+}
+
+.monitor-panel-headline {
   display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.monitor-panel-title-wrap {
+  display: grid;
+  gap: 4px;
+}
+
+.monitor-panel-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.monitor-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.monitor-panel-copy {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.monitor-panel-meta {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.monitor-panel-body {
+  min-height: 0;
+  min-width: 0;
+}
+
+.monitor-camera-panel {
+  min-width: 0;
+}
+
+.monitor-camera-panel .monitor-panel-body {
+  display: flex;
+  min-width: 0;
+}
+
+.monitor-map-panel .monitor-panel-body {
   min-width: 0;
 }
 
@@ -3684,6 +3776,10 @@ body {
   display: none;
 }
 
+.monitor-stage.is-cameras .monitor-camera-panel .camview-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+}
+
 .monitor-stage.is-map {
   grid-template-columns: 1fr;
 }
@@ -3693,16 +3789,16 @@ body {
 }
 
 .monitor-stage.is-map .monitor-map-panel .gps-live-viewport {
-  min-height: 420px;
+  min-height: 460px;
 }
 
 .monitor-stage.is-combined {
-  grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.2fr);
+  grid-template-columns: minmax(320px, 0.92fr) minmax(0, 1.28fr);
   align-items: stretch;
 }
 
 .monitor-stage.is-combined .monitor-map-panel .gps-live-viewport {
-  min-height: 260px;
+  min-height: 320px;
   height: 100%;
 }
 
@@ -3712,7 +3808,7 @@ body {
 }
 
 .monitor-stage.is-combined .monitor-camera-panel .camview-grid {
-  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
 }
 
 @media (max-width: 1160px) {
@@ -3771,7 +3867,7 @@ body {
 
   .camview-grid {
     grid-template-columns: 1fr;
-    padding: 8px;
+    padding: 0;
   }
 
   .join-banner-right {

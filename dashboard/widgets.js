@@ -337,17 +337,26 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         let lastFormKey = "";
         const pendingCaptureToggles = new Map();
         const pendingCaptureTimers = new Map();
+        const CAPTURE_TOGGLE_TIMEOUT_MS = 4000;
+
+        function clearCaptureTogglePending(key) {
+          const cleanKey = String(key || "");
+          const existing = pendingCaptureTimers.get(cleanKey);
+          if (existing) clearTimeout(existing);
+          pendingCaptureTimers.delete(cleanKey);
+          pendingCaptureToggles.delete(cleanKey);
+        }
 
         function markCaptureTogglePending(key, nextEnabled) {
-          pendingCaptureToggles.set(String(key || ""), !!nextEnabled);
-          const existing = pendingCaptureTimers.get(key);
+          const cleanKey = String(key || "");
+          pendingCaptureToggles.set(cleanKey, !!nextEnabled);
+          const existing = pendingCaptureTimers.get(cleanKey);
           if (existing) clearTimeout(existing);
           const timer = setTimeout(() => {
-            pendingCaptureTimers.delete(key);
-            pendingCaptureToggles.delete(key);
+            clearCaptureTogglePending(cleanKey);
             onStateChange();
-          }, 900);
-          pendingCaptureTimers.set(key, timer);
+          }, CAPTURE_TOGGLE_TIMEOUT_MS);
+          pendingCaptureTimers.set(cleanKey, timer);
           onStateChange();
         }
 
@@ -355,7 +364,12 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           const st = store.getState();
           const cfg = mergeRunConfig(st.sessionConfig || defaultRunConfig);
           const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
+          const controlsDisabled = isActive || !st.wsConnected;
           const joinCode = String(st.sessionJoinCode || "");
+          const captureEnabledState = getPrimaryCaptureToggleState(cfg);
+          for (const [key, targetEnabled] of [...pendingCaptureToggles.entries()]) {
+            if (captureEnabledState[key] === !!targetEnabled) clearCaptureTogglePending(key);
+          }
           joinBannerCode.textContent = joinCode || "——";
 
           const online = (st.deviceList || []).filter((d) => d?.connected !== false).length;
@@ -370,13 +384,13 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             <div class="session-estimate-copy">${escapeHtml(`${captureItems.join(", ")} · ${estimates.bandwidthMbps.toFixed(2)} Mbps/device live`)}</div>
           `;
 
-          renderPrimaryCaptureToggles(captureGrid, cfg, isActive, updateSessionCfg, pendingCaptureToggles, markCaptureTogglePending);
+          renderPrimaryCaptureToggles(captureGrid, cfg, controlsDisabled, updateSessionCfg, pendingCaptureToggles, markCaptureTogglePending);
 
           const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
           const isStopping = phase === "STOPPING";
           const buttonText = ctaBtn.querySelector(".button-text");
           const buttonSpinner = ctaBtn.querySelector(".button-spinner");
-          ctaBtn.disabled = isStopping || actionPending || (!isActive && online === 0);
+          ctaBtn.disabled = isStopping || actionPending || !st.wsConnected || (!isActive && online === 0);
           if (buttonText) buttonText.textContent = isActive ? "Stop Recording" : "Start Recording";
           ctaBtn.className = isActive ? "btn btn-danger" : "btn btn-success";
           ctaBtn.classList.add("primary", "large");
@@ -391,6 +405,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
           const formKey = JSON.stringify({
             active: isActive,
+            ws_connected: !!st.wsConnected,
             imu_enabled: !!cfg.streams.imu.enabled,
             imu_rate: Number(cfg.streams.imu.rate_hz || 30),
             cam_enabled: String(cfg.streams.camera.mode || "off") !== "off",
@@ -408,7 +423,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           form.innerHTML = "";
 
           const authBody = addFormSection(form, "Join Access", "Change the code that phones use to join this session.");
-          addTextInput(authBody, "Join code", joinCode, (v) => updateJoinCode(v), isActive, "e.g. A1B2C3");
+          addTextInput(authBody, "Join code", joinCode, (v) => updateJoinCode(v), controlsDisabled, "e.g. A1B2C3");
           addInfoLine(authBody, "The banner above always shows the code currently in use.");
 
           const captureDetailBody = addFormSection(form, "Capture Detail", "Adjust stream quality for any capture types that are turned on above.");
@@ -419,7 +434,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               { value: "10", label: "Light (10 Hz)" },
               { value: "30", label: "Balanced (30 Hz)" },
               { value: "60", label: "High (60 Hz)" }
-            ], (v) => updateSessionCfg((c) => c.streams.imu.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.imu.rate_hz = Number(v)), controlsDisabled);
           }
 
           if (cfg.streams.camera.mode !== "off") {
@@ -429,7 +444,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               { value: "10", label: "Balanced (10 FPS)" },
               { value: "15", label: "Smooth (15 FPS)" },
               { value: "30", label: "High (30 FPS)" }
-            ], (v) => updateSessionCfg((c) => c.streams.camera.fps = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.camera.fps = Number(v)), controlsDisabled);
           }
 
           if (cfg.streams.audio.enabled) {
@@ -438,7 +453,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               { value: "5", label: "Light (5 Hz)" },
               { value: "10", label: "Balanced (10 Hz)" },
               { value: "20", label: "High (20 Hz)" }
-            ], (v) => updateSessionCfg((c) => c.streams.audio.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.audio.rate_hz = Number(v)), controlsDisabled);
           }
 
           if (cfg.streams.gps.enabled) {
@@ -447,33 +462,36 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               { value: "1", label: "Battery saver (1 Hz)" },
               { value: "2", label: "Balanced (2 Hz)" },
               { value: "5", label: "High (5 Hz)" }
-            ], (v) => updateSessionCfg((c) => c.streams.gps.rate_hz = Number(v)), isActive);
+            ], (v) => updateSessionCfg((c) => c.streams.gps.rate_hz = Number(v)), controlsDisabled);
           }
           if (!hasDetailControl) {
             addInfoLine(captureDetailBody, "Turn on a capture type above to reveal its detail controls here.");
           }
         };
 
-        function updateSessionCfg(mutator) {
+        function updateSessionCfg(mutator, { optimistic = true } = {}) {
           const st = store.getState();
           const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
-          if (isActive) return;
-          const next = mergeRunConfig(st.sessionConfig || defaultRunConfig);
+          if (isActive || !st.wsConnected) return false;
+          const current = mergeRunConfig(st.sessionConfig || defaultRunConfig);
+          const next = mergeRunConfig(current);
           mutator(next);
-          store.setState({ sessionConfig: next, sessionState: "draft" });
+          if (JSON.stringify(next) === JSON.stringify(current)) return false;
+          if (optimistic) store.setState({ sessionConfig: next, sessionState: "draft" });
           sendJson({ type: "session_config_update", sessionConfig: next });
+          return true;
         }
 
         function updateJoinCode(value) {
           const st = store.getState();
           const isActive = (st.sessionState || "draft") === "active" || !!st.recording?.active;
-          if (isActive) return;
+          if (isActive || !st.wsConnected) return;
           const next = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
           store.setState({ sessionJoinCode: next });
           sendJson({ type: "session_auth_update", joinCode: next });
         }
 
-        const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode }), onStateChange);
+        const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode, wsConnected: s.wsConnected }), onStateChange);
         onStateChange();
 
         return () => {
@@ -631,24 +649,78 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         content.closest(".widget-card")?.classList.add("widget-cam-full");
         content.classList.add("cam-content", "monitor-widget-content");
 
+        const createMonitorPanel = ({ className, title, copy, meta }) => {
+          const panel = document.createElement("section");
+          panel.className = `monitor-panel ${className}`;
+
+          const head = document.createElement("div");
+          head.className = "monitor-panel-head";
+
+          const headline = document.createElement("div");
+          headline.className = "monitor-panel-headline";
+
+          const titleWrap = document.createElement("div");
+          titleWrap.className = "monitor-panel-title-wrap";
+
+          const label = document.createElement("span");
+          label.className = "monitor-panel-label";
+          label.textContent = "Viewpoint";
+
+          const heading = document.createElement("strong");
+          heading.className = "monitor-panel-title";
+          heading.textContent = title;
+
+          titleWrap.append(label, heading);
+          headline.appendChild(titleWrap);
+
+          let metaEl = null;
+          if (meta) {
+            metaEl = document.createElement("span");
+            metaEl.className = "monitor-panel-meta";
+            metaEl.textContent = meta;
+            headline.appendChild(metaEl);
+          }
+
+          const desc = document.createElement("p");
+          desc.className = "monitor-panel-copy";
+          desc.textContent = copy;
+
+          const body = document.createElement("div");
+          body.className = "monitor-panel-body";
+
+          head.append(headline, desc);
+          panel.append(head, body);
+
+          return { panel, body, titleEl: heading, copyEl: desc, metaEl };
+        };
+
         const tabs = document.createElement("div");
         tabs.className = "monitor-tabs";
         tabs.setAttribute("role", "tablist");
         const stage = document.createElement("div");
         stage.className = "monitor-stage is-cameras";
 
-        const mapPanel = document.createElement("section");
-        mapPanel.className = "monitor-map-panel gps-live-content";
+        const mapPanel = createMonitorPanel({
+          className: "monitor-map-panel",
+          title: "Live Map",
+          copy: "Latest GPS positions from connected phones.",
+          meta: "Live GPS"
+        });
+        mapPanel.body.classList.add("gps-live-content");
 
-        const cameraPanel = document.createElement("section");
-        cameraPanel.className = "monitor-camera-panel";
+        const cameraPanel = createMonitorPanel({
+          className: "monitor-camera-panel",
+          title: "Camera Wall",
+          copy: "Live previews from connected phones.",
+          meta: "0 feeds"
+        });
 
-        stage.append(mapPanel, cameraPanel);
+        stage.append(mapPanel.panel, cameraPanel.panel);
         content.append(tabs, stage);
 
         let activeMode = "cameras";
         const tabButtons = new Map();
-        const mapView = mountGpsLivePanel(mapPanel, {
+        const mapView = mountGpsLivePanel(mapPanel.body, {
           store,
           getDeviceId: () => getWidgetDevice(ctx.instance.settings)
         });
@@ -681,7 +753,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const empty = document.createElement("div");
         empty.className = "camview-empty";
         empty.textContent = "No devices connected";
-        cameraPanel.appendChild(grid);
+        cameraPanel.body.appendChild(grid);
         grid.appendChild(empty);
 
         function destroyCard(deviceId) {
@@ -755,6 +827,21 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           const visibleDevices = selectedDeviceId
             ? (st.deviceList || []).filter((summary) => String(summary?.device_id || "") === selectedDeviceId)
             : (st.deviceList || []);
+          const selectedSummary = selectedDeviceId ? visibleDevices[0] : null;
+          cameraPanel.titleEl.textContent = selectedDeviceId
+            ? String(selectedSummary?.deviceName || selectedDeviceId)
+            : "Camera Wall";
+          cameraPanel.copyEl.textContent = selectedDeviceId
+            ? "Focused live preview for the selected phone."
+            : "Live previews from connected phones.";
+          if (cameraPanel.metaEl) {
+            const count = visibleDevices.length;
+            cameraPanel.metaEl.textContent = `${count} ${count === 1 ? "feed" : "feeds"}`;
+          }
+          mapPanel.copyEl.textContent = selectedDeviceId
+            ? "Latest GPS path for the selected phone."
+            : "Latest GPS positions from connected phones.";
+          if (mapPanel.metaEl) mapPanel.metaEl.textContent = selectedDeviceId ? "Focused GPS" : "Live GPS";
           const activeIds = new Set();
           const now = Date.now();
 
@@ -1749,16 +1836,25 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg, pe
     action.addEventListener("click", () => {
       if (disabled || isPending) return;
       const targetEnabled = !enabled;
-      onToggleStart?.(item.key, targetEnabled);
-      updateSessionCfg((nextCfg) => {
+      const applied = updateSessionCfg((nextCfg) => {
         const currentEnabled = item.isEnabled(nextCfg);
         item.toggle(nextCfg, !currentEnabled);
-      });
+      }, { optimistic: false });
+      if (applied) onToggleStart?.(item.key, targetEnabled);
     });
 
     card.append(copy, action);
     parent.appendChild(card);
   }
+}
+
+function getPrimaryCaptureToggleState(cfg) {
+  return {
+    imu: !!cfg?.streams?.imu?.enabled,
+    camera: String(cfg?.streams?.camera?.mode || "off") !== "off",
+    audio: !!cfg?.streams?.audio?.enabled,
+    location: !!cfg?.streams?.gps?.enabled
+  };
 }
 
 function addFormSection(parent, title, description = "") {
