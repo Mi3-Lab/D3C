@@ -58,7 +58,7 @@ function bindUi() {
   });
 
   els.refreshBtn?.addEventListener("click", () => {
-    void refreshAll({ forceFlash: { tone: "info", message: "Refreshing dataset library..." } });
+    void refreshAll({ forceFlash: { tone: "info", message: "Refreshing..." } });
   });
 
   els.filterInput?.addEventListener("input", () => {
@@ -93,7 +93,7 @@ async function loadOverview() {
     state.lastRefreshAtMs = Date.now();
   } catch (error) {
     if (token !== overviewRequestToken) return;
-    state.flash = { tone: "error", message: `Could not refresh dataset list: ${String(error.message || error)}` };
+    state.flash = { tone: "error", message: `Refresh failed: ${String(error.message || error)}` };
   } finally {
     if (token === overviewRequestToken) {
       state.loadingOverview = false;
@@ -142,7 +142,7 @@ async function loadSelectedDetail() {
     state.manifest = null;
     state.meta = null;
     state.sync = null;
-    state.flash = { tone: "error", message: `Could not load dataset details: ${String(error.message || error)}` };
+    state.flash = { tone: "error", message: `Load failed: ${String(error.message || error)}` };
   } finally {
     if (token === detailRequestToken) {
       state.loadingDetail = false;
@@ -191,14 +191,14 @@ function syncSelectionToUrl() {
 function updateRefreshStatus() {
   if (!els.refreshStatus) return;
   if (state.loadingOverview) {
-    els.refreshStatus.textContent = "Refreshing dataset library...";
+    els.refreshStatus.textContent = "Refreshing...";
     return;
   }
   if (!state.lastRefreshAtMs) {
-    els.refreshStatus.textContent = `Auto refresh every ${Math.round(AUTO_REFRESH_MS / 1000)}s`;
+    els.refreshStatus.textContent = `${Math.round(AUTO_REFRESH_MS / 1000)}s auto`;
     return;
   }
-  els.refreshStatus.textContent = `Updated ${formatTime(state.lastRefreshAtMs)} · Auto refresh ${Math.round(AUTO_REFRESH_MS / 1000)}s`;
+  els.refreshStatus.textContent = `Updated ${formatTime(state.lastRefreshAtMs)}`;
 }
 
 function renderOverview() {
@@ -209,22 +209,22 @@ function renderOverview() {
     {
       label: "Sessions",
       value: String(state.storage?.session_count ?? state.summaries.length ?? 0),
-      hint: state.loadingOverview ? "Refreshing session folders..." : "Recorded datasets on disk"
+      hint: ""
     },
     {
-      label: "Storage Used",
+      label: "Used",
       value: formatStorageGb(state.storage?.sessions_size_gb),
-      hint: "Total size under datasets/"
+      hint: ""
     },
     {
-      label: "Free Disk",
+      label: "Free",
       value: formatBytes(state.storage?.free_disk_bytes),
-      hint: "Remaining free space on this machine"
+      hint: ""
     },
     {
-      label: "Latest Session",
+      label: "Latest",
       value: newest ? formatSessionLabel(newest.id) : "None",
-      hint: activeCount ? `${activeCount} active ${activeCount === 1 ? "recording" : "recordings"}` : "No active recordings"
+      hint: activeCount ? `${activeCount} live` : ""
     }
   ];
 
@@ -234,7 +234,7 @@ function renderOverview() {
       <div class="status-value">
         <span class="status-text">${escapeHtml(card.value)}</span>
       </div>
-      <p class="datasets-overview-hint">${escapeHtml(card.hint)}</p>
+      ${card.hint ? `<p class="datasets-overview-hint">${escapeHtml(card.hint)}</p>` : ""}
     </article>
   `).join("");
 }
@@ -245,8 +245,7 @@ function renderList() {
   if (!filtered.length) {
     els.list.innerHTML = `
       <div class="datasets-empty">
-        <strong>No datasets found</strong>
-        <p>${state.filter ? "Try a different filter." : "Start a recording and the session folder will appear here."}</p>
+        <strong>${state.filter ? "No matches" : "No sessions"}</strong>
       </div>
     `;
     return;
@@ -254,18 +253,15 @@ function renderList() {
 
   els.list.innerHTML = filtered.map((summary) => {
     const active = summary.id === state.selectedSessionId;
-    const modalities = Array.isArray(summary.requested_modalities) && summary.requested_modalities.length
-      ? summary.requested_modalities.map(formatModalityLabel).join(", ")
-      : "No capture plan recorded";
+    const title = summary.session_name || formatSessionLabel(summary.id);
     const exportText = summary.export_count ? `${summary.export_count} exports` : "Raw files only";
-    const deviceNames = Object.values(summary.device_names || {});
-    const deviceText = deviceNames.length ? deviceNames.join(", ") : `${summary.device_count || 0} device${summary.device_count === 1 ? "" : "s"}`;
+    const deviceCount = summary.device_count || Object.keys(summary.device_names || {}).length || 0;
+    const deviceText = `${deviceCount} device${deviceCount === 1 ? "" : "s"}`;
     return `
       <button type="button" class="datasets-list-item${active ? " is-active" : ""}" data-session-id="${escapeHtml(summary.id)}">
         <div class="datasets-list-head">
           <div>
-            <strong>${escapeHtml(formatSessionLabel(summary.id))}</strong>
-            <div class="datasets-list-subtitle">${escapeHtml(summary.session_name || summary.id)}</div>
+            <strong>${escapeHtml(title)}</strong>
           </div>
           <div class="datasets-list-badges">
             ${summary.active ? '<span class="datasets-badge is-live">Live</span>' : ""}
@@ -273,7 +269,6 @@ function renderList() {
           </div>
         </div>
         <div class="datasets-list-meta">${escapeHtml(formatDate(summary.created_at_iso))} · ${escapeHtml(deviceText)}</div>
-        <div class="datasets-list-copy">${escapeHtml(modalities)}</div>
       </button>
     `;
   }).join("");
@@ -298,8 +293,7 @@ function renderDetail() {
   if (!summary) {
     els.detail.innerHTML = `
       <div class="datasets-empty datasets-detail-empty">
-        <strong>No dataset selected</strong>
-        <p>The dataset library will populate automatically as session folders appear.</p>
+        <strong>No session</strong>
       </div>
     `;
     return;
@@ -316,24 +310,23 @@ function renderDetail() {
   const detailMetrics = buildDetailMetrics(summary, manifest, meta, sync);
   const exportLinks = buildExportLinks(manifest);
   const rawLinks = buildRawLinks(manifest);
-  const deviceCards = buildDeviceCards(summary, meta, sync, selectedDeviceId);
+  const deviceOptions = buildDeviceOptions(summary, manifest);
+  const selectedDeviceName = selectedDeviceId ? formatDeviceName(summary, selectedDeviceId) : "";
 
   els.detail.innerHTML = `
     <div class="datasets-detail-head">
       <div class="datasets-detail-copy">
-        <span class="workspace-bar-label">Dataset</span>
         <h2>${escapeHtml(summary.session_name || summary.id)}</h2>
-        <p class="workspace-panel-text">${escapeHtml(formatSessionDescription(summary, meta))}</p>
       </div>
       <div class="datasets-detail-actions">
         <button type="button" class="btn btn-alt btn-small" data-action="refresh-detail">Refresh</button>
-        <button type="button" class="btn btn-alt btn-small" data-action="generate-exports"${state.actionBusy ? " disabled" : ""}>Generate Exports</button>
+        <button type="button" class="btn btn-alt btn-small" data-action="generate-exports"${state.actionBusy ? " disabled" : ""}>Build Exports</button>
         <button type="button" class="btn btn-alt btn-small" data-action="delete-dataset"${state.actionBusy ? " disabled" : ""}>Delete</button>
       </div>
     </div>
 
     ${state.flash ? `<div class="datasets-flash is-${escapeHtml(state.flash.tone || "info")}">${escapeHtml(state.flash.message || "")}</div>` : ""}
-    ${state.loadingDetail ? `<div class="datasets-flash is-info">Refreshing dataset details...</div>` : ""}
+    ${state.loadingDetail ? '<div class="datasets-flash is-info">Loading...</div>' : ""}
 
     <div class="kv-grid datasets-detail-metrics">
       ${detailMetrics.map((item) => `
@@ -347,62 +340,49 @@ function renderDetail() {
     <div class="datasets-detail-grid">
       <section class="datasets-panel datasets-preview-panel">
         <div class="datasets-panel-head">
-          <div>
-            <span class="workspace-bar-label">Preview</span>
-            <h3>Session Media</h3>
-          </div>
-          <span class="datasets-panel-meta">${escapeHtml(previewUrl ? "Preview ready" : "No video export yet")}</span>
+          <h3>Preview</h3>
+          <span class="datasets-panel-meta">${escapeHtml(previewUrl ? "Ready" : "Pending")}</span>
         </div>
         ${previewUrl
           ? `<video class="datasets-preview-video" controls preload="metadata" src="${escapeHtml(previewUrl)}"></video>`
-          : `<div class="datasets-preview-empty">No multiview or camera video is available yet for this session.</div>`}
+          : '<div class="datasets-preview-empty">No preview yet.</div>'}
       </section>
 
       <section class="datasets-panel">
         <div class="datasets-panel-head">
-          <div>
-            <span class="workspace-bar-label">Exports</span>
-            <h3>Artifacts</h3>
-          </div>
+          <h3>Exports</h3>
           <span class="datasets-panel-meta">${escapeHtml(exportLinks.length ? `${exportLinks.length} files` : "Pending")}</span>
         </div>
-        <div class="datasets-link-grid">
+        <div class="datasets-table-wrap">
           ${exportLinks.length
-            ? exportLinks.map((link) => renderLinkCard(link)).join("")
-            : '<div class="datasets-inline-empty">No exported artifacts yet. Use Generate Exports to build them.</div>'}
+            ? renderLinkTable(exportLinks, { nameLabel: "Export" })
+            : '<div class="datasets-inline-empty">No exports.</div>'}
         </div>
       </section>
 
       <section class="datasets-panel">
         <div class="datasets-panel-head">
-          <div>
-            <span class="workspace-bar-label">Devices</span>
-            <h3>Recorded Phones</h3>
-          </div>
+          <h3>Devices</h3>
           <span class="datasets-panel-meta">${escapeHtml(`${deviceIds.length} device${deviceIds.length === 1 ? "" : "s"}`)}</span>
         </div>
-        <div class="datasets-device-grid">
-          ${deviceCards.length
-            ? deviceCards.map((card) => `
-              <button type="button" class="datasets-device-card${card.deviceId === selectedDeviceId ? " is-active" : ""}" data-device-id="${escapeHtml(card.deviceId)}">
-                <div class="datasets-device-head">
-                  <strong>${escapeHtml(card.name)}</strong>
-                  <span class="datasets-badge">${escapeHtml(card.status)}</span>
-                </div>
-                <div class="datasets-device-sub">${escapeHtml(card.deviceId)}</div>
-                <div class="datasets-device-copy">${escapeHtml(card.copy)}</div>
-              </button>
+        <div class="datasets-device-tabs">
+          ${deviceOptions.length
+            ? deviceOptions.map((device) => `
+              <button
+                type="button"
+                class="datasets-device-tab${device.deviceId === selectedDeviceId ? " is-active" : ""}"
+                data-device-id="${escapeHtml(device.deviceId)}"
+                title="${escapeHtml(device.deviceId)}"
+              >${escapeHtml(device.name)}</button>
             `).join("")
-            : '<div class="datasets-inline-empty">No device details found for this session.</div>'}
+            : '<div class="datasets-inline-empty">No devices.</div>'}
         </div>
       </section>
 
       <section class="datasets-panel datasets-streams-panel">
         <div class="datasets-panel-head">
-          <div>
-            <span class="workspace-bar-label">Raw Files</span>
-            <h3>${escapeHtml(selectedDeviceId || "Device Streams")}</h3>
-          </div>
+          <h3>Files</h3>
+          ${selectedDeviceName && deviceIds.length <= 1 ? `<span class="datasets-panel-meta">${escapeHtml(selectedDeviceName)}</span>` : ""}
           ${deviceIds.length > 1 ? `
             <label class="datasets-device-select">
               Device
@@ -412,10 +392,10 @@ function renderDetail() {
             </label>
           ` : ""}
         </div>
-        <div class="datasets-link-grid">
+        <div class="datasets-table-wrap">
           ${rawLinks.length
-            ? rawLinks.map((link) => renderLinkCard(link)).join("")
-            : '<div class="datasets-inline-empty">No stream files are available for the selected device yet.</div>'}
+            ? renderLinkTable(rawLinks, { nameLabel: "File" })
+            : '<div class="datasets-inline-empty">No files.</div>'}
         </div>
       </section>
     </div>
@@ -423,7 +403,7 @@ function renderDetail() {
 
   const refreshBtn = els.detail.querySelector('[data-action="refresh-detail"]');
   refreshBtn?.addEventListener("click", () => {
-    state.flash = { tone: "info", message: "Refreshing dataset details..." };
+    state.flash = { tone: "info", message: "Loading..." };
     renderDetail();
     void loadSelectedDetail();
   });
@@ -458,7 +438,7 @@ function renderDetail() {
 
 async function handleGenerateExports(sessionId) {
   state.actionBusy = "exports";
-  state.flash = { tone: "info", message: "Generating exports..." };
+  state.flash = { tone: "info", message: "Building..." };
   renderDetail();
   try {
     await fetchJson(`/api/datasets/${encodeURIComponent(sessionId)}/exports`, {
@@ -466,10 +446,10 @@ async function handleGenerateExports(sessionId) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({})
     });
-    state.flash = { tone: "success", message: "Exports generated successfully." };
+    state.flash = { tone: "success", message: "Exports ready." };
     await refreshAll();
   } catch (error) {
-    state.flash = { tone: "error", message: `Export generation failed: ${String(error.message || error)}` };
+    state.flash = { tone: "error", message: `Build failed: ${String(error.message || error)}` };
     renderDetail();
   } finally {
     state.actionBusy = "";
@@ -503,11 +483,10 @@ async function handleDeleteDataset(sessionId) {
 function buildDetailMetrics(summary, manifest, meta, sync) {
   const requested = Array.isArray(summary.requested_modalities) && summary.requested_modalities.length
     ? summary.requested_modalities.map(formatModalityLabel).join(", ")
-    : "Unknown";
-  const updatedAt = summary.updated_at_ms ? formatDate(summary.updated_at_ms) : "Unknown";
+    : "-";
+  const updatedAt = summary.updated_at_ms ? formatDate(summary.updated_at_ms) : "-";
   return [
-    { label: "Session", value: formatSessionLabel(summary.id) },
-    { label: "Created", value: formatDate(summary.created_at_iso) },
+    { label: "Added", value: formatDate(summary.created_at_iso) },
     { label: "Updated", value: updatedAt },
     { label: "Devices", value: String(summary.device_count || getAvailableDeviceIds(summary, manifest, meta, sync).length || 0) },
     { label: "Capture", value: requested },
@@ -558,24 +537,12 @@ function buildRawLinks(manifest) {
   return items.filter((item) => !!item.href);
 }
 
-function buildDeviceCards(summary, meta, sync, selectedDeviceId) {
-  const ids = getAvailableDeviceIds(summary, state.manifest, meta, sync);
+function buildDeviceOptions(summary, manifest) {
+  const ids = getAvailableDeviceIds(summary, manifest, null, null);
   return ids.map((deviceId) => {
-    const syncDevice = sync?.devices?.[deviceId] || {};
-    const runConfig = meta?.devices?.[deviceId]?.runConfig || {};
-    const alerts = Array.isArray(syncDevice.alerts) ? syncDevice.alerts : [];
-    const modalities = [];
-    if (runConfig?.streams?.imu?.enabled) modalities.push("motion");
-    if (String(runConfig?.streams?.camera?.mode || "off") !== "off") modalities.push("camera");
-    if (runConfig?.streams?.gps?.enabled) modalities.push("location");
-    if (runConfig?.streams?.audio?.enabled) modalities.push("audio");
     return {
       deviceId,
-      name: summary.device_names?.[deviceId] || syncDevice.device_name || deviceId,
-      status: syncDevice.connection_status || (deviceId === selectedDeviceId ? "selected" : "recorded"),
-      copy: alerts.length
-        ? alerts.map((alert) => String(alert.message || alert.code || "alert")).join(" · ")
-        : (modalities.length ? `${modalities.join(", ")} captured` : "Recorded in this session")
+      name: formatDeviceName(summary, deviceId)
     };
   });
 }
@@ -613,24 +580,35 @@ function pickPreviewUrl(manifest) {
     || "";
 }
 
-function renderLinkCard(link) {
+function renderLinkTable(links, { nameLabel = "Name" } = {}) {
   return `
-    <a class="datasets-link-card" href="${escapeHtml(link.href)}" target="_blank" rel="noreferrer noopener">
-      <span class="datasets-link-kind">${escapeHtml(link.kind.toUpperCase())}</span>
-      <strong>${escapeHtml(link.label)}</strong>
-      <span class="datasets-link-meta">${escapeHtml(link.href.split("/").slice(-1)[0] || link.href)}</span>
-    </a>
+    <table class="datasets-link-table">
+      <thead>
+        <tr>
+          <th scope="col">${escapeHtml(nameLabel)}</th>
+          <th scope="col">Type</th>
+          <th scope="col">View</th>
+          <th scope="col">Download</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${links.map((link) => `
+          <tr>
+            <td>${escapeHtml(link.label)}</td>
+            <td>${escapeHtml(link.kind.toUpperCase())}</td>
+            <td><a class="datasets-link-action" href="${escapeHtml(link.href)}" target="_blank" rel="noreferrer noopener">View</a></td>
+            <td>${link.kind === "dir"
+              ? '<span class="datasets-link-muted">-</span>'
+              : `<a class="datasets-link-action" href="${escapeHtml(link.href)}" download>Download</a>`}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
   `;
 }
 
-function formatSessionDescription(summary, meta) {
-  const modalities = Array.isArray(summary.requested_modalities) && summary.requested_modalities.length
-    ? summary.requested_modalities.map(formatModalityLabel).join(", ")
-    : "capture plan unavailable";
-  const targetCount = Array.isArray(meta?.target_device_ids) && meta.target_device_ids.length
-    ? meta.target_device_ids.length
-    : summary.device_count || 0;
-  return `${targetCount} recorded ${targetCount === 1 ? "device" : "devices"} · ${modalities} · ${summary.recording_mode || "all"} mode`;
+function formatDeviceName(summary, deviceId) {
+  return summary.device_names?.[deviceId] || deviceId;
 }
 
 function formatSessionLabel(id) {

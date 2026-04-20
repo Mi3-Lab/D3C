@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>D3C / Dataset Library</title>
+  <title>D3C / Datasets</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" />
@@ -16,7 +16,7 @@
         <span class="topbar-logo">D3C</span>
         <div class="topbar-copy">
           <span class="topbar-kicker">Distributed Driving Data Collective</span>
-          <span class="topbar-title">Dataset Library</span>
+          <span class="topbar-title">Datasets</span>
         </div>
       </div>
       <nav class="topbar-nav" aria-label="Dashboard sections">
@@ -25,7 +25,7 @@
       </nav>
     </div>
     <div class="topbar-right">
-      <span id="datasetsRefreshStatus" class="topbar-note">Auto refresh every 5s</span>
+      <span id="datasetsRefreshStatus" class="topbar-note">5s auto</span>
       <button id="logoutBtn" class="btn btn-alt btn-small">Log Out</button>
     </div>
   </header>
@@ -33,11 +33,10 @@
   <main class="dashboard-main datasets-page-main">
     <section class="dashboard-hero datasets-hero">
       <div class="dashboard-hero-copy">
-        <h1>Dataset Library</h1>
-        <p class="dashboard-hero-text">Recorded sessions, exports, and raw stream artifacts update here automatically as data lands on disk.</p>
+        <h1>Datasets</h1>
       </div>
       <div class="datasets-hero-actions">
-        <button id="refreshDatasetsBtn" class="btn btn-small">Refresh Now</button>
+        <button id="refreshDatasetsBtn" class="btn btn-small">Refresh</button>
       </div>
     </section>
 
@@ -47,13 +46,10 @@
       <aside class="card datasets-sidebar">
         <div class="datasets-sidebar-head">
           <div class="datasets-sidebar-copy">
-            <span class="workspace-bar-label">Sessions</span>
-            <h2>Collected Data</h2>
-            <p class="workspace-panel-text">Newest session folders appear automatically while recording or exporting.</p>
+            <h2>Sessions</h2>
           </div>
           <label class="datasets-filter-label">
-            Filter
-            <input id="datasetsFilterInput" type="text" placeholder="Search by session or device" />
+            <input id="datasetsFilterInput" type="text" placeholder="Search" aria-label="Search sessions" />
           </label>
         </div>
         <div id="datasetsList" class="datasets-list"></div>

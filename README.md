@@ -87,6 +87,12 @@ With dashboard password protection enabled:
 DASHBOARD_PASSWORD='replace-with-a-strong-password' ./scripts/start-quick-tunnel.sh
 ```
 
+If your network blocks QUIC/UDP, force HTTP/2:
+
+```bash
+CLOUDFLARED_PROTOCOL=http2 ./scripts/start-quick-tunnel.sh
+```
+
 Once running, the script prints:
 
 ```
@@ -161,6 +167,7 @@ node scripts/backfill-session-exports.js --force
 |---|---|
 | `DASHBOARD_PASSWORD` | Enables dashboard login when set |
 | `CLOUDFLARED_BIN` | Path to `cloudflared` binary (default: `.local/bin/cloudflared`) |
+| `CLOUDFLARED_PROTOCOL` | Tunnel transport for `cloudflared` (default: `http2`) |
 | `DATASETS_ROOT` | Where recordings are saved (default: `datasets/`) |
 | `AUTH_STATE_PATH` | Path to auth state file |
 | `FFMPEG_BIN` | Path to `ffmpeg` binary |
@@ -172,6 +179,7 @@ node scripts/backfill-session-exports.js --force
 - **Phone cannot connect** — make sure you're using the full tunnel URL (`https://xxxx.trycloudflare.com/phone`), not a local IP.
 - **Join code rejected** — codes expire; copy a fresh one from the dashboard.
 - **Quick Tunnel stopped** — rerun `./scripts/start-quick-tunnel.sh`.
+- **Cloudflare 1033 / `control stream encountered a failure while serving`** — your network is likely rejecting QUIC/UDP. Run with `CLOUDFLARED_PROTOCOL=http2`.
 - **iPhone motion sensors not working** — use Safari and keep the page open in the foreground.
 - **No MP4 output** — install `ffmpeg`.
 - **No multiview or video+audio export** — install `ffmpeg`, then call `POST /api/datasets/:id/exports` to regenerate session media.
