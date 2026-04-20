@@ -77,7 +77,9 @@ app.post("/api/dashboard/logout", (req, res) => {
 app.use("/datasets", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
 app.use("/sessions", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
 app.get("/dashboard", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
+app.get("/dashboard/datasets", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "datasets.html")));
 app.get("/dashboard.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.js")));
+app.get("/dashboard-datasets.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "datasets.js")));
 app.get("/layouts.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "layouts.js")));
 app.get("/store.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "store.js")));
 app.get("/widgets.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "widgets.js")));
@@ -136,15 +138,13 @@ app.all("/api/sessions*", (req, res) => {
 
 app.get("/api/datasets", requireDashboardAuth("api"), (_req, res) => {
   try {
-    if (!fs.existsSync(DATASETS_ROOT)) return res.json({ sessions: [] });
-    const sessions = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
-      .map((d) => d.name)
-      .sort()
-      .reverse();
-    res.json({ sessions });
+    const sessions = listDatasetIds();
+    res.json({
+      sessions,
+      summaries: sessions.map((id) => buildDatasetSummary(id)).filter(Boolean)
+    });
   } catch {
-    res.status(500).json({ sessions: [] });
+    res.status(500).json({ sessions: [], summaries: [] });
   }
 });
 app.get("/api/storage", requireDashboardAuth("api"), (_req, res) => {
@@ -2121,6 +2121,83 @@ function firstDeviceId(sessionRoot) {
   if (!fs.existsSync(dir)) return null;
   const ids = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
   return ids[0] || null;
+}
+
+function listDatasetIds() {
+  if (!fs.existsSync(DATASETS_ROOT)) return [];
+  return fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
+    .map((d) => d.name)
+    .sort()
+    .reverse();
+}
+
+function safeReadJson(absPath) {
+  try {
+    if (!absPath || !fs.existsSync(absPath)) return null;
+    return JSON.parse(fs.readFileSync(absPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function buildDatasetSummary(id) {
+  try {
+    const root = path.join(DATASETS_ROOT, String(id || ""));
+    if (!fs.existsSync(root)) return null;
+    const stat = fs.statSync(root);
+    const meta = safeReadJson(path.join(root, "meta.json"));
+    const sync = safeReadJson(path.join(root, "sync_report.json"));
+    const exportsRoot = path.join(root, EXPORTS_DIRNAME);
+    const deviceIds = new Set();
+
+    for (const value of meta?.target_device_ids || []) deviceIds.add(String(value));
+    for (const value of Object.keys(meta?.devices || {})) deviceIds.add(String(value));
+    for (const value of Object.keys(sync?.devices || {})) deviceIds.add(String(value));
+
+    const devicesRoot = path.join(root, "devices");
+    if (fs.existsSync(devicesRoot)) {
+      for (const entry of fs.readdirSync(devicesRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) deviceIds.add(String(entry.name));
+      }
+    }
+
+    const normalizedDeviceIds = [...deviceIds].filter(Boolean).sort();
+    const exports = {
+      multiview: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_NAME)),
+      multiviewWithAudio: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_WITH_AUDIO_NAME)),
+      multiviewWithAudioAndGps: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME)),
+      manifestJson: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_MANIFEST_NAME)),
+      gpsPlaybackJson: fs.existsSync(path.join(exportsRoot, SESSION_GPS_PLAYBACK_NAME)),
+      gpsPlaybackVideo: fs.existsSync(path.join(exportsRoot, SESSION_GPS_PLAYBACK_VIDEO_NAME))
+    };
+    const activeSessionId = recording?.session_dir ? path.basename(String(recording.session_dir || "")) : "";
+
+    return {
+      id: String(id),
+      session_name: String(meta?.session_name || id),
+      created_at_iso: String(meta?.created_at_iso || meta?.start_time_iso || stat.birthtime?.toISOString?.() || stat.mtime?.toISOString?.()),
+      updated_at_ms: Number(stat.mtimeMs || Date.now()),
+      recording_mode: String(meta?.recording_mode || sync?.recording_mode || "all"),
+      focused_device_id: meta?.focused_device_id || firstDeviceId(root) || null,
+      target_device_ids: Array.isArray(meta?.target_device_ids) ? meta.target_device_ids : normalizedDeviceIds,
+      requested_modalities: Array.isArray(meta?.requested_modalities) ? meta.requested_modalities : [],
+      dataset_format: meta?.dataset_format || null,
+      device_count: Number(sync?.device_count || normalizedDeviceIds.length || 0),
+      device_ids: normalizedDeviceIds,
+      device_names: Object.fromEntries(normalizedDeviceIds.map((deviceId) => [
+        deviceId,
+        String(sync?.devices?.[deviceId]?.device_name || meta?.device_details?.[deviceId]?.device_name || deviceId)
+      ])),
+      exports,
+      export_count: Object.values(exports).filter(Boolean).length,
+      has_meta: !!meta,
+      has_sync_report: !!sync,
+      active: !!recording?.active && activeSessionId === id
+    };
+  } catch {
+    return null;
+  }
 }
 
 function clone(v) {
