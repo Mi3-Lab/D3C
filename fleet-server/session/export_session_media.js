@@ -458,11 +458,7 @@ async function createMultiviewVideo({ inputs, outPath, ffmpegBin, layout, global
   args.push(
     "-filter_complex", filterParts.join(";"),
     "-map", "[outv]",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart",
+    ...buildPlaybackFriendlyVideoArgs(),
     outPath
   );
 
@@ -498,12 +494,7 @@ async function muxVideoWithAudio({ videoPath, audioPath, outPath, ffmpegBin, off
   args.push("-map", videoMap, "-map", audioMap);
 
   if (videoFilters.length) {
-    args.push(
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-pix_fmt", "yuv420p"
-    );
+    args.push(...buildPlaybackFriendlyVideoArgs({ includeFaststart: false }));
   } else {
     args.push("-c:v", "copy");
   }
@@ -580,16 +571,26 @@ async function composeMultiviewWithAudioAndGps({
     `[stage1][wave]overlay=${waveformInnerX}:${waveformInnerY}[outv]`,
     "-map", "[outv]",
     "-map", "0:a:0?",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-pix_fmt", "yuv420p",
+    ...buildPlaybackFriendlyVideoArgs(),
     "-c:a", "copy",
-    "-movflags", "+faststart",
     outPath
   ];
   const res = await runFfmpeg(args, ffmpegBin);
   return { ...res, path: outPath };
+}
+
+function buildPlaybackFriendlyVideoArgs({ crf = 23, gop = 60, minKeyint = 30, includeFaststart = true } = {}) {
+  const args = [
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", String(Number.isFinite(crf) ? crf : 23),
+    "-g", String(Math.max(12, Number(gop) || 60)),
+    "-keyint_min", String(Math.max(1, Number(minKeyint) || 30)),
+    "-sc_threshold", "0",
+    "-pix_fmt", "yuv420p"
+  ];
+  if (includeFaststart) args.push("-movflags", "+faststart");
+  return args;
 }
 
 function buildAtempoFilters(factor) {

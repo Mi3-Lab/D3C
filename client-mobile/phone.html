@@ -74,6 +74,33 @@
         <div id="phonePermissionActions" class="phone-status-actions"></div>
       </section>
 
+      <section class="card phone-overview-card">
+        <details id="phoneFleetOverviewDetails" class="phone-overview-details">
+          <summary class="phone-overview-summary">
+            <div class="phone-overview-copy">
+              <h2>Fleet Overview</h2>
+              <p>Optional live coordination map for every connected phone.</p>
+            </div>
+            <span id="phoneFleetOverviewBadge" class="gps-badge off">Closed</span>
+          </summary>
+          <div class="phone-overview-body">
+            <div id="phoneFleetOverviewMeta" class="gps-live-meta mono">Connect to the session to load the overview.</div>
+            <div id="phoneFleetOverviewViewport" class="gps-live-viewport phone-overview-viewport">
+              <canvas id="phoneFleetOverviewCanvas" class="gps-live-canvas"></canvas>
+              <div class="gps-live-overlay">
+                <div id="phoneFleetOverviewStatus" class="gps-live-status">Waiting for fleet data.</div>
+                <div class="gps-live-attribution">
+                  <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer noopener">© OpenStreetMap</a>
+                  ·
+                  <a href="https://carto.com/attributions" target="_blank" rel="noreferrer noopener">© CARTO</a>
+                </div>
+              </div>
+            </div>
+            <div id="phoneFleetOverviewLegend" class="gps-live-legend"></div>
+          </div>
+        </details>
+      </section>
+
       <section class="card camera-section">
         <div class="section-header phone-camera-header">
           <h2>Camera</h2>
@@ -95,6 +122,23 @@
 
     </div>
   </main>
+
+  <div id="permissionRefreshModal" class="phone-modal" hidden>
+    <div class="phone-modal-backdrop"></div>
+    <section class="phone-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="permissionRefreshModalTitle">
+      <div class="phone-modal-head">
+        <span class="section-eyebrow">Dashboard Request</span>
+        <h2 id="permissionRefreshModalTitle">Enable access</h2>
+      </div>
+      <p id="permissionRefreshModalMessage" class="phone-modal-copy">The dashboard turned on a permission for this phone.</p>
+      <div id="permissionRefreshModalMeta" class="phone-modal-meta mono"></div>
+      <div class="phone-modal-actions">
+        <button id="permissionRefreshModalAction" type="button" class="btn">Enable Now</button>
+        <button id="permissionRefreshModalRefresh" type="button" class="btn btn-alt">Refresh Page</button>
+        <button id="permissionRefreshModalDismiss" type="button" class="btn btn-alt">Dismiss</button>
+      </div>
+    </section>
+  </div>
 
   <div id="connStatus" class="phone-hidden-status">Disconnected</div>
   <script src="/phone.js"></script>

@@ -38,6 +38,7 @@ const PUBLIC_RUNTIME_STATE_PATH = process.env.PUBLIC_RUNTIME_STATE_PATH
   ? path.resolve(process.env.PUBLIC_RUNTIME_STATE_PATH)
   : "";
 const SERVER_STARTED_AT_MS = Date.now();
+const FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS = 500;
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -76,7 +77,9 @@ app.post("/api/dashboard/logout", (req, res) => {
 app.use("/datasets", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
 app.use("/sessions", requireDashboardAuth("page"), express.static(DATASETS_ROOT));
 app.get("/dashboard", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.html")));
+app.get("/dashboard/datasets", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "datasets.html")));
 app.get("/dashboard.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "dashboard.js")));
+app.get("/dashboard-datasets.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "datasets.js")));
 app.get("/layouts.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "layouts.js")));
 app.get("/store.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "store.js")));
 app.get("/widgets.js", requireDashboardAuth("page"), (_req, res) => res.sendFile(path.join(process.cwd(), "dashboard", "widgets.js")));
@@ -135,15 +138,13 @@ app.all("/api/sessions*", (req, res) => {
 
 app.get("/api/datasets", requireDashboardAuth("api"), (_req, res) => {
   try {
-    if (!fs.existsSync(DATASETS_ROOT)) return res.json({ sessions: [] });
-    const sessions = fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
-      .map((d) => d.name)
-      .sort()
-      .reverse();
-    res.json({ sessions });
+    const sessions = listDatasetIds();
+    res.json({
+      sessions,
+      summaries: sessions.map((id) => buildDatasetSummary(id)).filter(Boolean)
+    });
   } catch {
-    res.status(500).json({ sessions: [] });
+    res.status(500).json({ sessions: [], summaries: [] });
   }
 });
 app.get("/api/storage", requireDashboardAuth("api"), (_req, res) => {
@@ -203,6 +204,55 @@ app.post("/api/datasets/:id/exports", requireDashboardAuth("api"), express.json(
   });
   if (!result.ok) return res.status(500).json(result);
   res.json(result);
+});
+app.patch("/api/datasets/:id", requireDashboardAuth("api"), express.json(), (req, res) => {
+  const id = sanitizeSessionId(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid id" });
+  const root = path.join(DATASETS_ROOT, id);
+  if (!fs.existsSync(root)) return res.status(404).json({ error: "not found" });
+  const sessionName = String(req.body?.session_name || "").trim();
+  if (!sessionName) return res.status(400).json({ error: "session_name required" });
+
+  try {
+    const activeSessionId = recording?.session_dir ? path.basename(String(recording.session_dir || "")) : "";
+    if (recording?.active && activeSessionId === id) {
+      return res.status(409).json({ error: "active session cannot be renamed" });
+    }
+
+    const nextId = makeSessionIdFromName(sessionName) || id;
+    if (nextId !== id && fs.existsSync(path.join(DATASETS_ROOT, nextId))) {
+      return res.status(409).json({ error: "session name already exists" });
+    }
+
+    let finalId = id;
+    let finalRoot = root;
+    if (nextId !== id) {
+      finalRoot = path.join(DATASETS_ROOT, nextId);
+      fs.renameSync(root, finalRoot);
+      finalId = nextId;
+    }
+
+    const metaPath = path.join(finalRoot, "meta.json");
+    const meta = safeReadJson(metaPath) || {};
+    meta.session_name = sessionName;
+    fs.writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+    appendControlLog(path.join(finalRoot, "control_log.jsonl"), {
+      type: "session_rename",
+      at_iso: new Date().toISOString(),
+      previous_id: id,
+      session_id: finalId,
+      session_name: sessionName
+    });
+    res.json({
+      ok: true,
+      id: finalId,
+      previous_id: id,
+      session_name: sessionName,
+      renamed_folder: finalId !== id
+    });
+  } catch {
+    res.status(500).json({ error: "rename failed" });
+  }
 });
 app.delete("/api/datasets/:id", requireDashboardAuth("api"), (req, res) => {
   const id = sanitizeSessionId(req.params.id);
@@ -304,6 +354,9 @@ const devices = new Map(); // device_id -> device entry
 const dashboardSockets = new Set();
 const pendingCameraHeaderBySocket = new Map(); // ws -> header
 const dashboardSessions = new Map();
+let fleetOverviewBroadcastTimer = null;
+let fleetOverviewBroadcastDirty = false;
+let lastFleetOverviewBroadcastAtMs = 0;
 
 let focusedDeviceId = null;
 let sessionConfig = sanitizeRunConfig(DEFAULT_RUN_CONFIG, DEFAULT_RUN_CONFIG);
@@ -370,6 +423,7 @@ wss.on("connection", (ws, req) => {
         focusedDeviceId = firstConnectedDeviceId() || null;
       }
       broadcastDeviceList();
+      queueFleetOverviewBroadcast({ immediate: true });
     }
     if (ws.role === "dashboard" && ws.client_id) {
       relayPreviewDisconnectToPhones(ws.client_id, "dashboard_disconnected");
@@ -535,6 +589,8 @@ function handleHello(ws, msg) {
   });
   sendWs(ws, { type: "config", device_id: unique, runConfig: sessionConfig });
   sendWs(ws, { type: "recording_state", active: recording.active, session_id: recording.session_id || null });
+  sendWs(ws, buildFleetOverviewPayload(), { critical: true });
+  queueFleetOverviewBroadcast({ immediate: true });
   broadcastDeviceList();
   broadcastState();
 }
@@ -695,6 +751,7 @@ function handlePhoneJson(ws, msg) {
       });
       markDeviceWrite(deviceId, tRecvMs);
     }
+    queueFleetOverviewBroadcast();
     return;
   }
 
@@ -871,14 +928,7 @@ function handleDashboardJson(ws, msg) {
       sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
       return;
     }
-    sessionConfig = sanitizeRunConfig(incoming, sessionConfig);
-    for (const [id, d] of devices.entries()) {
-      d.config = clone(sessionConfig);
-      sessionManager.updateDeviceConfig(id, d.config);
-      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
-    }
-    broadcastToDashboards(buildSessionConfigPayload());
-    broadcastState();
+    applySessionConfigUpdate(incoming);
     return;
   }
 
@@ -906,14 +956,14 @@ function handleDashboardJson(ws, msg) {
       sendWs(ws, { type: "session_config_rejected", reason: "session_active", sessionState: "active" });
       return;
     }
-    sessionConfig = sanitizeRunConfig(msg.sessionConfig, sessionConfig);
-    for (const [id, d] of devices.entries()) {
-      d.config = clone(sessionConfig);
-      sessionManager.updateDeviceConfig(id, d.config);
-      sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
-    }
-    broadcastToDashboards(buildSessionConfigPayload());
-    broadcastState();
+    applySessionConfigUpdate(msg.sessionConfig);
+    return;
+  }
+
+  if (msg.type === "device_kick") {
+    const deviceId = sanitizeDeviceId(String(msg.device_id || "").trim());
+    if (!deviceId || !devices.has(deviceId)) return;
+    kickDeviceFromDashboard(deviceId);
     return;
   }
 
@@ -1561,6 +1611,74 @@ function broadcastToDashboards(payload) {
   }
 }
 
+function broadcastToPhones(payload, opts = {}) {
+  const text = JSON.stringify(payload);
+  const maxBufferedBytes = (DEFAULT_RUN_CONFIG.performance?.max_ws_buffer_kb || 1024) * 1024;
+  for (const [, device] of devices.entries()) {
+    const ws = device?.ws;
+    if (!device?.connected || !ws || ws.readyState !== WebSocket.OPEN) continue;
+    if (!opts.critical && ws.bufferedAmount > maxBufferedBytes) continue;
+    ws.send(text);
+  }
+}
+
+function buildFleetOverviewPayload() {
+  const devicesOverview = [];
+  for (const [deviceId, device] of devices.entries()) {
+    if (!device.connected) continue;
+    devicesOverview.push({
+      device_id: deviceId,
+      device_name: device.device_name || deviceId,
+      connected: true,
+      recording: !!device.recordingStatus?.recording,
+      motion_state: device.state?.motion_state || "UNKNOWN",
+      camera_preview_live: !!device.state?.camera_preview?.live,
+      gps_latest: device.state?.gps_latest
+        ? {
+            t_recv_ms: Number(device.state.gps_latest.t_recv_ms || 0),
+            lat: Number(device.state.gps_latest.lat || 0),
+            lon: Number(device.state.gps_latest.lon || 0),
+            accuracy_m: Number.isFinite(Number(device.state.gps_latest.accuracy_m)) ? Number(device.state.gps_latest.accuracy_m) : -1,
+            speed_mps: Number.isFinite(Number(device.state.gps_latest.speed_mps)) ? Number(device.state.gps_latest.speed_mps) : -1,
+            heading_deg: Number.isFinite(Number(device.state.gps_latest.heading_deg)) ? Number(device.state.gps_latest.heading_deg) : -1
+          }
+        : null
+    });
+  }
+  devicesOverview.sort((a, b) => a.device_id.localeCompare(b.device_id));
+  return {
+    type: "fleet_overview",
+    generated_at_ms: Date.now(),
+    devices: devicesOverview
+  };
+}
+
+function flushFleetOverviewBroadcast() {
+  fleetOverviewBroadcastTimer = null;
+  if (!fleetOverviewBroadcastDirty) return;
+  fleetOverviewBroadcastDirty = false;
+  lastFleetOverviewBroadcastAtMs = Date.now();
+  broadcastToPhones(buildFleetOverviewPayload());
+}
+
+function queueFleetOverviewBroadcast({ immediate = false } = {}) {
+  fleetOverviewBroadcastDirty = true;
+  const now = Date.now();
+  const delay = immediate
+    ? 0
+    : Math.max(0, FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS - (now - lastFleetOverviewBroadcastAtMs));
+  if (fleetOverviewBroadcastTimer && delay > 0) return;
+  if (fleetOverviewBroadcastTimer) {
+    clearTimeout(fleetOverviewBroadcastTimer);
+    fleetOverviewBroadcastTimer = null;
+  }
+  if (delay === 0) {
+    flushFleetOverviewBroadcast();
+    return;
+  }
+  fleetOverviewBroadcastTimer = setTimeout(flushFleetOverviewBroadcast, delay);
+}
+
 function buildSessionConfigPayload() {
   return {
     type: "session_config",
@@ -1911,6 +2029,16 @@ function prunePhoneAuthTokens() {
   }
 }
 
+function revokePhoneAuthTokensForDevice(deviceId) {
+  const targetId = sanitizeDeviceId(deviceId);
+  if (!targetId) return;
+  for (const [token, grant] of phoneAuthTokens.entries()) {
+    if (sanitizeDeviceId(grant?.device_id) === targetId) {
+      phoneAuthTokens.delete(token);
+    }
+  }
+}
+
 function validatePhoneAuthGrant(token) {
   if (typeof token !== "string" || !token) return null;
   const grant = phoneAuthTokens.get(token);
@@ -1920,6 +2048,37 @@ function validatePhoneAuthGrant(token) {
     return null;
   }
   return grant;
+}
+
+function kickDeviceFromDashboard(deviceId) {
+  const targetId = sanitizeDeviceId(deviceId);
+  if (!targetId) return false;
+  const entry = devices.get(targetId);
+  if (!entry) return false;
+
+  revokePhoneAuthTokensForDevice(targetId);
+  const targetWs = entry.ws;
+  recording.target_device_ids = (recording.target_device_ids || []).filter((id) => id !== targetId);
+  if (targetWs && isSocketOpen(targetWs)) {
+    sendWs(targetWs, {
+      type: "force_disconnect",
+      reason: "removed_by_dashboard",
+      message: "Dashboard removed this phone from the session. Tap Start Device to join again."
+    }, { critical: true });
+    setTimeout(() => {
+      try { targetWs.close(4002, "removed_by_dashboard"); } catch {}
+    }, 80);
+  }
+
+  devices.delete(targetId);
+  if (focusedDeviceId === targetId) {
+    focusedDeviceId = firstConnectedDeviceId() || null;
+  }
+  broadcastDeviceList();
+  queueFleetOverviewBroadcast({ immediate: true });
+  broadcastState();
+  broadcastRecordStatuses();
+  return true;
 }
 
 function getClientIp(req) {
@@ -2001,6 +2160,18 @@ function sanitizeSessionId(raw) {
   return raw;
 }
 
+function makeSessionIdFromName(raw) {
+  const slug = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_")
+    .slice(0, 96);
+  if (!slug) return null;
+  return sanitizeSessionId(`session_${slug}`);
+}
+
 function toUrlIfExists(absPath, urlPath) {
   if (!fs.existsSync(absPath)) return null;
   return urlPath;
@@ -2013,8 +2184,181 @@ function firstDeviceId(sessionRoot) {
   return ids[0] || null;
 }
 
+function listDatasetIds() {
+  if (!fs.existsSync(DATASETS_ROOT)) return [];
+  return fs.readdirSync(DATASETS_ROOT, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && d.name.startsWith("session_"))
+    .map((d) => d.name)
+    .sort()
+    .reverse();
+}
+
+function safeReadJson(absPath) {
+  try {
+    if (!absPath || !fs.existsSync(absPath)) return null;
+    return JSON.parse(fs.readFileSync(absPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function buildDatasetSummary(id) {
+  try {
+    const root = path.join(DATASETS_ROOT, String(id || ""));
+    if (!fs.existsSync(root)) return null;
+    const stat = fs.statSync(root);
+    const meta = safeReadJson(path.join(root, "meta.json"));
+    const sync = safeReadJson(path.join(root, "sync_report.json"));
+    const exportsRoot = path.join(root, EXPORTS_DIRNAME);
+    const sessionSizeBytes = dirSizeBytes(root);
+    const durationMs = datasetDurationMs({ meta, sync, fallbackEndMs: Number(stat.mtimeMs || Date.now()) });
+    const deviceIds = new Set();
+
+    for (const value of meta?.target_device_ids || []) deviceIds.add(String(value));
+    for (const value of Object.keys(meta?.devices || {})) deviceIds.add(String(value));
+    for (const value of Object.keys(sync?.devices || {})) deviceIds.add(String(value));
+
+    const devicesRoot = path.join(root, "devices");
+    if (fs.existsSync(devicesRoot)) {
+      for (const entry of fs.readdirSync(devicesRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) deviceIds.add(String(entry.name));
+      }
+    }
+
+    const normalizedDeviceIds = [...deviceIds].filter(Boolean).sort();
+    const exports = {
+      multiview: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_NAME)),
+      multiviewWithAudio: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_WITH_AUDIO_NAME)),
+      multiviewWithAudioAndGps: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_WITH_AUDIO_AND_GPS_NAME)),
+      manifestJson: fs.existsSync(path.join(exportsRoot, SESSION_MULTIVIEW_MANIFEST_NAME)),
+      gpsPlaybackJson: fs.existsSync(path.join(exportsRoot, SESSION_GPS_PLAYBACK_NAME)),
+      gpsPlaybackVideo: fs.existsSync(path.join(exportsRoot, SESSION_GPS_PLAYBACK_VIDEO_NAME))
+    };
+    const activeSessionId = recording?.session_dir ? path.basename(String(recording.session_dir || "")) : "";
+
+    return {
+      id: String(id),
+      session_name: String(meta?.session_name || id),
+      created_at_iso: String(meta?.created_at_iso || meta?.start_time_iso || stat.birthtime?.toISOString?.() || stat.mtime?.toISOString?.()),
+      updated_at_ms: Number(stat.mtimeMs || Date.now()),
+      recording_mode: String(meta?.recording_mode || sync?.recording_mode || "all"),
+      focused_device_id: meta?.focused_device_id || firstDeviceId(root) || null,
+      target_device_ids: Array.isArray(meta?.target_device_ids) ? meta.target_device_ids : normalizedDeviceIds,
+      requested_modalities: Array.isArray(meta?.requested_modalities) ? meta.requested_modalities : [],
+      dataset_format: meta?.dataset_format || null,
+      session_size_bytes: sessionSizeBytes,
+      duration_ms: durationMs,
+      device_count: Number(sync?.device_count || normalizedDeviceIds.length || 0),
+      device_ids: normalizedDeviceIds,
+      device_names: Object.fromEntries(normalizedDeviceIds.map((deviceId) => [
+        deviceId,
+        String(sync?.devices?.[deviceId]?.device_name || meta?.device_details?.[deviceId]?.device_name || deviceId)
+      ])),
+      exports,
+      export_count: Object.values(exports).filter(Boolean).length,
+      has_meta: !!meta,
+      has_sync_report: !!sync,
+      active: !!recording?.active && activeSessionId === id
+    };
+  } catch {
+    return null;
+  }
+}
+
+function datasetDurationMs({ meta, sync, fallbackEndMs = Date.now() }) {
+  const metaStartMs = new Date(meta?.start_time_iso || meta?.created_at_iso || "").getTime();
+  let startMs = Number.isFinite(metaStartMs) && metaStartMs > 0 ? metaStartMs : Infinity;
+  if (!Number.isFinite(startMs) || startMs <= 0) startMs = Infinity;
+  let endMs = 0;
+
+  for (const device of Object.values(sync?.devices || {})) {
+    for (const segment of device?.sync?.segments || []) {
+      const segStart = Number(segment?.start_server_ms || 0);
+      const segEnd = Number(segment?.end_server_ms || 0);
+      if (segStart > 0) startMs = Math.min(startMs, segStart);
+      if (segEnd > 0) endMs = Math.max(endMs, segEnd);
+    }
+  }
+
+  if (!Number.isFinite(startMs) || startMs <= 0) return 0;
+  const syncGeneratedMs = new Date(sync?.generated_at_iso || "").getTime();
+  const fallbackMs = Number.isFinite(syncGeneratedMs) && syncGeneratedMs > 0 ? syncGeneratedMs : Number(fallbackEndMs || 0);
+  const finalEndMs = Math.max(endMs, fallbackMs);
+  if (!Number.isFinite(finalEndMs) || finalEndMs <= startMs) return 0;
+  return finalEndMs - startMs;
+}
+
 function clone(v) {
   return JSON.parse(JSON.stringify(v));
+}
+
+function applySessionConfigUpdate(nextConfigInput) {
+  const previousSessionConfig = clone(sessionConfig);
+  sessionConfig = sanitizeRunConfig(nextConfigInput, sessionConfig);
+  const newlyEnabledPermissions = diffNewlyEnabledPermissions(previousSessionConfig, sessionConfig);
+  for (const [id, d] of devices.entries()) {
+    d.config = clone(sessionConfig);
+    sessionManager.updateDeviceConfig(id, d.config);
+    sendWs(d.ws, { type: "config", device_id: id, runConfig: d.config });
+  }
+  if (newlyEnabledPermissions.length) {
+    notifyConnectedPhonesPermissionRefresh(newlyEnabledPermissions);
+  }
+  broadcastToDashboards(buildSessionConfigPayload());
+  broadcastState();
+}
+
+function diffNewlyEnabledPermissions(previousConfig, nextConfig) {
+  const prev = capturePermissionToggleState(previousConfig);
+  const next = capturePermissionToggleState(nextConfig);
+  const enabled = [];
+  if (!prev.camera && next.camera) enabled.push("camera");
+  if (!prev.audio && next.audio) enabled.push("audio");
+  if (!prev.location && next.location) enabled.push("location");
+  return enabled;
+}
+
+function capturePermissionToggleState(config) {
+  return {
+    camera: String(config?.streams?.camera?.mode || "off") !== "off",
+    audio: !!config?.streams?.audio?.enabled,
+    location: !!config?.streams?.gps?.enabled
+  };
+}
+
+function notifyConnectedPhonesPermissionRefresh(modalities) {
+  const cleanModalities = [...new Set((Array.isArray(modalities) ? modalities : [])
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter((value) => ["camera", "audio", "location"].includes(value)))];
+  if (!cleanModalities.length) return;
+  const friendly = cleanModalities.map((value) => {
+    if (value === "audio") return "microphone";
+    return value;
+  });
+  const humanList = joinHumanList(friendly);
+  const title = `Dashboard turned on ${humanList}`;
+  const message = `The dashboard just enabled ${humanList}. Tap Enable Now on this phone so Safari can show the permission prompt. If it still gets stuck, use Refresh Page as a fallback.`;
+  const now = Date.now();
+  for (const [, device] of devices.entries()) {
+    if (!device.connected || !isSocketOpen(device.ws)) continue;
+    sendWs(device.ws, {
+      type: "fleet_alert",
+      kind: "permission_refresh",
+      source_device_name: "Dashboard",
+      title,
+      message,
+      modalities: cleanModalities,
+      t_server_ms: now
+    }, { critical: true });
+  }
+}
+
+function joinHumanList(items) {
+  const clean = (Array.isArray(items) ? items : []).filter(Boolean);
+  if (!clean.length) return "permissions";
+  if (clean.length === 1) return clean[0];
+  if (clean.length === 2) return `${clean[0]} and ${clean[1]}`;
+  return `${clean.slice(0, -1).join(", ")}, and ${clean[clean.length - 1]}`;
 }
 
 function allowByRate(deviceEntry, streamKey, targetHz) {

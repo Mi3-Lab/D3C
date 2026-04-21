@@ -843,6 +843,9 @@ def compose_camera_with_map(camera_path: Path, map_path: Path, output_path: Path
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", str(crf),
+        "-g", "60",
+        "-keyint_min", "30",
+        "-sc_threshold", "0",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-shortest",
@@ -865,6 +868,8 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
 
     duration_ms = max(1000.0, end_ms - start_ms)
     frame_count = max(2, int(math.ceil((duration_ms / 1000.0) * fps)) + 1)
+    gop = max(12, int(round(fps * 2.0)))
+    min_keyint = max(1, int(round(fps)))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     tile_image = render_tile_background(projection)
@@ -885,6 +890,9 @@ def render_video(payload, output_path: Path, ffmpeg_bin: str, width: int, height
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", str(crf),
+        "-g", str(gop),
+        "-keyint_min", str(min_keyint),
+        "-sc_threshold", "0",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         output_path.as_posix(),

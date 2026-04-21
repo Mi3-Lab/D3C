@@ -7,6 +7,7 @@ PORT="${PORT:-3000}"
 HOST="${HOST:-0.0.0.0}"
 SERVER_URL="http://127.0.0.1:${PORT}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-$ROOT_DIR/.local/bin/cloudflared}"
+CLOUDFLARED_PROTOCOL="${CLOUDFLARED_PROTOCOL:-http2}"
 RUNTIME_DIR="$ROOT_DIR/tmp"
 PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH:-$RUNTIME_DIR/quick-tunnel-state.json}"
 SERVER_LOG="$(mktemp -t d3c-server.XXXXXX.log)"
@@ -83,7 +84,7 @@ echo "Opening Cloudflare Quick Tunnel ..."
 PUBLIC_URL=""
 for attempt in $(seq 1 "${QUICK_TUNNEL_RETRIES}"); do
   : >"${TUNNEL_LOG}"
-  "${CLOUDFLARED_BIN}" tunnel --url "${SERVER_URL}" >"${TUNNEL_LOG}" 2>&1 &
+  "${CLOUDFLARED_BIN}" tunnel --protocol "${CLOUDFLARED_PROTOCOL}" --url "${SERVER_URL}" >"${TUNNEL_LOG}" 2>&1 &
   TUNNEL_PID=$!
 
   PUBLIC_URL=""
@@ -131,6 +132,7 @@ echo "Quick Tunnel is up:"
 echo "Phone:     ${PUBLIC_URL}/phone"
 echo "Dashboard: ${PUBLIC_URL}/dashboard"
 echo "Health:    ${PUBLIC_URL}/health"
+echo "Protocol:  ${CLOUDFLARED_PROTOCOL}"
 echo
 echo "Local server logs: ${SERVER_LOG}"
 echo "Tunnel logs:       ${TUNNEL_LOG}"

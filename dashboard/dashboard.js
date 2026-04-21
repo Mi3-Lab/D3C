@@ -811,6 +811,7 @@ function renderDashboard() {
   for (const instance of visible) {
     const def = widgetRegistry[instance.type];
     if (!def) continue;
+    const hasVisibleSettings = widgetHasVisibleSettings(def.settingsSchema);
 
     const card = document.createElement("article");
     card.className = "card widget-card";
@@ -832,7 +833,7 @@ function renderDashboard() {
     const actions = document.createElement("div");
     actions.className = "widget-actions";
 
-    if (def.settingsSchema?.length) {
+    if (hasVisibleSettings) {
       actions.appendChild(actionBtn("Settings", () => {
         const panel = card.querySelector(".widget-settings");
         panel.style.display = panel.style.display === "none" ? "block" : "none";
@@ -858,11 +859,13 @@ function renderDashboard() {
     head.append(title, actions);
     card.appendChild(head);
 
-    const settings = document.createElement("div");
-    settings.className = "widget-settings";
-    settings.style.display = "none";
-    if (def.settingsSchema?.length) renderSettings(settings, instance, def.settingsSchema);
-    card.appendChild(settings);
+    if (hasVisibleSettings) {
+      const settings = document.createElement("div");
+      settings.className = "widget-settings";
+      settings.style.display = "none";
+      renderSettings(settings, instance, def.settingsSchema);
+      card.appendChild(settings);
+    }
 
     const body = document.createElement("div");
     body.className = "widget-content";
@@ -881,6 +884,11 @@ function renderDashboard() {
     mountedWidgets.set(instance.id, { cleanups: cleanup ? [cleanup] : [], type: instance.type, el: card });
   }
 }
+
+function widgetHasVisibleSettings(schema) {
+  return Array.isArray(schema) && schema.some((field) => !(field?.type === "device" && field?.key === "device_id"));
+}
+
 function renderSettings(container, instance, schema) {
   container.innerHTML = "";
   for (const field of schema) {

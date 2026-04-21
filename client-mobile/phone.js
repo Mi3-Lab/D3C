@@ -15,12 +15,34 @@
   const phoneReadyMissing = document.getElementById("phoneReadyMissing");
   const phoneReadinessList = document.getElementById("phoneReadinessList");
   const phonePermissionActions = document.getElementById("phonePermissionActions");
+  const phoneFleetOverviewDetails = document.getElementById("phoneFleetOverviewDetails");
+  const phoneFleetOverviewBadge = document.getElementById("phoneFleetOverviewBadge");
+  const phoneFleetOverviewMeta = document.getElementById("phoneFleetOverviewMeta");
+  const phoneFleetOverviewViewport = document.getElementById("phoneFleetOverviewViewport");
+  const phoneFleetOverviewCanvas = document.getElementById("phoneFleetOverviewCanvas");
+  const phoneFleetOverviewStatus = document.getElementById("phoneFleetOverviewStatus");
+  const phoneFleetOverviewLegend = document.getElementById("phoneFleetOverviewLegend");
   const cameraFlipBtn = document.getElementById("cameraFlipBtn");
   const cameraPreviewBadge = document.getElementById("cameraPreviewBadge");
   const cameraPreviewFps = document.getElementById("cameraPreviewFps");
   const cameraPreviewMeta = document.getElementById("cameraPreviewMeta");
+  const permissionRefreshModal = document.getElementById("permissionRefreshModal");
+  const permissionRefreshModalTitle = document.getElementById("permissionRefreshModalTitle");
+  const permissionRefreshModalMessage = document.getElementById("permissionRefreshModalMessage");
+  const permissionRefreshModalMeta = document.getElementById("permissionRefreshModalMeta");
+  const permissionRefreshModalAction = document.getElementById("permissionRefreshModalAction");
+  const permissionRefreshModalRefresh = document.getElementById("permissionRefreshModalRefresh");
+  const permissionRefreshModalDismiss = document.getElementById("permissionRefreshModalDismiss");
   const RECONNECT_KEY_STORAGE = "d3c_phone_reconnect_key";
+  const PHONE_OVERVIEW_OPEN_KEY = "d3c_phone_fleet_overview_open";
   const PREVIEW_ICE_SERVERS = [{ urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }];
+  const GPS_LIVE_TILE_SIZE = 256;
+  const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
+  const GPS_LIVE_STALE_MS = 15000;
+  const GPS_LIVE_TRAIL_MAX_AGE_MS = 20 * 60 * 1000;
+  const GPS_LIVE_TRAIL_MAX_POINTS = 2400;
+  const GPS_LIVE_DRAW_MAX_POINTS = 700;
+  const GPS_LIVE_COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#b197fc", "#63e6be", "#ffa94d", "#f783ac"];
 
   const DEFAULT_RUN_CONFIG = {
     device_id: resolveDeviceId(),
@@ -91,11 +113,19 @@
   let alertFeedbackText = "";
   let alertFeedbackTone = "muted";
   let alertFeedbackTimer = null;
+  let permissionRefreshNotice = null;
+  let permissionRefreshBusy = false;
+  let permissionRefreshStatusText = "";
   let alertCooldownTimer = null;
   let lastAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
+  let fleetOverview = { devices: [], generated_at_ms: 0 };
+  const fleetOverviewTrailCache = new Map();
+  const fleetOverviewTileCache = new Map();
+  let fleetOverviewRenderPending = false;
+  let fleetOverviewResizeObserver = null;
 
   renderDeviceIdentity();
   renderJoinFields();
@@ -104,6 +134,28 @@
   renderStatus();
   setConnectionUi(false, "Disconnected");
   setJoinStatus("Enter join code");
+  if (phoneFleetOverviewDetails) {
+    phoneFleetOverviewDetails.open = localStorage.getItem(PHONE_OVERVIEW_OPEN_KEY) === "1";
+    phoneFleetOverviewDetails.addEventListener("toggle", () => {
+      localStorage.setItem(PHONE_OVERVIEW_OPEN_KEY, phoneFleetOverviewDetails.open ? "1" : "0");
+      scheduleFleetOverviewRender();
+    });
+  }
+  if (typeof ResizeObserver === "function" && phoneFleetOverviewViewport) {
+    fleetOverviewResizeObserver = new ResizeObserver(() => scheduleFleetOverviewRender());
+    fleetOverviewResizeObserver.observe(phoneFleetOverviewViewport);
+  } else {
+    window.addEventListener("resize", scheduleFleetOverviewRender);
+  }
+  permissionRefreshModalAction?.addEventListener("click", () => {
+    void handlePermissionRefreshAction();
+  });
+  permissionRefreshModalRefresh?.addEventListener("click", () => {
+    window.location.reload();
+  });
+  permissionRefreshModalDismiss?.addEventListener("click", () => {
+    clearPermissionRefreshNotice();
+  });
 
   cameraFlipBtn?.addEventListener("click", async () => {
     cameraFacingMode = cameraFacingMode === "environment" ? "user" : "environment";
@@ -221,6 +273,10 @@
           return;
         }
         if (msg.type === "auth_required") {
+          started = false;
+          authState = null;
+          updateJoinFieldLock();
+          renderStatus();
           setJoinStatus("Join token expired - tap Start again");
           wsClient?.disconnect(true);
           return;
@@ -240,8 +296,17 @@
           renderStatus();
           return;
         }
+        if (msg.type === "force_disconnect") {
+          handleForcedDisconnect(msg);
+          return;
+        }
         if (msg.type === "fleet_alert") {
           void handleFleetAlert(msg);
+          return;
+        }
+        if (msg.type === "fleet_overview") {
+          fleetOverview = normalizeFleetOverviewPayload(msg);
+          scheduleFleetOverviewRender();
           return;
         }
         if (msg.type === "webrtc_signal") {
@@ -705,11 +770,23 @@
   }
 
   async function handleFleetAlert(msg) {
+    const kind = String(msg.kind || "").trim();
     const sourceDeviceId = String(msg.source_device_id || "").trim();
     const sourceDeviceName = String(msg.source_device_name || sourceDeviceId || "another phone").trim();
     const targetCount = Math.max(1, Number(msg.target_count || 0) || 1);
     const fromSelf = !!sourceDeviceId && sourceDeviceId === runConfig.device_id;
     const played = await playAlertTone();
+    if (kind === "permission_refresh") {
+      const title = String(msg.title || "Enable access").trim() || "Enable access";
+      const message = String(msg.message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.").trim();
+      setPermissionRefreshNotice({
+        title,
+        message,
+        modalities: msg.modalities
+      });
+      setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      return;
+    }
     if (fromSelf) {
       setAlertFeedback(`Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success");
       return;
@@ -789,12 +866,12 @@
     );
   }
 
-  function retryGpsAccess() {
+  async function retryGpsAccess() {
     if (!runConfig.streams.gps?.enabled) return;
     if (!navigator.geolocation) {
       gpsPermissionState = "unsupported";
       renderStatus();
-      return;
+      return false;
     }
     if (gpsWatchId != null) {
       try { navigator.geolocation.clearWatch(gpsWatchId); } catch {}
@@ -802,18 +879,17 @@
     }
     gpsPermissionState = "unknown";
     renderStatus();
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        emitGpsPosition(pos, { rateLimit: false });
-        applyGpsConfig();
-        renderStatus();
-      },
-      (err) => {
-        gpsPermissionState = normalizeGpsErrorState(err);
-        renderStatus();
-      },
-      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-    );
+    try {
+      const pos = await requestCurrentGpsPosition();
+      emitGpsPosition(pos, { rateLimit: false });
+      applyGpsConfig();
+      renderStatus();
+      return true;
+    } catch (err) {
+      gpsPermissionState = normalizeGpsErrorState(err);
+      renderStatus();
+      return false;
+    }
   }
 
   function emitGpsPosition(pos, { rateLimit = true } = {}) {
@@ -896,11 +972,14 @@
   }
 
   function renderStatus() {
+    maybeClearPermissionRefreshNotice();
     renderDeviceIdentity();
     renderJoinValidation();
     renderReadiness();
     renderPrimaryAction();
     renderCameraPreviewStatus();
+    renderPermissionRefreshModal();
+    scheduleFleetOverviewRender();
   }
 
   function renderReadiness() {
@@ -1206,6 +1285,182 @@
     if (motionPermissionState === "granted") return "Permission granted, waiting for motion";
     if (motionPermissionState === "implicit") return "Motion pending";
     return "Motion permission pending";
+  }
+
+  function setPermissionRefreshNotice(notice) {
+    const title = String(notice?.title || "").trim();
+    const message = String(notice?.message || "").trim();
+    const modalities = normalizePermissionModalities(notice?.modalities);
+    permissionRefreshNotice = {
+      title: title || "Enable access",
+      message: message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.",
+      modalities
+    };
+    permissionRefreshBusy = false;
+    permissionRefreshStatusText = buildPermissionRefreshStatusText(modalities);
+    renderStatus();
+  }
+
+  function clearPermissionRefreshNotice() {
+    if (!permissionRefreshNotice) return;
+    permissionRefreshNotice = null;
+    permissionRefreshBusy = false;
+    permissionRefreshStatusText = "";
+    renderStatus();
+  }
+
+  function maybeClearPermissionRefreshNotice() {
+    if (!permissionRefreshNotice?.modalities?.length) return;
+    if (permissionRefreshNotice.modalities.every((modality) => isPermissionModalityReady(modality))) {
+      permissionRefreshNotice = null;
+      permissionRefreshBusy = false;
+      permissionRefreshStatusText = "";
+    }
+  }
+
+  function normalizePermissionModalities(values) {
+    return [...new Set((Array.isArray(values) ? values : [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => ["camera", "audio", "location"].includes(value)))];
+  }
+
+  function isPermissionModalityReady(modality) {
+    if (modality === "camera") {
+      return runConfig.streams.camera.mode === "off" || (cameraPermissionState === "granted" && !!cameraStream);
+    }
+    if (modality === "audio") {
+      return !runConfig.streams.audio.enabled || audioPermissionState === "granted";
+    }
+    if (modality === "location") {
+      return !runConfig.streams.gps.enabled || gpsPermissionState === "granted";
+    }
+    return true;
+  }
+
+  function renderPermissionRefreshModal() {
+    if (!permissionRefreshModal || !permissionRefreshModalTitle || !permissionRefreshModalMessage || !permissionRefreshModalMeta || !permissionRefreshModalAction) {
+      return;
+    }
+    const active = !!permissionRefreshNotice;
+    permissionRefreshModal.hidden = !active;
+    document.body.classList.toggle("phone-modal-open", active);
+    if (!active) return;
+    permissionRefreshModalTitle.textContent = permissionRefreshNotice.title || "Enable access";
+    permissionRefreshModalMessage.textContent = permissionRefreshNotice.message;
+    permissionRefreshModalMeta.textContent = permissionRefreshStatusText || buildPermissionRefreshStatusText(permissionRefreshNotice.modalities);
+    permissionRefreshModalAction.textContent = permissionRefreshBusy
+      ? "Requesting..."
+      : buildPermissionRefreshActionLabel(permissionRefreshNotice.modalities);
+    permissionRefreshModalAction.disabled = !!permissionRefreshBusy;
+    if (permissionRefreshModalRefresh) permissionRefreshModalRefresh.disabled = !!permissionRefreshBusy;
+    if (permissionRefreshModalDismiss) permissionRefreshModalDismiss.disabled = !!permissionRefreshBusy;
+  }
+
+  function buildPermissionRefreshActionLabel(modalities) {
+    const labels = normalizePermissionModalities(modalities).map((modality) => permissionModalityLabel(modality));
+    if (!labels.length) return "Enable Now";
+    if (labels.length === 1) return `Enable ${labels[0]}`;
+    if (labels.length === 2) return `Enable ${labels[0]} + ${labels[1]}`;
+    return "Enable Requested Access";
+  }
+
+  function buildPermissionRefreshStatusText(modalities) {
+    const parts = normalizePermissionModalities(modalities).map((modality) => {
+      return `${permissionModalityLabel(modality)}: ${permissionModalityStatus(modality)}`;
+    });
+    return parts.length
+      ? parts.join(" • ")
+      : "Tap Enable Now to request access on this phone.";
+  }
+
+  function permissionModalityLabel(modality) {
+    if (modality === "camera") return "Camera";
+    if (modality === "audio") return "Mic";
+    if (modality === "location") return "Location";
+    return "Access";
+  }
+
+  function permissionModalityStatus(modality) {
+    if (isPermissionModalityReady(modality)) return "ready";
+    if (modality === "camera") return describePermission(cameraPermissionState, "camera");
+    if (modality === "audio") return describePermission(audioPermissionState, "microphone");
+    if (modality === "location") return describePermission(gpsPermissionState, "location");
+    return "pending";
+  }
+
+  async function handlePermissionRefreshAction() {
+    if (!permissionRefreshNotice || permissionRefreshBusy) return;
+    permissionRefreshBusy = true;
+    permissionRefreshStatusText = "Requesting access on this phone...";
+    renderPermissionRefreshModal();
+
+    try {
+      await primeAlertAudio();
+      await applyConfig();
+      if (permissionRefreshNotice?.modalities?.includes("location") && runConfig.streams.gps?.enabled && !isPermissionModalityReady("location")) {
+        await retryGpsAccess();
+      }
+    } finally {
+      permissionRefreshBusy = false;
+    }
+
+    maybeClearPermissionRefreshNotice();
+    if (!permissionRefreshNotice) {
+      setAlertFeedback("Requested access is ready.", "success");
+      renderStatus();
+      return;
+    }
+    permissionRefreshStatusText = `${buildPermissionRefreshStatusText(permissionRefreshNotice.modalities)}. If Safari still does not prompt, refresh this page or re-enable the permission in Safari/iPhone settings.`;
+    renderStatus();
+  }
+
+  function requestCurrentGpsPosition() {
+    return new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 10000
+      });
+    });
+  }
+
+  function handleForcedDisconnect(msg) {
+    const message = String(msg?.message || "Dashboard removed this phone from the session. Tap Start Device to join again.").trim();
+    clearPermissionRefreshNotice();
+    setAlertFeedback(message, "warning", 5000);
+    wsClient?.disconnect(true);
+    ws = null;
+    stopFrameLoop();
+    stopCamera();
+    stopAudioLoop();
+    if (micStream) {
+      for (const track of micStream.getTracks()) track.stop();
+      micStream = null;
+    }
+    if (audioCtx) {
+      try { audioCtx.close(); } catch {}
+      audioCtx = null;
+      analyserSource = null;
+      analyser = null;
+      pcmProcessor = null;
+      pcmSilenceGain = null;
+      pcmChunkParts = [];
+      pcmChunkSamples = 0;
+    }
+    if (gpsWatchId != null && navigator.geolocation) {
+      try { navigator.geolocation.clearWatch(gpsWatchId); } catch {}
+    }
+    gpsWatchId = null;
+    started = false;
+    authState = null;
+    sessionRecordingActive = false;
+    runConfig = mergeRunConfig({ device_id: runConfig.device_id });
+    closeAllPreviewPeers("removed_by_dashboard");
+    lastPreviewStatusSent = "";
+    updateJoinFieldLock();
+    setConnectionUi(false, "Disconnected");
+    setJoinStatus(message, true);
+    renderStatus();
   }
 
   async function ensureCameraStream() {
@@ -1701,6 +1956,473 @@ function mergeRunConfig(input) {
     if (!motionWarningTimer) return;
     clearTimeout(motionWarningTimer);
     motionWarningTimer = null;
+  }
+
+  function normalizeFleetOverviewPayload(msg) {
+    return {
+      generated_at_ms: Number(msg?.generated_at_ms || 0),
+      devices: Array.isArray(msg?.devices) ? msg.devices.map((device) => ({
+        device_id: String(device?.device_id || "").trim(),
+        device_name: String(device?.device_name || device?.device_id || "").trim(),
+        connected: device?.connected !== false,
+        recording: !!device?.recording,
+        motion_state: String(device?.motion_state || "").trim(),
+        camera_preview_live: !!device?.camera_preview_live,
+        gps_latest: device?.gps_latest && typeof device.gps_latest === "object"
+          ? {
+              t_recv_ms: Number(device.gps_latest.t_recv_ms || 0),
+              lat: Number(device.gps_latest.lat),
+              lon: Number(device.gps_latest.lon),
+              accuracy_m: Number.isFinite(Number(device.gps_latest.accuracy_m)) ? Number(device.gps_latest.accuracy_m) : -1,
+              speed_mps: Number.isFinite(Number(device.gps_latest.speed_mps)) ? Number(device.gps_latest.speed_mps) : -1,
+              heading_deg: Number.isFinite(Number(device.gps_latest.heading_deg)) ? Number(device.gps_latest.heading_deg) : -1
+            }
+          : null
+      })).filter((device) => device.device_id) : []
+    };
+  }
+
+  function scheduleFleetOverviewRender() {
+    if (fleetOverviewRenderPending) return;
+    fleetOverviewRenderPending = true;
+    requestAnimationFrame(() => {
+      fleetOverviewRenderPending = false;
+      renderFleetOverview();
+    });
+  }
+
+  function renderFleetOverview() {
+    if (!phoneFleetOverviewBadge || !phoneFleetOverviewMeta || !phoneFleetOverviewStatus || !phoneFleetOverviewLegend) return;
+    pruneFleetOverviewTrails(fleetOverview.devices);
+    ingestFleetOverviewDevices(fleetOverview.devices);
+    const tracks = buildFleetOverviewTracks();
+    const connectedCount = fleetOverview.devices.filter((device) => device.connected).length;
+    const liveCount = tracks.filter((track) => track.live).length;
+
+    let badgeClass = "off";
+    let badgeText = phoneFleetOverviewDetails?.open ? "Open" : "Closed";
+    if (!started || !wsClient?.isConnected()) {
+      badgeClass = "off";
+      badgeText = "Offline";
+    } else if (liveCount > 0) {
+      badgeClass = "ok";
+      badgeText = `${liveCount} Live`;
+    } else if (connectedCount > 0) {
+      badgeClass = "warn";
+      badgeText = "Waiting";
+    }
+    phoneFleetOverviewBadge.className = `gps-badge ${badgeClass}`;
+    phoneFleetOverviewBadge.textContent = badgeText;
+
+    if (!phoneFleetOverviewDetails?.open) {
+      phoneFleetOverviewMeta.textContent = !started || !wsClient?.isConnected()
+        ? "Connect to the session to load the live overview."
+        : `${connectedCount} phone${connectedCount === 1 ? "" : "s"} in the fleet. Open to view the map.`;
+      return;
+    }
+
+    if (!phoneFleetOverviewCanvas || !phoneFleetOverviewViewport) return;
+    const size = syncFleetOverviewCanvasSize();
+    if (!size.width || !size.height) return;
+    const ctx = phoneFleetOverviewCanvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, phoneFleetOverviewCanvas.width, phoneFleetOverviewCanvas.height);
+    ctx.scale(size.dpr, size.dpr);
+
+    const view = computeFleetOverviewView(tracks, size.width, size.height);
+    drawFleetOverviewBackdrop(ctx, size.width, size.height);
+
+    if (!started || !wsClient?.isConnected()) {
+      phoneFleetOverviewStatus.hidden = false;
+      phoneFleetOverviewStatus.textContent = "Connect this phone to the session to see the fleet overview.";
+      phoneFleetOverviewMeta.textContent = "Fleet overview offline";
+      phoneFleetOverviewLegend.innerHTML = "";
+      return;
+    }
+
+    if (!tracks.length || !view) {
+      phoneFleetOverviewStatus.hidden = false;
+      phoneFleetOverviewStatus.textContent = connectedCount
+        ? "Waiting for phones to send location fixes."
+        : "No phones are connected yet.";
+      phoneFleetOverviewMeta.textContent = connectedCount
+        ? `${connectedCount} phone${connectedCount === 1 ? "" : "s"} connected · waiting for GPS`
+        : "No live overview data yet";
+      phoneFleetOverviewLegend.innerHTML = "";
+      return;
+    }
+
+    const tileStats = drawFleetOverviewTiles(ctx, view, scheduleFleetOverviewRender);
+    for (const track of tracks) drawFleetOverviewTrack(ctx, track, view);
+    if (!tileStats.loaded && tileStats.total) {
+      ctx.save();
+      ctx.fillStyle = "rgba(15, 23, 40, 0.10)";
+      ctx.fillRect(0, 0, size.width, size.height);
+      ctx.restore();
+    }
+    drawFleetOverviewCrosshair(ctx, size.width, size.height);
+
+    const totalPoints = tracks.reduce((sum, track) => sum + track.points.length, 0);
+    phoneFleetOverviewMeta.textContent = `${liveCount}/${tracks.length} live · ${totalPoints} pts · ${formatFleetOverviewMetersPerPx(view.metersPerPx)} · ${tileStats.loaded}/${tileStats.total || 0} tiles`;
+    renderFleetOverviewLegend(tracks);
+    phoneFleetOverviewStatus.hidden = true;
+  }
+
+  function syncFleetOverviewCanvasSize() {
+    const rect = phoneFleetOverviewViewport.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const nextWidth = Math.max(1, Math.round(width * dpr));
+    const nextHeight = Math.max(1, Math.round(height * dpr));
+    if (phoneFleetOverviewCanvas.width !== nextWidth || phoneFleetOverviewCanvas.height !== nextHeight) {
+      phoneFleetOverviewCanvas.width = nextWidth;
+      phoneFleetOverviewCanvas.height = nextHeight;
+    }
+    phoneFleetOverviewCanvas.style.width = `${width}px`;
+    phoneFleetOverviewCanvas.style.height = `${height}px`;
+    return { width, height, dpr };
+  }
+
+  function ingestFleetOverviewDevices(devices) {
+    for (const device of Array.isArray(devices) ? devices : []) {
+      if (!device?.device_id || !device.gps_latest) continue;
+      ingestFleetOverviewPoint(device.device_id, device.device_name || device.device_id, device.gps_latest);
+    }
+  }
+
+  function pruneFleetOverviewTrails(devices) {
+    const activeIds = new Set((Array.isArray(devices) ? devices : []).map((device) => String(device?.device_id || "").trim()).filter(Boolean));
+    for (const deviceId of [...fleetOverviewTrailCache.keys()]) {
+      if (!activeIds.has(deviceId)) fleetOverviewTrailCache.delete(deviceId);
+    }
+  }
+
+  function ingestFleetOverviewPoint(deviceId, deviceName, gpsLatest) {
+    const lat = Number(gpsLatest?.lat);
+    const lon = Number(gpsLatest?.lon);
+    const ts = Number(gpsLatest?.t_recv_ms || 0);
+    if (!isValidFleetOverviewCoordinate(lat, lon) || !ts) return;
+    const entry = getOrCreateFleetOverviewTrail(deviceId, deviceName);
+    entry.name = deviceName || entry.name || deviceId;
+    if (entry.lastTs === ts) return;
+    entry.lastTs = ts;
+    entry.points.push({
+      ts,
+      lat,
+      lon,
+      accuracy_m: Number.isFinite(Number(gpsLatest?.accuracy_m)) ? Number(gpsLatest.accuracy_m) : -1,
+      speed_mps: Number.isFinite(Number(gpsLatest?.speed_mps)) ? Number(gpsLatest.speed_mps) : -1,
+      heading_deg: Number.isFinite(Number(gpsLatest?.heading_deg)) ? Number(gpsLatest.heading_deg) : -1
+    });
+    trimFleetOverviewTrail(entry.points, ts);
+  }
+
+  function getOrCreateFleetOverviewTrail(deviceId, deviceName = "") {
+    const key = String(deviceId || "").trim();
+    let entry = fleetOverviewTrailCache.get(key);
+    if (entry) return entry;
+    entry = { deviceId: key, name: deviceName || key, lastTs: 0, points: [] };
+    fleetOverviewTrailCache.set(key, entry);
+    return entry;
+  }
+
+  function trimFleetOverviewTrail(points, newestTs) {
+    while (points.length > GPS_LIVE_TRAIL_MAX_POINTS) points.shift();
+    while (points.length && newestTs - Number(points[0]?.ts || 0) > GPS_LIVE_TRAIL_MAX_AGE_MS) points.shift();
+  }
+
+  function buildFleetOverviewTracks() {
+    const now = Date.now();
+    const summaries = new Map((fleetOverview.devices || []).map((device) => [device.device_id, device]));
+    const ids = [...new Set([...summaries.keys(), ...fleetOverviewTrailCache.keys()])];
+    const tracks = [];
+    for (const deviceId of ids) {
+      const device = summaries.get(deviceId) || {};
+      const trail = fleetOverviewTrailCache.get(deviceId);
+      const points = sampleFleetOverviewPoints(trail?.points || []);
+      if (!points.length) continue;
+      const latest = points[points.length - 1];
+      const ageMs = latest?.ts ? Math.max(0, now - Number(latest.ts)) : Number.POSITIVE_INFINITY;
+      tracks.push({
+        deviceId,
+        name: `${device.device_name || trail?.name || deviceId}${deviceId === runConfig.device_id ? " (you)" : ""}`,
+        color: fleetOverviewColorForDevice(deviceId),
+        connected: device.connected !== false,
+        recording: !!device.recording,
+        ageMs,
+        live: ageMs <= 6000,
+        stale: ageMs > 6000 && ageMs <= GPS_LIVE_STALE_MS,
+        points,
+        latest
+      });
+    }
+    return tracks.sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+  }
+
+  function sampleFleetOverviewPoints(points) {
+    if (!Array.isArray(points) || !points.length) return [];
+    if (points.length <= GPS_LIVE_DRAW_MAX_POINTS) return points.slice();
+    const step = Math.ceil(points.length / GPS_LIVE_DRAW_MAX_POINTS);
+    const sampled = [];
+    for (let i = 0; i < points.length; i += step) sampled.push(points[i]);
+    if (sampled[sampled.length - 1] !== points[points.length - 1]) sampled.push(points[points.length - 1]);
+    return sampled;
+  }
+
+  function fleetOverviewColorForDevice(deviceId) {
+    const key = String(deviceId || "");
+    let hash = 0;
+    for (let i = 0; i < key.length; i += 1) hash = ((hash * 31) + key.charCodeAt(i)) >>> 0;
+    return GPS_LIVE_COLORS[hash % GPS_LIVE_COLORS.length];
+  }
+
+  function computeFleetOverviewView(tracks, width, height) {
+    const points = tracks.flatMap((track) => track.points).filter((point) => isValidFleetOverviewCoordinate(point.lat, point.lon));
+    if (!points.length || width < 40 || height < 40) return null;
+
+    let minX = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const point of points) {
+      const world = fleetOverviewLatLonToWorld(point.lat, point.lon);
+      minX = Math.min(minX, world.x);
+      maxX = Math.max(maxX, world.x);
+      minY = Math.min(minY, world.y);
+      maxY = Math.max(maxY, world.y);
+    }
+
+    const paddingPx = Math.max(28, Math.min(width, height) * 0.12);
+    const usableWidth = Math.max(1, width - paddingPx * 2);
+    const usableHeight = Math.max(1, height - paddingPx * 2);
+    const spanX = Math.max(maxX - minX, points.length === 1 ? 0 : 1e-6);
+    const spanY = Math.max(maxY - minY, points.length === 1 ? 0 : 1e-6);
+
+    let zoom = 16;
+    if (points.length > 1) {
+      const zoomX = Math.log2(usableWidth / (GPS_LIVE_TILE_SIZE * Math.max(spanX, 1e-9)));
+      const zoomY = Math.log2(usableHeight / (GPS_LIVE_TILE_SIZE * Math.max(spanY, 1e-9)));
+      zoom = Math.floor(Math.min(zoomX, zoomY));
+    }
+    zoom = Math.max(2, Math.min(18, Number.isFinite(zoom) ? zoom : 16));
+
+    const scale = GPS_LIVE_TILE_SIZE * (2 ** zoom);
+    const centerWorldX = (minX + maxX) / 2;
+    const centerWorldY = (minY + maxY) / 2;
+    const centerPxX = centerWorldX * scale;
+    const centerPxY = centerWorldY * scale;
+    const centerLat = points[Math.floor(points.length / 2)]?.lat ?? tracks[0]?.latest?.lat ?? 0;
+    const metersPerPx = 156543.03392 * Math.cos((centerLat * Math.PI) / 180) / (2 ** zoom);
+
+    return {
+      width,
+      height,
+      zoom,
+      scale,
+      centerPxX,
+      centerPxY,
+      metersPerPx,
+      project(lat, lon) {
+        const world = fleetOverviewLatLonToWorld(lat, lon);
+        return {
+          x: (world.x * scale) - centerPxX + (width / 2),
+          y: (world.y * scale) - centerPxY + (height / 2)
+        };
+      }
+    };
+  }
+
+  function fleetOverviewLatLonToWorld(lat, lon) {
+    const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, Number(lat || 0)));
+    const normalizedLon = Math.max(-180, Math.min(180, Number(lon || 0)));
+    const x = (normalizedLon + 180) / 360;
+    const sin = Math.sin((clampedLat * Math.PI) / 180);
+    const y = 0.5 - (Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI));
+    return { x, y };
+  }
+
+  function drawFleetOverviewBackdrop(ctx, width, height) {
+    const gradient = ctx.createLinearGradient(0, 0, width, height);
+    gradient.addColorStop(0, "#0d1527");
+    gradient.addColorStop(1, "#12203b");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+    ctx.lineWidth = 1;
+    const step = 44;
+    for (let x = 0; x <= width; x += step) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+    for (let y = 0; y <= height; y += step) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawFleetOverviewTiles(ctx, view, onInvalidate) {
+    const tileSpan = 2 ** view.zoom;
+    const left = view.centerPxX - (view.width / 2);
+    const top = view.centerPxY - (view.height / 2);
+    const startTileX = Math.floor(left / GPS_LIVE_TILE_SIZE);
+    const endTileX = Math.floor((left + view.width) / GPS_LIVE_TILE_SIZE);
+    const startTileY = Math.floor(top / GPS_LIVE_TILE_SIZE);
+    const endTileY = Math.floor((top + view.height) / GPS_LIVE_TILE_SIZE);
+    let total = 0;
+    let loaded = 0;
+
+    for (let rawTileX = startTileX; rawTileX <= endTileX; rawTileX += 1) {
+      for (let rawTileY = startTileY; rawTileY <= endTileY; rawTileY += 1) {
+        if (rawTileY < 0 || rawTileY >= tileSpan) continue;
+        total += 1;
+        const wrappedTileX = ((rawTileX % tileSpan) + tileSpan) % tileSpan;
+        const tile = ensureFleetOverviewTile(view.zoom, wrappedTileX, rawTileY, onInvalidate);
+        const dx = Math.round((rawTileX * GPS_LIVE_TILE_SIZE) - left);
+        const dy = Math.round((rawTileY * GPS_LIVE_TILE_SIZE) - top);
+
+        if (tile?.status === "loaded" && tile.image?.complete) {
+          ctx.drawImage(tile.image, dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+          loaded += 1;
+        } else {
+          ctx.save();
+          ctx.fillStyle = tile?.status === "error" ? "rgba(120, 17, 34, 0.14)" : "rgba(255, 255, 255, 0.03)";
+          ctx.fillRect(dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.04)";
+          ctx.strokeRect(dx, dy, GPS_LIVE_TILE_SIZE, GPS_LIVE_TILE_SIZE);
+          ctx.restore();
+        }
+      }
+    }
+
+    return { total, loaded };
+  }
+
+  function ensureFleetOverviewTile(z, x, y, onInvalidate) {
+    const key = `${z}/${x}/${y}`;
+    let entry = fleetOverviewTileCache.get(key);
+    if (entry) return entry;
+    const image = new Image();
+    entry = { status: "loading", image };
+    fleetOverviewTileCache.set(key, entry);
+    image.crossOrigin = "anonymous";
+    image.decoding = "async";
+    image.onload = () => {
+      entry.status = "loaded";
+      onInvalidate?.();
+    };
+    image.onerror = () => {
+      entry.status = "error";
+      onInvalidate?.();
+    };
+    image.src = GPS_LIVE_TILE_TEMPLATE
+      .replace("{z}", String(z))
+      .replace("{x}", String(x))
+      .replace("{y}", String(y));
+    return entry;
+  }
+
+  function drawFleetOverviewTrack(ctx, track, view) {
+    if (!track?.points?.length) return;
+    const projected = track.points.map((point) => ({
+      ...view.project(point.lat, point.lon),
+      accuracy_m: point.accuracy_m
+    }));
+    if (!projected.length) return;
+
+    ctx.save();
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    ctx.strokeStyle = "rgba(9, 12, 20, 0.80)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    for (let i = 0; i < projected.length; i += 1) {
+      const point = projected[i];
+      if (i === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = track.color;
+    ctx.lineWidth = track.live ? 3 : 2.5;
+    ctx.globalAlpha = track.live ? 0.95 : 0.68;
+    ctx.beginPath();
+    for (let i = 0; i < projected.length; i += 1) {
+      const point = projected[i];
+      if (i === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    const last = projected[projected.length - 1];
+    const accuracyRadius = Number.isFinite(last.accuracy_m) && last.accuracy_m > 0
+      ? Math.max(8, Math.min(80, last.accuracy_m / Math.max(0.5, view.metersPerPx)))
+      : 0;
+    if (accuracyRadius > 0) {
+      ctx.fillStyle = `${track.color}22`;
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, accuracyRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = track.color;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, track.deviceId === runConfig.device_id ? 7 : 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawFleetOverviewCrosshair(ctx, width, height) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo((width / 2) - 8, height / 2);
+    ctx.lineTo((width / 2) + 8, height / 2);
+    ctx.moveTo(width / 2, (height / 2) - 8);
+    ctx.lineTo(width / 2, (height / 2) + 8);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function renderFleetOverviewLegend(tracks) {
+    phoneFleetOverviewLegend.innerHTML = "";
+    for (const track of tracks) {
+      const item = document.createElement("div");
+      item.className = `gps-live-chip ${track.live ? "is-live" : track.stale ? "is-stale" : "is-old"}`;
+      const swatch = document.createElement("span");
+      swatch.className = "gps-live-chip-swatch";
+      swatch.style.background = track.color;
+      const text = document.createElement("span");
+      text.textContent = `${track.name} · ${track.latest?.lat?.toFixed?.(5) || "-"}, ${track.latest?.lon?.toFixed?.(5) || "-"}`;
+      item.append(swatch, text);
+      phoneFleetOverviewLegend.appendChild(item);
+    }
+  }
+
+  function formatFleetOverviewMetersPerPx(metersPerPx) {
+    const value = Math.max(0, Number(metersPerPx || 0));
+    if (!value) return "scale --";
+    if (value >= 1000) return `${(value / 1000).toFixed(2)} km/px`;
+    if (value >= 100) return `${Math.round(value)} m/px`;
+    return `${value.toFixed(1)} m/px`;
+  }
+
+  function isValidFleetOverviewCoordinate(lat, lon) {
+    return Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
   }
 
   function describeMotionStatus() {

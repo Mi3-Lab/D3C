@@ -17,8 +17,7 @@ export function defaultLayouts(makeWidget) {
       name: "Cameras",
       widgets: [
         makeWidget("camera_preview", { w: 8, h: 5, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("device_list", { w: 4, h: 5, pinned: true }),
-        makeWidget("gps_live", { w: 12, h: 3, pinned: false, settings: { device_id: "global" } })
+        makeWidget("device_list", { w: 4, h: 5, pinned: true })
       ]
     },
     Review: {
