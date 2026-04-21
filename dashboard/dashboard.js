@@ -6,7 +6,7 @@ const DEFAULT_RUN_CONFIG = {
   device_id: "phone1",
   streams: {
     imu: { enabled: true, rate_hz: 30, record: true },
-    camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", encode_timing: "post_session", video_fps: 30, video_bitrate: "2M", video_crf: 23, downsample_factor: 1 },
+    camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "both", encode_timing: "post_session", video_fps: 30, video_bitrate: "2M", video_crf: 23, downsample_factor: 1 },
     gps: { enabled: false, rate_hz: 1, record: false },
     audio: { enabled: false, rate_hz: 10, record: false },
     device: { enabled: true, rate_hz: 1, record: false },

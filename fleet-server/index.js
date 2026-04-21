@@ -329,6 +329,10 @@ app.get("/api/datasets/:id/manifest", requireDashboardAuth("api"), (req, res) =>
       path.join(streamRoot, "camera_timestamps.csv"),
       `/datasets/${id}/devices/${deviceId}/streams/camera_timestamps.csv`
     ),
+    cameraChunksCsv: toUrlIfExists(
+      path.join(streamRoot, "camera_chunks.csv"),
+      `/datasets/${id}/devices/${deviceId}/streams/camera_chunks.csv`
+    ),
     cameraVideo: toUrlIfExists(
       path.join(streamRoot, "camera_video.mp4"),
       `/datasets/${id}/devices/${deviceId}/streams/camera_video.mp4`
@@ -352,7 +356,7 @@ const sessionManager = new SessionManager();
 
 const devices = new Map(); // device_id -> device entry
 const dashboardSockets = new Set();
-const pendingCameraHeaderBySocket = new Map(); // ws -> header
+const pendingBinaryHeadersBySocket = new Map(); // ws -> [header]
 const dashboardSessions = new Map();
 let fleetOverviewBroadcastTimer = null;
 let fleetOverviewBroadcastDirty = false;
@@ -408,7 +412,7 @@ wss.on("connection", (ws, req) => {
     if (ws.role === "phone") connectionStats.phones_disconnected += 1;
     if (ws.role === "dashboard") connectionStats.dashboards_disconnected += 1;
     console.log("[ws] socket closed", { role: ws.role, device_id: ws.device_id, sockets_connected: connectionStats.sockets_connected, sockets_closed: connectionStats.sockets_closed, phones_connected: connectionStats.phones_connected, phones_disconnected: connectionStats.phones_disconnected });
-    pendingCameraHeaderBySocket.delete(ws);
+    pendingBinaryHeadersBySocket.delete(ws);
     if (ws.role === "phone") {
       const d = devices.get(ws.device_id);
       if (d && d.ws === ws) {
@@ -594,6 +598,23 @@ function handleHello(ws, msg) {
   broadcastDeviceList();
   broadcastState();
 }
+function enqueuePendingBinaryHeader(ws, header) {
+  if (!ws || !header || typeof header !== "object") return;
+  const queue = pendingBinaryHeadersBySocket.get(ws) || [];
+  queue.push(header);
+  if (queue.length > 64) queue.shift();
+  pendingBinaryHeadersBySocket.set(ws, queue);
+}
+
+function dequeuePendingBinaryHeader(ws) {
+  const queue = pendingBinaryHeadersBySocket.get(ws);
+  if (!queue?.length) return null;
+  const header = queue.shift() || null;
+  if (queue.length) pendingBinaryHeadersBySocket.set(ws, queue);
+  else pendingBinaryHeadersBySocket.delete(ws);
+  return header;
+}
+
 function handlePhoneJson(ws, msg) {
   const deviceId = ws.device_id;
   const d = devices.get(deviceId);
@@ -689,11 +710,26 @@ function handlePhoneJson(ws, msg) {
 
   if (msg.type === "camera_header") {
     if (!allowByRate(d, "camera", getExpectedCameraIngressFps(d, { recordingActive: !!d.recordingStatus?.recording }) || 10)) return;
-    pendingCameraHeaderBySocket.set(ws, {
+    enqueuePendingBinaryHeader(ws, {
+      type: "camera_header",
       device_id: deviceId,
       t_device_ms: Number(msg.t_device_ms || 0),
       format: msg.format || "jpeg",
-      lighting_score: Number.isFinite(msg.lighting_score) ? Number(msg.lighting_score) : null
+      lighting_score: Number.isFinite(msg.lighting_score) ? Number(msg.lighting_score) : null,
+      record_for_session: msg.record_for_session !== false
+    });
+    return;
+  }
+
+  if (msg.type === "camera_video_chunk_header") {
+    enqueuePendingBinaryHeader(ws, {
+      type: "camera_video_chunk_header",
+      device_id: deviceId,
+      t_device_ms: Number(msg.t_device_ms || 0),
+      duration_ms: Number.isFinite(Number(msg.duration_ms)) ? Number(msg.duration_ms) : 0,
+      chunk_index: Number.isFinite(Number(msg.chunk_index)) ? Number(msg.chunk_index) : 0,
+      mime_type: typeof msg.mime_type === "string" ? msg.mime_type : "",
+      capture_start_device_ms: Number.isFinite(Number(msg.capture_start_device_ms)) ? Number(msg.capture_start_device_ms) : null
     });
     return;
   }
@@ -867,18 +903,36 @@ function handlePhoneJson(ws, msg) {
 function handlePhoneBinary(ws, data) {
   const d = devices.get(ws.device_id);
   if (!d) return;
-  const header = pendingCameraHeaderBySocket.get(ws);
+  const header = dequeuePendingBinaryHeader(ws);
   if (!header) return;
-  pendingCameraHeaderBySocket.delete(ws);
   const tRecvMs = Date.now();
   const tServerRxNs = nowServerRxNs();
-  d.latestCameraBuffer = Buffer.from(data);
+  const buffer = Buffer.from(data);
+
+  if (header.type === "camera_video_chunk_header") {
+    if (!recording.active) return;
+    trackDeviceClockSample(d, Number(header.t_device_ms || 0), tRecvMs);
+    sessionManager.writeCameraVideoChunk(ws.device_id, {
+      chunkBuffer: buffer,
+      t_device_ms: Number(header.t_device_ms || 0),
+      duration_ms: Number(header.duration_ms || 0),
+      chunk_index: Number(header.chunk_index || 0),
+      mime_type: header.mime_type || "",
+      capture_start_device_ms: Number.isFinite(header.capture_start_device_ms) ? Number(header.capture_start_device_ms) : null,
+      t_recv_ms: tRecvMs,
+      t_server_rx_ns: tServerRxNs
+    });
+    markDeviceWrite(ws.device_id, tRecvMs);
+    return;
+  }
+
+  d.latestCameraBuffer = buffer;
   d.latestCameraMime = header.format === "jpeg" ? "image/jpeg" : "application/octet-stream";
   d.state.camera_latest_ts = tRecvMs;
   trackDeviceClockSample(d, Number(header.t_device_ms || 0), tRecvMs);
   if (Number.isFinite(header.lighting_score)) d.state.camera_quality.lighting_score = header.lighting_score;
   d.stats.camera_count += 1;
-  if (recording.active) {
+  if (recording.active && header.record_for_session !== false) {
     sessionManager.writeCamera(ws.device_id, {
       jpegBuffer: d.latestCameraBuffer,
       t_device_ms: header.t_device_ms,
@@ -1105,11 +1159,18 @@ async function stopRecordingSession() {
 
   recording.phase = "STOPPING";
   recording.stop_requested_at_ms = Date.now();
-  broadcastState();
-  broadcastRecordStatuses();
-
   const stoppingSessionId = recording.session_id;
   const stoppingTargets = [...recording.target_device_ids];
+  broadcastState();
+  broadcastRecordStatuses();
+  for (const deviceId of stoppingTargets) {
+    const d = devices.get(deviceId);
+    if (d?.connected && isSocketOpen(d.ws)) {
+      sendWs(d.ws, { type: "recording_state", active: false, session_id: stoppingSessionId, phase: "STOPPING" });
+    }
+  }
+  const flushGraceMs = 1800;
+  await new Promise((resolve) => setTimeout(resolve, flushGraceMs));
   const res = sessionManager.stop();
   const finalizeTasks = Array.isArray(res.finalizeTasks) ? res.finalizeTasks : [];
   const timeoutMs = 300000;
@@ -1124,7 +1185,8 @@ async function stopRecordingSession() {
   writeSyncReport(res.sessionDir, stoppingSessionId, stoppingTargets, {
     timedOut,
     timeout_ms: timeoutMs,
-    finalize_tasks: finalizeTasks.length
+    finalize_tasks: finalizeTasks.length,
+    flush_grace_ms: flushGraceMs
   });
   const exportTimeoutMs = 300000;
   let exportResult = null;
@@ -1244,8 +1306,13 @@ function collectStoppedFiles(sessionDir, deviceId) {
     const streamsDir = path.join(sessionDir || "", "devices", sanitizeDeviceId(deviceId), "streams");
     if (fs.existsSync(path.join(streamsDir, "imu.parquet"))) out.imu = "imu.parquet";
     else if (fs.existsSync(path.join(streamsDir, "imu.csv"))) out.imu = "imu.csv";
-    if (fs.existsSync(path.join(streamsDir, "camera_video.mp4"))) out.cam = "camera_video.mp4";
-    else if (fs.existsSync(path.join(streamsDir, "camera"))) out.cam = "camera/";
+    if (fs.existsSync(path.join(streamsDir, "camera_video.mp4"))) {
+      out.cam = "camera_video.mp4";
+    } else {
+      const directSource = fs.readdirSync(streamsDir).find((name) => /^camera_video_source\./.test(name));
+      if (directSource) out.cam = directSource;
+      else if (fs.existsSync(path.join(streamsDir, "camera"))) out.cam = "camera/";
+    }
     if (fs.existsSync(path.join(streamsDir, CAMERA_WITH_AUDIO_NAME))) out.cam_audio = CAMERA_WITH_AUDIO_NAME;
     if (fs.existsSync(path.join(streamsDir, "audio.wav"))) out.audio = "audio.wav";
     else if (fs.existsSync(path.join(streamsDir, "audio.parquet"))) out.audio = "audio.parquet";
@@ -1361,10 +1428,15 @@ function getExpectedCameraIngressFps(device, { recordingActive = false } = {}) {
   const config = device?.config || {};
   const camera = config?.streams?.camera || {};
   if (camera.mode !== "stream") return 0;
-  if (!recordingActive || !camera.record) {
-    return getConfiguredPreviewCameraFps(config);
+  const previewFps = getConfiguredPreviewCameraFps(config);
+  const previewPeerCount = Math.max(0, Number(device?.state?.camera_preview?.peer_count || 0));
+  const previewIngressFps = previewPeerCount > 0 ? 0 : previewFps;
+  if (!recordingActive || !camera.record) return previewIngressFps;
+  const recordMode = String(camera.record_mode || "both").toLowerCase();
+  if (recordMode === "jpg" || recordMode === "both") {
+    return Math.max(previewIngressFps, getConfiguredRecordingCameraFps(config));
   }
-  return getConfiguredRecordingCameraFps(config);
+  return previewIngressFps;
 }
 
 function buildStreamStatus(config, d) {
@@ -1380,8 +1452,8 @@ function buildStreamStatus(config, d) {
       recording: !!s.camera.record && s.camera.mode === "stream",
       rate: s.camera.mode === "stream"
         ? (s.camera.record && recordCameraFps > previewCameraFps
-          ? `${previewCameraFps} FPS preview / ${recordCameraFps} FPS recorded (${s.camera.record_mode || "jpg"})`
-          : `${previewCameraFps} FPS (${s.camera.record_mode || "jpg"})`)
+          ? `${previewCameraFps} FPS preview / ${recordCameraFps} FPS recorded (${s.camera.record_mode || "both"})`
+          : `${previewCameraFps} FPS (${s.camera.record_mode || "both"})`)
         : s.camera.mode,
       last_seen_ms: cameraSeenMs || null
     },

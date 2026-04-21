@@ -689,6 +689,7 @@ function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, g
         included_in_multiview: includedInMultiview.has(info.deviceId),
         camera_video: manifestExportPath(result.session_dir, deviceResult.camera_video),
         camera_with_audio: manifestExportPath(result.session_dir, deviceResult.camera_with_audio),
+        camera_chunks_csv: manifestFilePath(result.session_dir, info.cameraChunksPath),
         audio_wav: manifestFilePath(result.session_dir, info.audioWavPath),
         audio_chunks_csv: manifestFilePath(result.session_dir, info.audioChunksPath),
         imu_csv: manifestFilePath(result.session_dir, info.imuCsvPath),
@@ -705,6 +706,7 @@ function buildSessionManifest({ meta, syncReport, deviceInfos, result, layout, g
 function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) {
   const streamsDir = path.join(sessionDir, "devices", sanitizeDeviceId(deviceId), "streams");
   const cameraTimestampsPath = path.join(streamsDir, "camera_timestamps.csv");
+  const cameraChunksPath = path.join(streamsDir, "camera_chunks.csv");
   const cameraDir = path.join(streamsDir, "camera");
   const cameraVideoPath = path.join(streamsDir, "camera_video.mp4");
   const audioWavPath = path.join(streamsDir, "audio.wav");
@@ -714,7 +716,7 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
   const imuCsvPath = path.join(streamsDir, "imu.csv");
   const runConfig = meta?.devices?.[deviceId]?.runConfig || {};
   const deviceReport = syncReport?.devices?.[deviceId] || {};
-  const cameraTimeline = loadCameraTimeline(cameraTimestampsPath, deviceId, syncModels);
+  const cameraTimeline = loadCameraTimeline({ timestampsPath: cameraTimestampsPath, chunksPath: cameraChunksPath, deviceId, syncModels });
   const audioTimeline = loadAudioTimeline({
     audioChunksPath,
     audioCsvPath,
@@ -729,6 +731,7 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
     streamsDir,
     cameraDir,
     cameraTimestampsPath,
+    cameraChunksPath,
     cameraVideoPath,
     audioWavPath,
     audioCsvPath,
@@ -743,24 +746,77 @@ function loadDeviceInfo({ sessionDir, deviceId, meta, syncReport, syncModels }) 
   };
 }
 
-function loadCameraTimeline(timestampsPath, deviceId, syncModels) {
-  if (!timestampsPath || !fs.existsSync(timestampsPath)) return null;
-  const rawRows = readCsvLines(timestampsPath).slice(1).map(parseCameraTimestampRow).filter(Boolean);
-  const rows = buildAlignedCameraRows(rawRows, deviceId, syncModels);
-  if (rows.length < 2) return null;
-  const chosen = chooseTimeline(rows);
-  if (!chosen) return null;
-  const firstRow = chosen.rows[0];
-  const absoluteStartMs = resolveCameraAbsoluteStartMs(firstRow, deviceId, syncModels, chosen.source);
+function loadCameraTimeline({ timestampsPath, chunksPath, deviceId, syncModels }) {
+  if (timestampsPath && fs.existsSync(timestampsPath)) {
+    const rawRows = readCsvLines(timestampsPath).slice(1).map(parseCameraTimestampRow).filter(Boolean);
+    const rows = buildAlignedCameraRows(rawRows, deviceId, syncModels);
+    if (rows.length >= 2) {
+      const chosen = chooseTimeline(rows);
+      if (chosen) {
+        const firstRow = chosen.rows[0];
+        const absoluteStartMs = resolveCameraAbsoluteStartMs(firstRow, deviceId, syncModels, chosen.source);
+        if (Number.isFinite(absoluteStartMs)) {
+          const serverScale = resolveCameraServerScale(deviceId, syncModels, chosen.source);
+          const durationMs = Math.max(0, chosen.values[chosen.values.length - 1] - chosen.values[0]) * serverScale;
+          return {
+            timelineSource: chosen.source,
+            firstRow,
+            rows: chosen.rows,
+            absoluteStartMs,
+            durationMs,
+            serverScale
+          };
+        }
+      }
+    }
+  }
+
+  if (!chunksPath || !fs.existsSync(chunksPath)) return null;
+  const rows = readCsvLines(chunksPath).slice(1).map(parseCameraChunkRow).filter(Boolean);
+  if (!rows.length) return null;
+  const first = rows[0];
+  const startDeviceMs = Number.isFinite(first.captureStartDeviceMs)
+    ? first.captureStartDeviceMs
+    : (Number.isFinite(first.tDeviceMs) ? first.tDeviceMs - first.durationMs : null);
+  const startServerMs = Number.isFinite(first.tServerRxNs) ? (first.tServerRxNs / 1_000_000) - first.durationMs : null;
+  const startRecvMs = Number.isFinite(first.tRecvMs) ? first.tRecvMs - first.durationMs : null;
+  let durationMs = rows.reduce((sum, row) => sum + (Number.isFinite(row.durationMs) ? Math.max(0, row.durationMs) : 0), 0);
+  if (!(durationMs > 0)) {
+    const last = rows[rows.length - 1];
+    if (Number.isFinite(last.tDeviceMs) && Number.isFinite(startDeviceMs)) durationMs = Math.max(0, last.tDeviceMs - startDeviceMs);
+    else if (Number.isFinite(last.tServerRxNs) && Number.isFinite(startServerMs)) durationMs = Math.max(0, (last.tServerRxNs / 1_000_000) - startServerMs);
+    else if (Number.isFinite(last.tRecvMs) && Number.isFinite(startRecvMs)) durationMs = Math.max(0, last.tRecvMs - startRecvMs);
+  }
+  let absoluteStartMs = null;
+  let timelineSource = null;
+  if (Number.isFinite(startDeviceMs)) {
+    absoluteStartMs = alignUtcMs(syncModels, deviceId, startDeviceMs, first.tServerRxNs);
+    if (Number.isFinite(absoluteStartMs)) timelineSource = "t_device_ms";
+  }
+  if (!Number.isFinite(absoluteStartMs) && Number.isFinite(startServerMs)) {
+    absoluteStartMs = startServerMs;
+    timelineSource = "t_server_rx_ns";
+  }
+  if (!Number.isFinite(absoluteStartMs) && Number.isFinite(startRecvMs)) {
+    absoluteStartMs = startRecvMs;
+    timelineSource = "t_recv_ms";
+  }
   if (!Number.isFinite(absoluteStartMs)) return null;
-  const serverScale = resolveCameraServerScale(deviceId, syncModels, chosen.source);
-  const durationMs = Math.max(0, chosen.values[chosen.values.length - 1] - chosen.values[0]) * serverScale;
+  const serverScale = timelineSource === "t_device_ms"
+    ? resolveGlobalServerScale(deviceId, syncModels)
+    : 1;
+  const firstRow = {
+    filename: null,
+    tDeviceMs: Number.isFinite(startDeviceMs) ? startDeviceMs : null,
+    tRecvMs: Number.isFinite(startRecvMs) ? startRecvMs : null,
+    tServerRxNs: Number.isFinite(startServerMs) ? Math.round(startServerMs * 1_000_000) : null
+  };
   return {
-    timelineSource: chosen.source,
+    timelineSource,
     firstRow,
-    rows: chosen.rows,
+    rows: null,
     absoluteStartMs,
-    durationMs,
+    durationMs: Math.max(0, durationMs) * serverScale,
     serverScale
   };
 }
@@ -1262,6 +1318,20 @@ function parseCameraTimestampRow(line) {
     tDeviceMs: toFiniteNumber(parts[2]),
     tRecvMs: toFiniteNumber(parts[3]),
     tServerRxNs: toFiniteNumber(parts[4])
+  };
+}
+
+function parseCameraChunkRow(line) {
+  const parts = line.split(",");
+  if (parts.length < 7) return null;
+  return {
+    chunkIndex: toFiniteNumber(parts[0]),
+    tRecvMs: toFiniteNumber(parts[1]),
+    tDeviceMs: toFiniteNumber(parts[2]),
+    tServerRxNs: parts[3] === "" ? null : toFiniteNumber(parts[3]),
+    durationMs: toFiniteNumber(parts[4]),
+    bytes: toFiniteNumber(parts[5]),
+    captureStartDeviceMs: parts[6] === "" ? null : toFiniteNumber(parts[6])
   };
 }
 
