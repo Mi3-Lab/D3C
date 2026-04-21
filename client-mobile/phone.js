@@ -43,12 +43,14 @@
   const GPS_LIVE_TRAIL_MAX_POINTS = 2400;
   const GPS_LIVE_DRAW_MAX_POINTS = 700;
   const GPS_LIVE_COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#b197fc", "#63e6be", "#ffa94d", "#f783ac"];
+  const CAMERA_VIDEO_CHUNK_TIMESLICE_MS = 1000;
+  const CAMERA_BINARY_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024;
 
   const DEFAULT_RUN_CONFIG = {
     device_id: resolveDeviceId(),
     streams: {
       imu: { enabled: true, rate_hz: 30, record: false },
-      camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "jpg", video_fps: 30 },
+      camera: { mode: "off", fps: 10, jpeg_q: 0.6, record: false, record_mode: "both", video_fps: 30 },
       gps: { enabled: false, rate_hz: 1, record: false },
       audio: { enabled: false, rate_hz: 10, record: false },
       device: { enabled: true, rate_hz: 1, record: false },
@@ -88,6 +90,16 @@
   let imuLastSent = 0;
   let cameraStream = null;
   let frameTimer = null;
+  let cameraVideoRecorder = null;
+  let cameraVideoRecorderMimeType = "";
+  let cameraVideoRecorderStream = null;
+  let cameraVideoRecorderStartDeviceMs = 0;
+  let cameraVideoRecorderLastChunkDeviceMs = 0;
+  let cameraVideoRecorderChunkIndex = 0;
+  let cameraVideoRecorderFallback = false;
+  let cameraVideoRecorderStopPromise = null;
+  let cameraVideoRecorderSendChain = Promise.resolve();
+  let cameraVideoRecorderSyncChain = Promise.resolve();
   let canvas = null;
   let ctx2d = null;
   let micStream = null;
@@ -289,7 +301,11 @@
           return;
         }
         if (msg.type === "recording_state") {
+          const wasRecording = sessionRecordingActive;
           sessionRecordingActive = !!msg.active;
+          if (sessionRecordingActive && !wasRecording) {
+            cameraVideoRecorderFallback = false;
+          }
           if (!sessionRecordingActive) flushPcmChunk(audioCtx?.sampleRate || 48000);
           updateCameraTransport();
           void ensureAudioRunning();
@@ -435,7 +451,6 @@
       if (capturing) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (runConfig.streams.camera.mode !== "stream") return;
-      if (!wsClient?.canSendBinary()) return;
       const w = previewEl.videoWidth;
       const h = previewEl.videoHeight;
       if (!w || !h) return;
@@ -454,21 +469,20 @@
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", q));
         if (!blob) return;
         const buffer = await blob.arrayBuffer();
-        if (!wsClient?.canSendBinary()) return;
-        queueJson({
+        if (!sendBinaryMessage({
           type: "camera_header",
           device_id: runConfig.device_id,
           t_device_ms: getDeviceMonoMs(),
           frame_id: "phone_camera",
           format: "jpeg",
-          lighting_score: lightingScore
-        });
-        if (!wsClient?.sendBinary(buffer)) return;
+          lighting_score: lightingScore,
+          record_for_session: shouldRecordCameraSnapshotsForSession()
+        }, buffer)) return;
         lastCameraFrameMs = Date.now();
       } finally {
         capturing = false;
       }
-    }, Math.max(16, Math.floor(1000 / getActiveCameraCaptureFps())));
+    }, Math.max(16, Math.floor(1000 / getSnapshotLoopFps())));
   }
 
   function stopFrameLoop() {
@@ -485,37 +499,77 @@
     return Math.max(getPreviewCameraFps(), Number(runConfig.streams.camera?.video_fps || runConfig.streams.camera?.fps || 10));
   }
 
-  function getActiveCameraCaptureFps() {
-    if (sessionRecordingActive && runConfig.streams.camera?.record) {
-      return getRecordingCameraFps();
-    }
-    return getPreviewCameraFps();
+  function getCameraRecordMode() {
+    const mode = String(runConfig.streams.camera?.record_mode || "both").toLowerCase();
+    if (mode === "jpg" || mode === "video" || mode === "both") return mode;
+    return "both";
+  }
+
+  function canDirectRecordCameraVideo() {
+    return typeof MediaRecorder === "function";
+  }
+
+  function shouldUseDirectCameraRecorder() {
+    return started &&
+      !!cameraStream &&
+      runConfig.streams.camera.mode === "stream" &&
+      sessionRecordingActive &&
+      !!runConfig.streams.camera?.record &&
+      getCameraRecordMode() !== "jpg" &&
+      canDirectRecordCameraVideo() &&
+      !cameraVideoRecorderFallback;
+  }
+
+  function shouldRecordCameraSnapshotsForSession() {
+    if (!(sessionRecordingActive && runConfig.streams.camera?.record)) return false;
+    const recordMode = getCameraRecordMode();
+    if (recordMode === "jpg" || recordMode === "both") return true;
+    return !canDirectRecordCameraVideo() || cameraVideoRecorderFallback;
+  }
+
+  function getSnapshotLoopFps() {
+    return shouldRecordCameraSnapshotsForSession()
+      ? getRecordingCameraFps()
+      : getPreviewCameraFps();
+  }
+
+  function isDirectCameraRecorderActive() {
+    return !!cameraVideoRecorder && cameraVideoRecorder.state !== "inactive";
   }
 
   function shouldRunSnapshotLoop() {
     const mode = runConfig.streams.camera.mode === "preview" ? "stream" : runConfig.streams.camera.mode;
-    return started && mode === "stream" && (sessionRecordingActive || connectedPreviewPeerCount() === 0);
+    return started &&
+      mode === "stream" &&
+      (connectedPreviewPeerCount() === 0 || shouldRecordCameraSnapshotsForSession());
   }
 
   function updateCameraTransport() {
     if (!cameraStream || !shouldRunSnapshotLoop()) {
       stopFrameLoop();
-      return;
+    } else {
+      startFrameLoop();
     }
-    startFrameLoop();
+    void syncDirectCameraRecorder();
   }
 
   function stopCamera() {
     stopFrameLoop();
-    if (!cameraStream) return;
+    if (!cameraStream) {
+      void syncDirectCameraRecorder();
+      return;
+    }
     for (const t of cameraStream.getTracks()) t.stop();
     cameraStream = null;
     previewEl.srcObject = null;
+    cameraVideoRecorderFallback = false;
+    void syncDirectCameraRecorder();
     emitPreviewStatus(true);
   }
 
   async function restartCamera() {
     stopFrameLoop();
+    cameraVideoRecorderFallback = false;
     if (cameraStream) {
       for (const t of cameraStream.getTracks()) t.stop();
     }
@@ -1210,17 +1264,24 @@
     const width = Number(previewEl?.videoWidth || 0);
     const height = Number(previewEl?.videoHeight || 0);
     const previewFps = getPreviewCameraFps();
+    const snapshotFps = getSnapshotLoopFps();
     const recordFps = getRecordingCameraFps();
     const recordingCaptureActive = sessionRecordingActive && !!runConfig.streams.camera?.record;
+    const directRecordingActive = isDirectCameraRecorderActive() && !cameraVideoRecorderFallback;
+    const directRecordingLabel = directRecordingActive ? `${recordFps} FPS direct record` : `${recordFps} FPS record`;
     cameraPreviewBadge.textContent = streaming ? "LIVE" : (active ? "WAITING" : "OFF");
     cameraPreviewBadge.className = `badge ${streaming ? "live" : active ? "pending" : "off"}`;
     cameraPreviewFps.textContent = streaming
       ? (connectedPreviewPeerCount() > 0
-        ? (recordingCaptureActive ? `RTC + ${recordFps} REC` : "RTC")
-        : `${getActiveCameraCaptureFps()} FPS`)
+        ? (recordingCaptureActive ? (directRecordingActive ? "RTC + VIDEO REC" : `RTC + ${recordFps} REC`) : "RTC")
+        : (recordingCaptureActive && directRecordingActive ? `${previewFps} FPS + VIDEO REC` : `${snapshotFps} FPS`))
       : "0 FPS";
     const parts = [];
-    parts.push(`Camera: ${active ? (connectedPreviewPeerCount() > 0 ? (recordingCaptureActive ? `WebRTC live / ${recordFps} FPS record` : "WebRTC live") : `${previewFps} FPS preview`) : "Off"}`);
+    parts.push(`Camera: ${active
+      ? (connectedPreviewPeerCount() > 0
+        ? (recordingCaptureActive ? `WebRTC live / ${directRecordingLabel}` : "WebRTC live")
+        : (recordingCaptureActive && directRecordingActive ? `${previewFps} FPS preview / ${directRecordingLabel}` : `${snapshotFps} FPS preview`))
+      : "Off"}`);
     parts.push(width && height ? `Resolution: ${width}x${height}` : "Resolution: --");
     parts.push(`Facing: ${cameraFacingMode === "user" ? "Front" : "Rear"}`);
     cameraPreviewMeta.innerHTML = parts.map((part) => `<span>${part}</span>`).join("<span>•</span>");
@@ -1467,6 +1528,7 @@
     if (cameraStream) return cameraStream;
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacingMode }, audio: false });
+      cameraVideoRecorderFallback = false;
       cameraPermissionState = "granted";
       previewEl.srcObject = cameraStream;
       try { await previewEl.play?.(); } catch {}
@@ -1701,6 +1763,174 @@
     wsClient?.sendJson(obj);
   }
 
+  function sendBinaryMessage(header, buffer, { maxBufferedBytes = CAMERA_BINARY_BUFFER_LIMIT_BYTES } = {}) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !header || !buffer) return false;
+    const size = Number(buffer.byteLength || buffer.length || 0);
+    if (size > 0 && (ws.bufferedAmount + size) > maxBufferedBytes) return false;
+    try {
+      ws.send(JSON.stringify(header));
+      ws.send(buffer);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveDirectCameraRecorderMimeType() {
+    if (typeof MediaRecorder !== "function" || typeof MediaRecorder.isTypeSupported !== "function") return "";
+    const candidates = [
+      "video/mp4;codecs=avc1.42E01E",
+      "video/mp4",
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm"
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+      } catch {}
+    }
+    return "";
+  }
+
+  function parseVideoBitsPerSecond(value) {
+    const text = String(value || "").trim().toUpperCase();
+    const match = text.match(/^(\d+(?:\.\d+)?)([KMG])?$/);
+    if (!match) return 0;
+    const num = Number(match[1]);
+    if (!Number.isFinite(num) || num <= 0) return 0;
+    const scale = match[2] === "G" ? 1_000_000_000 : match[2] === "M" ? 1_000_000 : match[2] === "K" ? 1_000 : 1;
+    return Math.round(num * scale);
+  }
+
+  function resetDirectCameraRecorderState() {
+    cameraVideoRecorder = null;
+    cameraVideoRecorderMimeType = "";
+    cameraVideoRecorderStream = null;
+    cameraVideoRecorderStartDeviceMs = 0;
+    cameraVideoRecorderLastChunkDeviceMs = 0;
+    cameraVideoRecorderChunkIndex = 0;
+    cameraVideoRecorderStopPromise = null;
+    cameraVideoRecorderSendChain = Promise.resolve();
+  }
+
+  async function startDirectCameraRecorder() {
+    if (!cameraStream || typeof MediaRecorder !== "function") return false;
+    if (isDirectCameraRecorderActive() && cameraVideoRecorderStream === cameraStream) return true;
+    if (isDirectCameraRecorderActive()) {
+      await stopDirectCameraRecorder();
+    }
+
+    const preferredMimeType = resolveDirectCameraRecorderMimeType();
+    const options = {};
+    if (preferredMimeType) options.mimeType = preferredMimeType;
+    const bitsPerSecond = parseVideoBitsPerSecond(runConfig.streams.camera?.video_bitrate);
+    if (bitsPerSecond > 0) options.videoBitsPerSecond = bitsPerSecond;
+
+    let recorder = null;
+    try {
+      recorder = Object.keys(options).length ? new MediaRecorder(cameraStream, options) : new MediaRecorder(cameraStream);
+    } catch {
+      try {
+        recorder = new MediaRecorder(cameraStream);
+      } catch {
+        cameraVideoRecorderFallback = true;
+        renderStatus();
+        updateCameraTransport();
+        return false;
+      }
+    }
+
+    cameraVideoRecorder = recorder;
+    cameraVideoRecorderStream = cameraStream;
+    cameraVideoRecorderMimeType = String(recorder.mimeType || preferredMimeType || "");
+    cameraVideoRecorderStartDeviceMs = getDeviceMonoMs();
+    cameraVideoRecorderLastChunkDeviceMs = cameraVideoRecorderStartDeviceMs;
+    cameraVideoRecorderChunkIndex = 0;
+    cameraVideoRecorderSendChain = Promise.resolve();
+    cameraVideoRecorderStopPromise = new Promise((resolve) => {
+      recorder.addEventListener("stop", () => resolve(true), { once: true });
+      recorder.addEventListener("error", () => resolve(false), { once: true });
+    });
+
+    recorder.addEventListener("dataavailable", (ev) => {
+      const blob = ev.data;
+      if (!blob || !blob.size) return;
+      const chunkEndDeviceMs = getDeviceMonoMs();
+      const previousChunkEndMs = cameraVideoRecorderLastChunkDeviceMs || cameraVideoRecorderStartDeviceMs || chunkEndDeviceMs;
+      const durationMs = Math.max(0, chunkEndDeviceMs - previousChunkEndMs);
+      cameraVideoRecorderLastChunkDeviceMs = chunkEndDeviceMs;
+      cameraVideoRecorderChunkIndex += 1;
+      const chunkIndex = cameraVideoRecorderChunkIndex;
+      const mimeType = String(blob.type || recorder.mimeType || preferredMimeType || cameraVideoRecorderMimeType || "video/webm");
+      cameraVideoRecorderMimeType = mimeType;
+      cameraVideoRecorderSendChain = cameraVideoRecorderSendChain.then(async () => {
+        const buffer = await blob.arrayBuffer();
+        sendBinaryMessage({
+          type: "camera_video_chunk_header",
+          device_id: runConfig.device_id,
+          t_device_ms: chunkEndDeviceMs,
+          duration_ms: Number(durationMs.toFixed(1)),
+          chunk_index: chunkIndex,
+          mime_type: mimeType,
+          capture_start_device_ms: Number(cameraVideoRecorderStartDeviceMs || 0)
+        }, buffer);
+      }).catch(() => {});
+    });
+
+    recorder.addEventListener("error", () => {
+      cameraVideoRecorderFallback = true;
+      renderStatus();
+      updateCameraTransport();
+    });
+
+    try {
+      recorder.start(CAMERA_VIDEO_CHUNK_TIMESLICE_MS);
+      cameraVideoRecorderFallback = false;
+      renderStatus();
+      return true;
+    } catch {
+      resetDirectCameraRecorderState();
+      cameraVideoRecorderFallback = true;
+      renderStatus();
+      updateCameraTransport();
+      return false;
+    }
+  }
+
+  async function stopDirectCameraRecorder() {
+    const recorder = cameraVideoRecorder;
+    const stopPromise = cameraVideoRecorderStopPromise;
+    if (!recorder) return true;
+    if (recorder.state !== "inactive") {
+      try {
+        recorder.stop();
+      } catch {}
+      if (stopPromise) {
+        try { await stopPromise; } catch {}
+      }
+    }
+    try { await cameraVideoRecorderSendChain; } catch {}
+    resetDirectCameraRecorderState();
+    renderStatus();
+    return true;
+  }
+
+  async function syncDirectCameraRecorderNow() {
+    if (shouldUseDirectCameraRecorder()) {
+      await startDirectCameraRecorder();
+      return;
+    }
+    await stopDirectCameraRecorder();
+  }
+
+  function syncDirectCameraRecorder() {
+    cameraVideoRecorderSyncChain = cameraVideoRecorderSyncChain
+      .then(() => syncDirectCameraRecorderNow())
+      .catch(() => {});
+    return cameraVideoRecorderSyncChain;
+  }
+
   function getDeviceMonoMs() {
     return performance.now();
   }
@@ -1820,7 +2050,8 @@
       gps: !!navigator.geolocation,
       battery: !!navigator.getBattery,
       wake_lock: "wakeLock" in navigator,
-      webrtc_preview: typeof RTCPeerConnection === "function"
+      webrtc_preview: typeof RTCPeerConnection === "function",
+      camera_direct_recording: canDirectRecordCameraVideo()
     };
   }
 

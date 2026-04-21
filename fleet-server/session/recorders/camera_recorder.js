@@ -6,18 +6,23 @@ class CameraRecorder {
   constructor(streamsDir) {
     this.cameraDir = path.join(streamsDir, "camera");
     this.timestampsPath = path.join(streamsDir, "camera_timestamps.csv");
+    this.videoChunksPath = path.join(streamsDir, "camera_chunks.csv");
     this.videoPath = path.join(streamsDir, "camera_video.mp4");
     this.frameIndex = 0;
+    this.directVideoChunkIndex = 0;
     this.initialized = false;
+    this.directVideoInitialized = false;
     this.mode = "jpg";
     this.ffmpegProc = null;
     this.realtimeEncode = false;
     this.realtimeClosed = false;
+    this.directVideoPath = null;
+    this.directVideoMimeType = "";
   }
 
   ensureInit(mode = "jpg") {
+    this.mode = mergeRecordModes(this.mode, mode);
     if (this.initialized) return;
-    this.mode = mode;
     fs.mkdirSync(this.cameraDir, { recursive: true });
     fs.writeFileSync(this.timestampsPath, "index,filename,t_device_ms,t_recv_ms,t_server_rx_ns\n", "utf8");
     this.initialized = true;
@@ -47,6 +52,35 @@ class CameraRecorder {
         }
       }
     }
+  }
+
+  ensureDirectVideoInit(mimeType = "") {
+    if (this.directVideoInitialized) return;
+    this.directVideoMimeType = String(mimeType || "").trim().toLowerCase();
+    const ext = chooseDirectVideoExtension(this.directVideoMimeType);
+    this.directVideoPath = path.join(path.dirname(this.videoPath), `camera_video_source${ext}`);
+    safeRemoveFile(this.directVideoPath);
+    safeRemoveFile(this.videoPath);
+    fs.writeFileSync(
+      this.videoChunksPath,
+      "chunk_index,t_recv_ms,t_device_ms,t_server_rx_ns,duration_ms,bytes,capture_start_device_ms\n",
+      "utf8"
+    );
+    this.directVideoInitialized = true;
+  }
+
+  writeVideoChunk({ chunkBuffer, t_device_ms, duration_ms = 0, chunk_index = 0, mime_type = "", capture_start_device_ms = null, t_recv_ms, t_server_rx_ns = "", record_mode = "video" }) {
+    if (!chunkBuffer || !chunkBuffer.length) return;
+    this.mode = mergeRecordModes(this.mode, record_mode);
+    this.ensureDirectVideoInit(mime_type);
+    fs.appendFileSync(this.directVideoPath, chunkBuffer);
+    this.directVideoChunkIndex += 1;
+    const rowIndex = Number(chunk_index || 0) > 0 ? Number(chunk_index) : this.directVideoChunkIndex;
+    fs.appendFileSync(
+      this.videoChunksPath,
+      `${rowIndex},${Number(t_recv_ms || 0)},${Number(t_device_ms || 0)},${t_server_rx_ns ?? ""},${Number(duration_ms || 0)},${chunkBuffer.length},${capture_start_device_ms ?? ""}\n`,
+      "utf8"
+    );
   }
 
   ensureRealtimeEncoder({ fps, bitrate, crf, ffmpegBin }) {
@@ -91,11 +125,11 @@ class CameraRecorder {
     cleanupAfterEncode = false,
     forcePostSessionMp4 = false
   }) {
-    if (!this.initialized) return { ok: true, skipped: true };
+    if (!this.initialized && !this.directVideoInitialized) return { ok: true, skipped: true };
 
     const shouldEncodeVideo = forcePostSessionMp4 || this.mode === "video" || this.mode === "both";
     if (!shouldEncodeVideo) return { ok: true, skipped: true };
-    if (!this.frameIndex) return { ok: true, skipped: true };
+    if (!this.frameIndex && !this.directVideoChunkIndex) return { ok: true, skipped: true };
 
     if (encodeTiming === "manual") {
       return { ok: true, skipped: true, reason: "manual" };
@@ -107,10 +141,39 @@ class CameraRecorder {
       return { ok: true, skipped: false, videoPath: this.videoPath, mode: "realtime" };
     }
 
+    let directError = null;
+    if (this.directVideoInitialized) {
+      const directResult = await this.finalizeDirectVideo({ fps, ffmpegBin, bitrate, crf });
+      if (directResult.ok && !directResult.skipped) return { ...directResult, mode: "direct" };
+      if (!directResult.ok) directError = directResult.error || "direct video finalize failed";
+      if (!this.frameIndex) return directResult;
+    }
+
     const result = await this.encodeFromJpgSequence({ fps, ffmpegBin, bitrate, crf });
     if (result.ok && cleanupAfterEncode && this.mode === "video") {
       safeRemoveDir(this.cameraDir);
     }
+    if (result.ok && directError) result.warning = `direct_video_failed: ${directError}`;
+    return result;
+  }
+
+  async finalizeDirectVideo({ fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23 }) {
+    if (!this.directVideoInitialized || !this.directVideoPath || !fs.existsSync(this.directVideoPath)) {
+      return { ok: true, skipped: true };
+    }
+    const stats = safeStat(this.directVideoPath);
+    if (!stats || !stats.size) {
+      return { ok: true, skipped: true, reason: "direct_video_empty" };
+    }
+    const result = await finalizeDirectVideoToMp4({
+      inputPath: this.directVideoPath,
+      outMp4: this.videoPath,
+      ffmpegBin,
+      fps,
+      bitrate,
+      crf
+    });
+    if (result.ok) safeRemoveFile(this.directVideoPath);
     return result;
   }
 
@@ -161,6 +224,42 @@ function safeRemoveDir(dirPath) {
   try {
     fs.rmSync(dirPath, { recursive: true, force: true });
   } catch {}
+}
+
+function safeRemoveFile(filePath) {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch {}
+}
+
+function safeStat(filePath) {
+  try {
+    return fs.statSync(filePath);
+  } catch {
+    return null;
+  }
+}
+
+function mergeRecordModes(current, next) {
+  const curr = normalizeRecordMode(current);
+  const incoming = normalizeRecordMode(next);
+  if (curr === incoming) return curr;
+  if (curr === "both" || incoming === "both") return "both";
+  if ((curr === "jpg" && incoming === "video") || (curr === "video" && incoming === "jpg")) return "both";
+  return incoming;
+}
+
+function normalizeRecordMode(mode) {
+  return mode === "video" || mode === "both" ? mode : "jpg";
+}
+
+function chooseDirectVideoExtension(mimeType = "") {
+  const lower = String(mimeType || "").toLowerCase();
+  if (lower.includes("mp4")) return ".mp4";
+  if (lower.includes("mov") || lower.includes("quicktime")) return ".mov";
+  if (lower.includes("ogg") || lower.includes("ogv")) return ".ogv";
+  if (lower.includes("mkv") || lower.includes("matroska")) return ".mkv";
+  return ".webm";
 }
 
 module.exports = {
@@ -216,6 +315,57 @@ function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBi
         timing_mode: timing ? "timestamped" : "fixed_fps",
         timing_source: timing?.source || null
       });
+    });
+  });
+}
+
+async function finalizeDirectVideoToMp4({ inputPath, outMp4, ffmpegBin = "ffmpeg", fps = 30, bitrate = "2M", crf = 23 }) {
+  const resolvedInputPath = path.resolve(inputPath);
+  const resolvedOutMp4 = path.resolve(outMp4);
+  const inputExt = path.extname(resolvedInputPath).toLowerCase();
+  if (inputExt === ".mp4") {
+    const copyResult = await runFfmpeg(ffmpegBin, [
+      "-y",
+      "-i",
+      resolvedInputPath,
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      resolvedOutMp4
+    ]);
+    if (copyResult.ok) {
+      return { ok: true, skipped: false, videoPath: resolvedOutMp4, timing_mode: "direct_chunks", source_path: resolvedInputPath };
+    }
+  }
+
+  const transcodeResult = await runFfmpeg(ffmpegBin, [
+    "-y",
+    "-i",
+    resolvedInputPath,
+    ...buildH264Mp4VideoArgs({ fps, bitrate, crf }),
+    resolvedOutMp4
+  ]);
+  if (!transcodeResult.ok) return transcodeResult;
+  return { ok: true, skipped: false, videoPath: resolvedOutMp4, timing_mode: "direct_chunks", source_path: resolvedInputPath };
+}
+
+function runFfmpeg(ffmpegBin, args) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegBin, args, { windowsHide: true });
+    let stderr = "";
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+    proc.on("error", (err) => {
+      resolve({ ok: false, error: err.message });
+    });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        resolve({ ok: false, error: `ffmpeg exit ${code}: ${stderr.slice(-400)}` });
+        return;
+      }
+      resolve({ ok: true, skipped: false });
     });
   });
 }

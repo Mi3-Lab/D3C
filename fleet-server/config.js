@@ -9,7 +9,7 @@ const DEFAULT_RUN_CONFIG = {
       fps: 10,
       jpeg_q: 0.6,
       record: false,
-      record_mode: "jpg",
+      record_mode: "both",
       encode_timing: "post_session",
       auto_mp4_on_stop: true,
       jpg_quality: 85,

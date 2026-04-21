@@ -181,12 +181,23 @@ class SessionManager {
     this.getRecorders(deviceId).camera ??= new CameraRecorder(this.getStreamsDir(deviceId));
     this.getRecorders(deviceId).camera.writeFrame({
       ...frame,
-      record_mode: c.record_mode || "jpg",
+      record_mode: c.record_mode || "both",
       encode_timing: c.encode_timing || "post_session",
       fps: c.video_fps || c.fps || 10,
       bitrate: c.video_bitrate || "2M",
       crf: Number.isFinite(c.video_crf) ? c.video_crf : 23,
       ffmpegBin: process.env.FFMPEG_BIN || "ffmpeg",
+    });
+  }
+
+  writeCameraVideoChunk(deviceId, chunk) {
+    const cfg = this.getConfig(deviceId);
+    const c = cfg?.streams?.camera;
+    if (!c?.record || c.mode !== "stream") return;
+    this.getRecorders(deviceId).camera ??= new CameraRecorder(this.getStreamsDir(deviceId));
+    this.getRecorders(deviceId).camera.writeVideoChunk({
+      ...chunk,
+      record_mode: c.record_mode || "both"
     });
   }
 
@@ -351,8 +362,6 @@ function appendControlLog(controlLogPath, entry) {
 module.exports = {
   SessionManager
 };
-
-
 
 
 
