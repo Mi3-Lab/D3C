@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>D3C / Datasets</title>
+  <title>D3C / View Outputs</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap" />
@@ -16,16 +16,16 @@
         <span class="topbar-logo">D3C</span>
         <div class="topbar-copy">
           <span class="topbar-kicker">Distributed Driving Data Collective</span>
-          <span class="topbar-title">Datasets</span>
+          <span class="topbar-title">View Outputs</span>
         </div>
       </div>
       <nav class="topbar-nav" aria-label="Dashboard sections">
         <a class="topbar-link" href="/dashboard">Live</a>
-        <a class="topbar-link is-active" href="/dashboard/datasets">Datasets</a>
+        <a class="topbar-link is-active" href="/dashboard/datasets">View Outputs</a>
       </nav>
     </div>
     <div class="topbar-right">
-      <span id="datasetsRefreshStatus" class="topbar-note">5s auto</span>
+      <button id="refreshDatasetsBtn" class="btn btn-small">Refresh</button>
       <button id="logoutBtn" class="btn btn-alt btn-small">Log Out</button>
     </div>
   </header>
@@ -33,10 +33,7 @@
   <main class="dashboard-main datasets-page-main">
     <section class="dashboard-hero datasets-hero">
       <div class="dashboard-hero-copy">
-        <h1>Datasets</h1>
-      </div>
-      <div class="datasets-hero-actions">
-        <button id="refreshDatasetsBtn" class="btn btn-small">Refresh</button>
+        <h1>View Outputs</h1>
       </div>
     </section>
 
@@ -48,9 +45,23 @@
           <div class="datasets-sidebar-copy">
             <h2>Sessions</h2>
           </div>
-          <label class="datasets-filter-label">
-            <input id="datasetsFilterInput" type="text" placeholder="Search" aria-label="Search sessions" />
-          </label>
+          <div class="datasets-sidebar-tools">
+            <label class="datasets-filter-label">
+              <span class="datasets-field-label">Search</span>
+              <input id="datasetsFilterInput" type="text" placeholder="Search" aria-label="Search sessions" />
+            </label>
+            <label class="datasets-sort-label">
+              <span class="datasets-field-label">Sort</span>
+              <select id="datasetsSortSelect" aria-label="Sort sessions">
+                <option value="updated_desc">Newest</option>
+                <option value="updated_asc">Oldest</option>
+                <option value="name_asc">A-Z</option>
+                <option value="name_desc">Z-A</option>
+                <option value="size_desc">Largest</option>
+                <option value="duration_desc">Longest</option>
+              </select>
+            </label>
+          </div>
         </div>
         <div id="datasetsList" class="datasets-list"></div>
       </aside>
@@ -60,6 +71,20 @@
       </section>
     </section>
   </main>
+
+  <div id="datasetsActionModal" class="phone-modal datasets-modal" hidden>
+    <div class="phone-modal-backdrop" data-modal-close></div>
+    <div class="phone-modal-dialog datasets-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="datasetsModalTitle">
+      <div class="phone-modal-head">
+        <h2 id="datasetsModalTitle">Action</h2>
+        <p id="datasetsModalCopy" class="phone-modal-copy"></p>
+      </div>
+      <div class="phone-modal-actions datasets-modal-actions">
+        <button id="datasetsModalCancel" type="button" class="btn btn-alt">Cancel</button>
+        <button id="datasetsModalConfirm" type="button" class="btn">Confirm</button>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/dashboard-datasets.js"></script>
 </body>

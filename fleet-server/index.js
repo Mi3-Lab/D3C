@@ -205,6 +205,55 @@ app.post("/api/datasets/:id/exports", requireDashboardAuth("api"), express.json(
   if (!result.ok) return res.status(500).json(result);
   res.json(result);
 });
+app.patch("/api/datasets/:id", requireDashboardAuth("api"), express.json(), (req, res) => {
+  const id = sanitizeSessionId(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid id" });
+  const root = path.join(DATASETS_ROOT, id);
+  if (!fs.existsSync(root)) return res.status(404).json({ error: "not found" });
+  const sessionName = String(req.body?.session_name || "").trim();
+  if (!sessionName) return res.status(400).json({ error: "session_name required" });
+
+  try {
+    const activeSessionId = recording?.session_dir ? path.basename(String(recording.session_dir || "")) : "";
+    if (recording?.active && activeSessionId === id) {
+      return res.status(409).json({ error: "active session cannot be renamed" });
+    }
+
+    const nextId = makeSessionIdFromName(sessionName) || id;
+    if (nextId !== id && fs.existsSync(path.join(DATASETS_ROOT, nextId))) {
+      return res.status(409).json({ error: "session name already exists" });
+    }
+
+    let finalId = id;
+    let finalRoot = root;
+    if (nextId !== id) {
+      finalRoot = path.join(DATASETS_ROOT, nextId);
+      fs.renameSync(root, finalRoot);
+      finalId = nextId;
+    }
+
+    const metaPath = path.join(finalRoot, "meta.json");
+    const meta = safeReadJson(metaPath) || {};
+    meta.session_name = sessionName;
+    fs.writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+    appendControlLog(path.join(finalRoot, "control_log.jsonl"), {
+      type: "session_rename",
+      at_iso: new Date().toISOString(),
+      previous_id: id,
+      session_id: finalId,
+      session_name: sessionName
+    });
+    res.json({
+      ok: true,
+      id: finalId,
+      previous_id: id,
+      session_name: sessionName,
+      renamed_folder: finalId !== id
+    });
+  } catch {
+    res.status(500).json({ error: "rename failed" });
+  }
+});
 app.delete("/api/datasets/:id", requireDashboardAuth("api"), (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid id" });
@@ -2111,6 +2160,18 @@ function sanitizeSessionId(raw) {
   return raw;
 }
 
+function makeSessionIdFromName(raw) {
+  const slug = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_")
+    .slice(0, 96);
+  if (!slug) return null;
+  return sanitizeSessionId(`session_${slug}`);
+}
+
 function toUrlIfExists(absPath, urlPath) {
   if (!fs.existsSync(absPath)) return null;
   return urlPath;
@@ -2149,6 +2210,8 @@ function buildDatasetSummary(id) {
     const meta = safeReadJson(path.join(root, "meta.json"));
     const sync = safeReadJson(path.join(root, "sync_report.json"));
     const exportsRoot = path.join(root, EXPORTS_DIRNAME);
+    const sessionSizeBytes = dirSizeBytes(root);
+    const durationMs = datasetDurationMs({ meta, sync, fallbackEndMs: Number(stat.mtimeMs || Date.now()) });
     const deviceIds = new Set();
 
     for (const value of meta?.target_device_ids || []) deviceIds.add(String(value));
@@ -2183,6 +2246,8 @@ function buildDatasetSummary(id) {
       target_device_ids: Array.isArray(meta?.target_device_ids) ? meta.target_device_ids : normalizedDeviceIds,
       requested_modalities: Array.isArray(meta?.requested_modalities) ? meta.requested_modalities : [],
       dataset_format: meta?.dataset_format || null,
+      session_size_bytes: sessionSizeBytes,
+      duration_ms: durationMs,
       device_count: Number(sync?.device_count || normalizedDeviceIds.length || 0),
       device_ids: normalizedDeviceIds,
       device_names: Object.fromEntries(normalizedDeviceIds.map((deviceId) => [
@@ -2198,6 +2263,29 @@ function buildDatasetSummary(id) {
   } catch {
     return null;
   }
+}
+
+function datasetDurationMs({ meta, sync, fallbackEndMs = Date.now() }) {
+  const metaStartMs = new Date(meta?.start_time_iso || meta?.created_at_iso || "").getTime();
+  let startMs = Number.isFinite(metaStartMs) && metaStartMs > 0 ? metaStartMs : Infinity;
+  if (!Number.isFinite(startMs) || startMs <= 0) startMs = Infinity;
+  let endMs = 0;
+
+  for (const device of Object.values(sync?.devices || {})) {
+    for (const segment of device?.sync?.segments || []) {
+      const segStart = Number(segment?.start_server_ms || 0);
+      const segEnd = Number(segment?.end_server_ms || 0);
+      if (segStart > 0) startMs = Math.min(startMs, segStart);
+      if (segEnd > 0) endMs = Math.max(endMs, segEnd);
+    }
+  }
+
+  if (!Number.isFinite(startMs) || startMs <= 0) return 0;
+  const syncGeneratedMs = new Date(sync?.generated_at_iso || "").getTime();
+  const fallbackMs = Number.isFinite(syncGeneratedMs) && syncGeneratedMs > 0 ? syncGeneratedMs : Number(fallbackEndMs || 0);
+  const finalEndMs = Math.max(endMs, fallbackMs);
+  if (!Number.isFinite(finalEndMs) || finalEndMs <= startMs) return 0;
+  return finalEndMs - startMs;
 }
 
 function clone(v) {

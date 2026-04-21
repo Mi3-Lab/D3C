@@ -51,6 +51,7 @@ class CameraRecorder {
 
   ensureRealtimeEncoder({ fps, bitrate, crf, ffmpegBin }) {
     if (this.ffmpegProc || this.realtimeClosed) return;
+    const safeFps = Math.max(1, Number(fps || 10));
     const args = [
       "-y",
       "-f",
@@ -58,17 +59,15 @@ class CameraRecorder {
       "-vcodec",
       "mjpeg",
       "-framerate",
-      String(Math.max(1, Number(fps || 10))),
+      String(safeFps),
       "-i",
       "-",
-      "-c:v",
-      "libx264",
-      "-b:v",
-      String(bitrate || "2M"),
-      "-crf",
-      String(Number.isFinite(crf) ? crf : 23),
-      "-pix_fmt",
-      "yuv420p",
+      ...buildH264Mp4VideoArgs({
+        fps: safeFps,
+        bitrate,
+        crf,
+        tune: "zerolatency"
+      }),
       this.videoPath
     ];
     this.realtimeEncode = true;
@@ -172,38 +171,25 @@ module.exports = {
 function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBin = "ffmpeg", bitrate = "2M", crf = 23, timelineRows = null }) {
   const resolvedCameraDir = path.resolve(cameraDir);
   const resolvedOutMp4 = path.resolve(outMp4);
-  const timing = buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps: fps, timelineRows });
+  const safeFps = Math.max(1, Number(fps || 10));
+  const timing = buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps: safeFps, timelineRows });
   const args = timing?.sequenceDir
     ? [
         "-y",
         "-framerate",
-        String(Math.max(1, Number(fps || 10))),
+        String(safeFps),
         "-i",
         path.join(timing.sequenceDir, "%06d.jpg"),
-        "-c:v",
-        "libx264",
-        "-b:v",
-        String(bitrate || "2M"),
-        "-crf",
-        String(Number.isFinite(crf) ? crf : 23),
-        "-pix_fmt",
-        "yuv420p",
+        ...buildH264Mp4VideoArgs({ fps: safeFps, bitrate, crf }),
         resolvedOutMp4
       ]
     : [
         "-y",
         "-framerate",
-        String(Math.max(1, Number(fps || 10))),
+        String(safeFps),
         "-i",
         path.join(resolvedCameraDir, "%06d.jpg"),
-        "-c:v",
-        "libx264",
-        "-b:v",
-        String(bitrate || "2M"),
-        "-crf",
-        String(Number.isFinite(crf) ? crf : 23),
-        "-pix_fmt",
-        "yuv420p",
+        ...buildH264Mp4VideoArgs({ fps: safeFps, bitrate, crf }),
         resolvedOutMp4
       ];
 
@@ -232,6 +218,35 @@ function encodeCameraDirToMp4({ cameraDir, timestampsPath, outMp4, fps, ffmpegBi
       });
     });
   });
+}
+
+function buildH264Mp4VideoArgs({ fps, bitrate = "2M", crf = 23, tune = "" } = {}) {
+  const safeFps = Math.max(1, Number(fps || 10));
+  const safeCrf = Number.isFinite(crf) ? Number(crf) : 23;
+  const gop = Math.max(12, Math.round(safeFps * 2));
+  const minKeyint = Math.max(1, Math.round(safeFps));
+  const args = [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-b:v",
+    String(bitrate || "2M"),
+    "-crf",
+    String(safeCrf),
+    "-g",
+    String(gop),
+    "-keyint_min",
+    String(minKeyint),
+    "-sc_threshold",
+    "0",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart"
+  ];
+  if (tune) args.splice(8, 0, "-tune", String(tune));
+  return args;
 }
 
 function buildResampledFrameSequence({ cameraDir, timestampsPath, outputFps, timelineRows = null }) {
