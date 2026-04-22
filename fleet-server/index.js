@@ -416,17 +416,21 @@ wss.on("connection", (ws, req) => {
     if (ws.role === "phone") {
       const d = devices.get(ws.device_id);
       if (d && d.ws === ws) {
+        const targeted = recording.active && recording.target_device_ids.includes(ws.device_id);
         d.connected = false;
         d.ws = null;
         d.lastSeenTs = Date.now();
         d.state.camera_preview = { live: false, peer_count: 0, updated_at_ms: Date.now() };
         d.recordingStatus.recording = false;
-        d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
+        d.recordingStatus.phase = targeted ? "starting" : "idle";
+        d.recordingStatus.acknowledged_at_utc_ms = targeted ? null : d.recordingStatus.acknowledged_at_utc_ms;
+        d.recordingStatus.modalities = emptyRecordingModalities();
       }
       if (focusedDeviceId === ws.device_id) {
         focusedDeviceId = firstConnectedDeviceId() || null;
       }
       broadcastDeviceList();
+      broadcastRecordStatuses();
       queueFleetOverviewBroadcast({ immediate: true });
     }
     if (ws.role === "dashboard" && ws.client_id) {
@@ -1135,11 +1139,13 @@ function startRecordingSession({ scope, session_name, modalities = ["imu", "cam"
   for (const [id, d] of devices.entries()) {
     const targeted = recording.target_device_ids.includes(id);
     if (targeted) {
-      d.recordingStatus.recording = true;
+      d.recordingStatus.recording = false;
+      d.recordingStatus.phase = "starting";
       d.recordingStatus.session_id = sid;
       d.recordingStatus.started_at_utc_ms = startedAt;
-      d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
-      d.recordingStatus.writer = { last_write_utc_ms: null, dropped: 0 };
+      d.recordingStatus.acknowledged_at_utc_ms = null;
+      d.recordingStatus.modalities = emptyRecordingModalities();
+      d.recordingStatus.writer = emptyRecordingWriter();
       d.recordingStatus.files = {};
       d.recordingStatus.error = null;
     }
@@ -1161,6 +1167,12 @@ async function stopRecordingSession() {
   recording.stop_requested_at_ms = Date.now();
   const stoppingSessionId = recording.session_id;
   const stoppingTargets = [...recording.target_device_ids];
+  for (const id of stoppingTargets) {
+    const d = devices.get(id);
+    if (!d?.recordingStatus) continue;
+    d.recordingStatus.recording = false;
+    d.recordingStatus.phase = "stopping";
+  }
   broadcastState();
   broadcastRecordStatuses();
   for (const deviceId of stoppingTargets) {
@@ -1212,9 +1224,16 @@ async function stopRecordingSession() {
     const d = devices.get(id);
     if (!d) continue;
     d.recordingStatus.recording = false;
-    d.recordingStatus.modalities = { imu: false, cam: false, audio: false };
+    d.recordingStatus.phase = "idle";
+    d.recordingStatus.session_id = null;
+    d.recordingStatus.started_at_utc_ms = null;
+    d.recordingStatus.acknowledged_at_utc_ms = null;
+    d.recordingStatus.modalities = emptyRecordingModalities();
     d.recordingStatus.files = collectStoppedFiles(res.sessionDir, id);
-    d.recordingStatus.writer = { ...d.recordingStatus.writer, dropped: d.stats?.dropped_packets || 0 };
+    d.recordingStatus.writer = {
+      ...emptyRecordingWriter(d.stats?.dropped_packets || 0),
+      last_write_utc_ms: d.recordingStatus.writer?.last_write_utc_ms || null
+    };
     broadcastToDashboards({
       type: "record_stopped",
       device_id: id,
@@ -1256,7 +1275,7 @@ function broadcastRecordStatuses() {
 
 function refreshDeviceRecordingStatus(deviceId, d) {
   if (!d.recordingStatus) return;
-  const writer = d.recordingStatus.writer || { last_write_utc_ms: null, dropped: 0 };
+  const writer = d.recordingStatus.writer || emptyRecordingWriter();
   writer.dropped = Number(d.stats?.dropped_packets || 0);
   d.recordingStatus.writer = writer;
   if (!d.recordingStatus.recording) return;
@@ -1264,7 +1283,8 @@ function refreshDeviceRecordingStatus(deviceId, d) {
   d.recordingStatus.modalities = {
     imu: !!flags.imu,
     cam: !!flags.camera,
-    audio: !!(flags.audio || flags.audioWav)
+    audio: !!(flags.audio || flags.audioWav),
+    gps: !!flags.gps
   };
 }
 
@@ -1274,19 +1294,49 @@ function buildRecordStatusPayload(deviceId, d) {
     device_id: deviceId,
     connected: !!d.connected,
     recording: !!d.recordingStatus?.recording,
+    phase: normalizeDeviceRecordingPhase(d.recordingStatus?.phase),
     session_id: d.recordingStatus?.session_id || null,
     started_at_utc_ms: d.recordingStatus?.started_at_utc_ms || null,
-    modalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
-    writer: d.recordingStatus?.writer || { last_write_utc_ms: null, dropped: 0 }
+    acknowledged_at_utc_ms: d.recordingStatus?.acknowledged_at_utc_ms || null,
+    modalities: d.recordingStatus?.modalities || emptyRecordingModalities(),
+    writer: d.recordingStatus?.writer || emptyRecordingWriter()
   };
 }
 
 function markDeviceWrite(deviceId, tRecvMs) {
   const d = devices.get(deviceId);
   if (!d || !d.recordingStatus) return;
-  if (!d.recordingStatus.writer) d.recordingStatus.writer = { last_write_utc_ms: null, dropped: 0 };
-  d.recordingStatus.writer.last_write_utc_ms = Number(tRecvMs || Date.now());
+  if (!d.recordingStatus.writer) d.recordingStatus.writer = emptyRecordingWriter();
+  const writeAtMs = Number(tRecvMs || Date.now());
+  d.recordingStatus.writer.last_write_utc_ms = writeAtMs;
+  if (
+    recording.active &&
+    d.recordingStatus.session_id &&
+    recording.target_device_ids.includes(deviceId) &&
+    d.recordingStatus.phase === "starting"
+  ) {
+    d.recordingStatus.recording = true;
+    d.recordingStatus.phase = "recording";
+    d.recordingStatus.acknowledged_at_utc_ms = writeAtMs;
+  }
 }
+
+function emptyRecordingModalities() {
+  return { imu: false, cam: false, audio: false, gps: false };
+}
+
+function emptyRecordingWriter(dropped = 0) {
+  return { last_write_utc_ms: null, dropped: Number(dropped || 0) };
+}
+
+function normalizeDeviceRecordingPhase(value) {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized === "starting" || normalized === "recording" || normalized === "stopping") {
+    return normalized;
+  }
+  return "idle";
+}
+
 function countDevicesRecording() {
   let n = 0;
   for (const d of devices.values()) if (d.recordingStatus?.recording) n += 1;
@@ -1401,8 +1451,8 @@ function deviceSummaries() {
       capabilities: d.capabilities || {},
       cameraPreviewLive: !!d.state.camera_preview?.live,
       recordingActive: !!d.recordingStatus?.recording,
-      recordingState: d.recordingStatus?.recording ? "recording" : (d.connected ? "armed" : "idle"),
-      recordingModalities: d.recordingStatus?.modalities || { imu: false, cam: false, audio: false },
+      recordingState: normalizeDeviceRecordingPhase(d.recordingStatus?.phase),
+      recordingModalities: d.recordingStatus?.modalities || emptyRecordingModalities(),
       recordingSessionId: d.recordingStatus?.session_id || null,
       healthAlerts: computeDeviceAlerts(d),
       syncSummary: summarizeSyncStats(d)
@@ -1651,10 +1701,12 @@ function newDeviceEntry(deviceId) {
     connectionStatus: "disconnected",
     recordingStatus: {
       recording: false,
+      phase: "idle",
       session_id: null,
       started_at_utc_ms: null,
-      modalities: { imu: false, cam: false, audio: false },
-      writer: { last_write_utc_ms: null, dropped: 0 },
+      acknowledged_at_utc_ms: null,
+      modalities: emptyRecordingModalities(),
+      writer: emptyRecordingWriter(),
       files: {},
       error: null
     }

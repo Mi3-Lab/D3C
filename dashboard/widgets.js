@@ -10,6 +10,24 @@ export function getWidgetDevice(settings) {
   return "";
 }
 
+function normalizeRecordingPhase(value, isRecording = false) {
+  const phase = String(value || "").toLowerCase();
+  if (phase === "starting" || phase === "recording" || phase === "stopping") return phase;
+  return isRecording ? "recording" : "idle";
+}
+
+function resolveDeviceReadiness(summary, rec) {
+  const connected = summary?.connected !== false;
+  if (!connected) {
+    return { label: "not ready", className: "not-ready", phase: "idle" };
+  }
+  const phase = normalizeRecordingPhase(rec?.phase || summary?.recordingState, rec?.recording || summary?.recordingActive);
+  if (phase === "starting") return { label: "starting", className: "starting", phase };
+  if (phase === "recording") return { label: "recording", className: "recording", phase };
+  if (phase === "stopping") return { label: "stopping", className: "stopping", phase };
+  return { label: "armed", className: "armed", phase: "idle" };
+}
+
 const GPS_LIVE_TILE_SIZE = 256;
 const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
 const GPS_LIVE_STALE_MS = 15000;
@@ -81,7 +99,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         content.appendChild(list);
         const pendingKicks = new Set();
 
-        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice }), () => {
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, recordByDevice: s.recordByDevice }), () => {
           const st = store.getState();
           list.innerHTML = "";
           const activeIds = new Set();
@@ -101,8 +119,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const tone = connected ? (streaming ? "ok" : "warn") : "bad";
             const label = tone === "ok" ? "Streaming" : tone === "warn" ? "Idle" : "Disconnected";
 
-            const readiness = connected ? (d.recordingActive ? "recording" : "armed") : "not ready";
-            const readinessClass = readiness === "recording" ? "recording" : (readiness === "armed" ? "armed" : "not-ready");
+            const rec = st.recordByDevice?.[d.device_id];
+            const readinessState = resolveDeviceReadiness(d, rec);
             const dropped = Number(d.droppedPackets ?? 0);
             const lastSeen = d.lastSeenTs ? formatTs(d.lastSeenTs) : "-";
             const displayName = escapeHtml(String(d.deviceName || d.device_id));
@@ -158,7 +176,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
                   </div>
                 </div>
                 <div class="device-roster-badges">
-                  <span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span>
+                  <span class="readiness-badge ${readinessState.className}">${escapeHtml(readinessState.label)}</span>
                   <span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span>
                 </div>
               </div>
@@ -854,7 +872,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const fresh = camTs > 0 && (now - camTs) < 4000;
             const fpsVal = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
             const rec = st.recordByDevice?.[deviceId];
-            const isCamRecording = !!rec?.recording && !!rec?.modalities?.cam;
+            const recordingPhase = normalizeRecordingPhase(rec?.phase || summary?.recordingState, rec?.recording || summary?.recordingActive);
+            const isCamRecording = recordingPhase === "recording" && !!rec?.modalities?.cam;
             const isOnline = summary.connected !== false;
             const previewEnabled = !!state?.stream_status?.camera?.enabled;
             previewRtc?.updateAvailability(deviceId, { connected: isOnline, previewEnabled });
@@ -866,6 +885,12 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             let placeholderText = previewEnabled ? "No feed" : "Camera disabled";
             if (!isOnline) {
               placeholderText = "Device offline";
+            } else if (recordingPhase === "stopping") {
+              statusClass = "rec";
+              statusLabel = "STOP";
+            } else if (recordingPhase === "starting") {
+              statusClass = "live";
+              statusLabel = "START";
             } else if (showVideo) {
               statusClass = isCamRecording ? "rec" : "live";
               statusLabel = isCamRecording ? "REC" : "LIVE";

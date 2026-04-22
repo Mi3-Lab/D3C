@@ -1731,9 +1731,12 @@ canvas {
 .gps-badge.bad,
 .gps-badge.offline { color: #ffaaaa; background: var(--red-bg);    border-color: var(--red-border); }
 
+.readiness-badge.starting,
 .readiness-badge.armed,
 .health-badge.warn,
 .gps-badge.warn    { color: #ffd8a0; background: var(--yellow-bg); border-color: var(--yellow-border); }
+
+.readiness-badge.stopping { color: #d7deea; background: rgba(100, 116, 139, 0.16); border-color: var(--line-2); }
 
 .health-badge.ok,
 .gps-badge.ok      { color: #a0edca; background: var(--green-bg);  border-color: var(--green-border); }
@@ -2817,6 +2820,22 @@ td,
 .panel-rec::before,
 .status-item#statusRec::before {
   background: var(--red);
+}
+
+.panel-rec.rec-pending {
+  color: var(--yellow);
+}
+
+.panel-rec.rec-pending::before {
+  background: var(--yellow);
+}
+
+.panel-rec.rec-stopping {
+  color: #d7deea;
+}
+
+.panel-rec.rec-stopping::before {
+  background: var(--dim);
 }
 
 .live-badge.offline::before,

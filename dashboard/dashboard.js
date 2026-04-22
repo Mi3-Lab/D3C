@@ -492,13 +492,39 @@ function widgetModality(widgetType) {
   return null;
 }
 
+function normalizeRecordPhase(value, isRecording = false) {
+  const phase = String(value || "").toLowerCase();
+  if (phase === "starting" || phase === "recording" || phase === "stopping") return phase;
+  return isRecording ? "recording" : "idle";
+}
+
+function widgetModalityRecordsToDisk(deviceId, modality) {
+  const st = store.getState();
+  const cfg = st.runConfigsByDevice?.[deviceId] || st.sessionConfig || DEFAULT_RUN_CONFIG;
+  if (modality === "imu") return !!cfg?.streams?.imu?.record;
+  if (modality === "cam") return !!cfg?.streams?.camera?.record && cfg?.streams?.camera?.mode === "stream";
+  if (modality === "audio") return !!cfg?.streams?.audio?.record;
+  if (modality === "gps") return !!cfg?.streams?.gps?.record;
+  return false;
+}
+
 function panelRecBadgeHtml(instance) {
   const modality = widgetModality(instance.type);
   if (!modality) return "";
   const st = store.getState();
   const deviceId = getWidgetDevice(instance.settings);
   const rec = st.recordByDevice?.[deviceId];
-  const on = !!rec?.recording && !!rec?.modalities?.[modality];
+  if (!rec || rec.connected === false) return "";
+  const phase = normalizeRecordPhase(rec.phase, rec.recording);
+  const shouldRecord = widgetModalityRecordsToDisk(deviceId, modality);
+  if (!shouldRecord) return "";
+  if (phase === "starting") {
+    return ' <span class="panel-rec rec-pending" title="Waiting for the first confirmed write">Starting</span>';
+  }
+  if (phase === "stopping") {
+    return ' <span class="panel-rec rec-stopping" title="Finalizing recording on disk">Stopping</span>';
+  }
+  const on = phase === "recording" && !!rec?.modalities?.[modality];
   return on
     ? ' <span class="panel-rec rec-on" title="Recording to disk">Recording</span>'
     : "";
@@ -678,9 +704,11 @@ function connectWs() {
             device_id: id,
             connected: msg.connected !== false,
             recording: !!msg.recording,
+            phase: normalizeRecordPhase(msg.phase, !!msg.recording),
             session_id: msg.session_id || null,
             started_at_utc_ms: msg.started_at_utc_ms || null,
-            modalities: msg.modalities || { imu: false, cam: false, audio: false },
+            acknowledged_at_utc_ms: msg.acknowledged_at_utc_ms || null,
+            modalities: msg.modalities || { imu: false, cam: false, audio: false, gps: false },
             writer: msg.writer || { last_write_utc_ms: null, dropped: 0 }
           }
         }
@@ -698,8 +726,11 @@ function connectWs() {
           ...st.recordByDevice,
           [id]: {
             ...prev,
+            connected: prev.connected !== false,
             recording: false,
-            modalities: { imu: false, cam: false, audio: false },
+            phase: "idle",
+            acknowledged_at_utc_ms: null,
+            modalities: { imu: false, cam: false, audio: false, gps: false },
             files: msg.files || prev.files || {}
           }
         }
