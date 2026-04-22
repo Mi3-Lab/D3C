@@ -986,6 +986,20 @@
       }
       return;
     }
+    if (kind === "workzone_detected") {
+      const title = String(msg.title || "Workzone detected").trim() || "Workzone detected";
+      const message = String(msg.message || `Workzone detected by ${sourceDeviceName}.`).trim();
+      if (fromSelf) {
+        setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
+        return;
+      }
+      if (played) {
+        setAlertFeedback(message, "warning", 5000);
+        return;
+      }
+      setAlertFeedback(`${message} Tap Alert once on this phone if Safari kept sound blocked.`, "warning", 5200);
+      return;
+    }
     if (fromSelf) {
       setAlertFeedback(`Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success");
       return;

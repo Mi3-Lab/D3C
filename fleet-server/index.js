@@ -39,6 +39,9 @@ const PUBLIC_RUNTIME_STATE_PATH = process.env.PUBLIC_RUNTIME_STATE_PATH
   : "";
 const SERVER_STARTED_AT_MS = Date.now();
 const FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS = 500;
+const WORKZONE_ALERT_POLL_INTERVAL_MS = 1000;
+const WORKZONE_ALERT_COOLDOWN_MS = 30000;
+const WORKZONE_ALERT_STALE_MS = 15000;
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -380,6 +383,10 @@ const recording = {
   last_error: null,
   stop_requested_at_ms: null
 };
+const workzoneAlertState = {
+  sessionDir: null,
+  devices: new Map()
+};
 let publicRuntimeInfo = loadPublicRuntimeInfo();
 
 wss.on("connection", (ws, req) => {
@@ -480,6 +487,10 @@ setInterval(() => {
   broadcastDeviceList();
   broadcastRecordStatuses();
 }, 1000);
+
+setInterval(() => {
+  pollWorkzoneAlerts();
+}, WORKZONE_ALERT_POLL_INTERVAL_MS);
 
 setInterval(() => {
   for (const [deviceId, d] of devices.entries()) {
@@ -626,24 +637,11 @@ function handlePhoneJson(ws, msg) {
   d.lastSeenTs = Date.now();
 
   if (msg.type === "fleet_alert") {
-    const tRecvMs = Date.now();
     const sourceDeviceName = d.device_name || deviceId;
-    let targetCount = 0;
-    for (const [, target] of devices.entries()) {
-      if (!target.connected || !isSocketOpen(target.ws)) continue;
-      targetCount += 1;
-    }
-    if (!targetCount) return;
-    for (const [, target] of devices.entries()) {
-      if (!target.connected || !isSocketOpen(target.ws)) continue;
-      sendWs(target.ws, {
-        type: "fleet_alert",
-        source_device_id: deviceId,
-        source_device_name: sourceDeviceName,
-        target_count: targetCount,
-        t_server_ms: tRecvMs
-      }, { critical: true });
-    }
+    broadcastFleetAlert({
+      source_device_id: deviceId,
+      source_device_name: sourceDeviceName
+    }, { critical: true });
     return;
   }
 
@@ -1725,6 +1723,27 @@ function sendWs(ws, payload, opts = {}) {
   ws.send(JSON.stringify(payload));
 }
 
+function broadcastFleetAlert(payload, opts = {}) {
+  const now = Date.now();
+  let targetCount = 0;
+  for (const [, target] of devices.entries()) {
+    if (!target.connected || !isSocketOpen(target.ws)) continue;
+    targetCount += 1;
+  }
+  if (!targetCount) return 0;
+  const message = {
+    type: "fleet_alert",
+    t_server_ms: now,
+    target_count: targetCount,
+    ...payload
+  };
+  for (const [, target] of devices.entries()) {
+    if (!target.connected || !isSocketOpen(target.ws)) continue;
+    sendWs(target.ws, message, opts);
+  }
+  return targetCount;
+}
+
 function broadcastToDashboards(payload) {
   const text = JSON.stringify(payload);
   const maxBufferedBytes = (DEFAULT_RUN_CONFIG.performance?.max_ws_buffer_kb || 1024) * 1024;
@@ -1775,6 +1794,165 @@ function buildFleetOverviewPayload() {
     generated_at_ms: Date.now(),
     devices: devicesOverview
   };
+}
+
+function resetWorkzoneAlertState(sessionDir = null) {
+  workzoneAlertState.sessionDir = sessionDir || null;
+  workzoneAlertState.devices.clear();
+}
+
+function pollWorkzoneAlerts() {
+  const sessionDir = recording.active ? recording.session_dir : null;
+  if (!sessionDir) {
+    if (workzoneAlertState.sessionDir) resetWorkzoneAlertState(null);
+    return;
+  }
+  if (workzoneAlertState.sessionDir !== sessionDir) {
+    resetWorkzoneAlertState(sessionDir);
+  }
+  const statusPath = resolveWorkzoneStatusPath(sessionDir);
+  if (!statusPath) return;
+
+  let payload = null;
+  try {
+    payload = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+  } catch {
+    return;
+  }
+  if (!payload || typeof payload !== "object") return;
+
+  const entries = payload.devices && typeof payload.devices === "object" ? Object.entries(payload.devices) : [];
+  const seen = new Set();
+  const now = Date.now();
+  for (const [deviceId, rawInfo] of entries) {
+    seen.add(deviceId);
+    const info = rawInfo && typeof rawInfo === "object" ? rawInfo : {};
+    const found = isWorkzoneDetectionActive(info, payload, now);
+    const frameIndex = Number(info.frame_index || 0);
+    const prev = workzoneAlertState.devices.get(deviceId) || {
+      active: false,
+      lastAlertAtMs: 0,
+      lastAlertFrameIndex: 0
+    };
+    let alertSent = false;
+    if (
+      found &&
+      (!prev.active || frameIndex > prev.lastAlertFrameIndex) &&
+      (now - prev.lastAlertAtMs) >= WORKZONE_ALERT_COOLDOWN_MS
+    ) {
+      const targetCount = sendWorkzoneDetectedAlert({
+        deviceId,
+        info,
+        payload,
+        statusPath
+      });
+      if (targetCount > 0) {
+        prev.lastAlertAtMs = now;
+        prev.lastAlertFrameIndex = frameIndex;
+        alertSent = true;
+      }
+    }
+    prev.active = found && (prev.active || alertSent);
+    workzoneAlertState.devices.set(deviceId, prev);
+  }
+
+  for (const [deviceId] of workzoneAlertState.devices.entries()) {
+    if (!seen.has(deviceId)) workzoneAlertState.devices.delete(deviceId);
+  }
+}
+
+function resolveWorkzoneStatusPath(sessionDir) {
+  if (!sessionDir) return null;
+  const candidates = [
+    path.join(sessionDir, "outputs", "workzone", "session_status.json"),
+    path.join(sessionDir, "workzone", "session_status.json")
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function isWorkzoneDetectionActive(info, payload, now = Date.now()) {
+  if (!info || typeof info !== "object") return false;
+  const found = !!info.found;
+  const detectionCount = Math.max(0, Number(info.detection_count || 0));
+  const score = Number(info.score || 0);
+  const payloadThreshold = Number.isFinite(Number(payload?.score_threshold))
+    ? Number(payload.score_threshold)
+    : 0.45;
+  const updatedAtMs = Date.parse(String(info.updated_at || payload?.updated_at || ""));
+  if (Number.isFinite(updatedAtMs) && (now - updatedAtMs) > WORKZONE_ALERT_STALE_MS) return false;
+  return found && detectionCount > 0 && score >= payloadThreshold;
+}
+
+function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
+  const sourceDeviceName = devices.get(deviceId)?.device_name || deviceId;
+  const score = Number(info.score || 0);
+  const maxConfidence = Number(info.max_confidence || 0);
+  const detectionCount = Math.max(0, Number(info.detection_count || 0));
+  const frameIndex = Math.max(0, Number(info.frame_index || 0));
+  const classCounts = info.class_counts && typeof info.class_counts === "object" ? info.class_counts : {};
+  const classSummary = summarizeWorkzoneClasses(classCounts);
+  const message = classSummary
+    ? `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"} (${classSummary}).`
+    : `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"}.`;
+  const targetCount = broadcastFleetAlert({
+    kind: "workzone_detected",
+    title: "Workzone detected",
+    message,
+    source_device_id: deviceId,
+    source_device_name: sourceDeviceName,
+    workzone: {
+      device_id: deviceId,
+      frame_index: frameIndex,
+      frame_filename: typeof info.frame_filename === "string" ? info.frame_filename : "",
+      score,
+      max_confidence: maxConfidence,
+      detection_count: detectionCount,
+      class_counts: classCounts,
+      session_dir: recording.session_dir || null,
+      status_path: statusPath,
+      output_root: typeof payload?.output_root === "string" ? payload.output_root : null,
+      updated_at: typeof info.updated_at === "string" ? info.updated_at : (typeof payload?.updated_at === "string" ? payload.updated_at : null)
+    }
+  }, { critical: true });
+  if (targetCount > 0) {
+    console.log("[workzone] fleet alert sent", {
+      source_device_id: deviceId,
+      source_device_name: sourceDeviceName,
+      target_count: targetCount,
+      frame_index: frameIndex,
+      frame_filename: typeof info.frame_filename === "string" ? info.frame_filename : "",
+      score: Number(score.toFixed(3)),
+      max_confidence: Number(maxConfidence.toFixed(3)),
+      detection_count: detectionCount,
+      classes: classCounts
+    });
+    appendControlLog(path.join(recording.session_dir, "control_log.jsonl"), {
+      type: "workzone_alert_sent",
+      at_iso: new Date().toISOString(),
+      source_device_id: deviceId,
+      source_device_name: sourceDeviceName,
+      target_count: targetCount,
+      frame_index: frameIndex,
+      frame_filename: typeof info.frame_filename === "string" ? info.frame_filename : "",
+      score,
+      max_confidence: maxConfidence,
+      detection_count: detectionCount,
+      class_counts: classCounts
+    });
+  }
+  return targetCount;
+}
+
+function summarizeWorkzoneClasses(classCounts) {
+  const items = Object.entries(classCounts || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]) || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, 3)
+    .map(([label, count]) => `${label} x${Number(count)}`);
+  return items.join(", ");
 }
 
 function flushFleetOverviewBroadcast() {
@@ -2462,19 +2640,13 @@ function notifyConnectedPhonesPermissionRefresh(modalities) {
   const humanList = joinHumanList(friendly);
   const title = `Dashboard turned on ${humanList}`;
   const message = `The dashboard just enabled ${humanList}. Tap Enable Now on this phone so Safari can show the permission prompt. If it still gets stuck, use Refresh Page as a fallback.`;
-  const now = Date.now();
-  for (const [, device] of devices.entries()) {
-    if (!device.connected || !isSocketOpen(device.ws)) continue;
-    sendWs(device.ws, {
-      type: "fleet_alert",
-      kind: "permission_refresh",
-      source_device_name: "Dashboard",
-      title,
-      message,
-      modalities: cleanModalities,
-      t_server_ms: now
-    }, { critical: true });
-  }
+  broadcastFleetAlert({
+    kind: "permission_refresh",
+    source_device_name: "Dashboard",
+    title,
+    message,
+    modalities: cleanModalities
+  }, { critical: true });
 }
 
 function joinHumanList(items) {

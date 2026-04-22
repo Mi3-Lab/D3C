@@ -12,8 +12,18 @@ RUNTIME_DIR="$ROOT_DIR/tmp"
 PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH:-$RUNTIME_DIR/quick-tunnel-state.json}"
 SERVER_LOG="$(mktemp -t d3c-server.XXXXXX.log)"
 TUNNEL_LOG="$(mktemp -t d3c-tunnel.XXXXXX.log)"
+WORKZONE_ENABLE="${WORKZONE_ENABLE:-auto}"
+WORKZONE_PROJECT_DIR="${WORKZONE_PROJECT_DIR:-/home/proy/projects/mi3/workzone}"
+WORKZONE_PYTHON="${WORKZONE_PYTHON:-/home/proy/miniconda3/envs/workzone/bin/python}"
+WORKZONE_WEIGHTS="${WORKZONE_WEIGHTS:-weights/yolo12s_hardneg_1280.pt}"
+WORKZONE_DEVICE="${WORKZONE_DEVICE:-cpu}"
+WORKZONE_POLL_INTERVAL="${WORKZONE_POLL_INTERVAL:-0.5}"
+WORKZONE_OUTPUT_FOLDER_NAME="${WORKZONE_OUTPUT_FOLDER_NAME:-workzone}"
+WORKZONE_VIDEO_SEGMENT_FRAMES="${WORKZONE_VIDEO_SEGMENT_FRAMES:-}"
+WORKZONE_LOG=""
 SERVER_PID=""
 TUNNEL_PID=""
+WORKZONE_PID=""
 QUICK_TUNNEL_RETRIES="${QUICK_TUNNEL_RETRIES:-4}"
 
 cleanup() {
@@ -27,8 +37,15 @@ cleanup() {
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
+  if [[ -n "${WORKZONE_PID}" ]] && kill -0 "${WORKZONE_PID}" 2>/dev/null; then
+    kill "${WORKZONE_PID}" 2>/dev/null || true
+    wait "${WORKZONE_PID}" 2>/dev/null || true
+  fi
   rm -f "${PUBLIC_RUNTIME_STATE_PATH}"
   rm -f "${SERVER_LOG}" "${TUNNEL_LOG}"
+  if [[ -n "${WORKZONE_LOG}" ]]; then
+    rm -f "${WORKZONE_LOG}"
+  fi
   exit "${exit_code}"
 }
 
@@ -55,6 +72,14 @@ if [[ ! -d "${ROOT_DIR}/node_modules" ]]; then
   exit 1
 fi
 
+should_start_workzone() {
+  local normalized="${WORKZONE_ENABLE,,}"
+  case "${normalized}" in
+    1|true|yes|on|auto) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cd "${ROOT_DIR}"
 mkdir -p "${RUNTIME_DIR}"
 
@@ -78,6 +103,47 @@ if ! curl -fsS "${SERVER_URL}/health" >/dev/null 2>&1; then
   echo "Server did not become healthy within 30 seconds." >&2
   cat "${SERVER_LOG}" >&2
   exit 1
+fi
+
+if should_start_workzone; then
+  if [[ ! -d "${WORKZONE_PROJECT_DIR}" ]] || [[ ! -x "${WORKZONE_PYTHON}" ]]; then
+    if [[ "${WORKZONE_ENABLE,,}" == "auto" ]]; then
+      echo "WorkZone runner not started: set WORKZONE_PROJECT_DIR and WORKZONE_PYTHON if you want live WorkZone logs." >&2
+    else
+      echo "WorkZone runner requested but unavailable." >&2
+      echo "WORKZONE_PROJECT_DIR=${WORKZONE_PROJECT_DIR}" >&2
+      echo "WORKZONE_PYTHON=${WORKZONE_PYTHON}" >&2
+      exit 1
+    fi
+  else
+    WORKZONE_LOG="$(mktemp -t d3c-workzone.XXXXXX.log)"
+    WORKZONE_CMD=(
+      "${WORKZONE_PYTHON}"
+      -B
+      -m
+      d3c_support.live_runner
+      --datasets-root "${ROOT_DIR}/datasets"
+      --weights "${WORKZONE_WEIGHTS}"
+      --device "${WORKZONE_DEVICE}"
+      --poll-interval "${WORKZONE_POLL_INTERVAL}"
+      --output-folder-name "${WORKZONE_OUTPUT_FOLDER_NAME}"
+    )
+    if [[ -n "${WORKZONE_VIDEO_SEGMENT_FRAMES}" ]]; then
+      WORKZONE_CMD+=(--video-segment-frames "${WORKZONE_VIDEO_SEGMENT_FRAMES}")
+    fi
+    echo "Starting WorkZone watcher from ${WORKZONE_PROJECT_DIR} ..."
+    (
+      cd "${WORKZONE_PROJECT_DIR}"
+      "${WORKZONE_CMD[@]}"
+    ) >"${WORKZONE_LOG}" 2>&1 &
+    WORKZONE_PID=$!
+    sleep 1
+    if ! kill -0 "${WORKZONE_PID}" 2>/dev/null; then
+      echo "WorkZone watcher exited during startup:" >&2
+      cat "${WORKZONE_LOG}" >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "Opening Cloudflare Quick Tunnel ..."
@@ -136,6 +202,9 @@ echo "Protocol:  ${CLOUDFLARED_PROTOCOL}"
 echo
 echo "Local server logs: ${SERVER_LOG}"
 echo "Tunnel logs:       ${TUNNEL_LOG}"
+if [[ -n "${WORKZONE_LOG}" ]]; then
+  echo "WorkZone logs:     ${WORKZONE_LOG}"
+fi
 echo
 echo "Press Ctrl-C to stop both processes."
 
