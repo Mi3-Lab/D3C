@@ -3298,10 +3298,10 @@ body {
 }
 
 .session-capture-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
   padding: 14px;
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -3318,39 +3318,54 @@ body {
 }
 
 .session-capture-action {
-  min-width: 92px;
+  min-width: 0;
+  width: fit-content;
+  align-self: start;
+  justify-self: start;
   justify-content: center;
 }
 
 .session-capture-copy {
   display: grid;
-  gap: 4px;
+  gap: 5px;
   min-width: 0;
 }
 
 .session-capture-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 10px;
+  min-width: 0;
 }
 
 .session-capture-head strong {
   font-size: 14px;
   font-weight: 600;
   color: var(--ink);
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .session-capture-status {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 3px 10px;
+  min-width: 0;
+  align-self: start;
+  padding: 2px 9px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.06);
   font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
   color: var(--muted);
+  text-align: center;
+  white-space: nowrap;
 }
 
 .session-capture-card.is-on .session-capture-status {
@@ -3368,6 +3383,7 @@ body {
 .session-capture-detail {
   font-size: 11px;
   color: var(--ink);
+  min-height: 1.4em;
 }
 
 .join-code-banner {
@@ -4580,6 +4596,15 @@ body {
   .session-capture-grid,
   .device-roster-grid {
     grid-template-columns: 1fr;
+  }
+
+  .session-capture-card {
+    grid-template-columns: 1fr;
+  }
+
+  .session-capture-action {
+    width: 100%;
+    min-width: 0;
   }
 
   .workspace-panel-summary,
