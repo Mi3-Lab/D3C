@@ -122,6 +122,10 @@
   const deviceMonoOriginWallMs = Date.now() - performance.now();
   let silentAudio = null;
   let alertAudioCtx = null;
+  let alertAudioMasterGain = null;
+  let alertAudioCompressor = null;
+  let alertAudioGraphReady = false;
+  let alertAudioWarmup = null;
   let alertFeedbackText = "";
   let alertFeedbackTone = "muted";
   let alertFeedbackTimer = null;
@@ -131,6 +135,7 @@
   let alertCooldownTimer = null;
   let lastAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
+  let pendingAlertReplay = null;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
   let fleetOverview = { devices: [], generated_at_ms: 0 };
@@ -167,6 +172,14 @@
   });
   permissionRefreshModalDismiss?.addEventListener("click", () => {
     clearPermissionRefreshNotice();
+  });
+  document.addEventListener("pointerdown", () => {
+    void replayPendingAlertIfPossible();
+  }, { passive: true });
+  document.addEventListener("keydown", (event) => {
+    if (!pendingAlertReplay) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    void replayPendingAlertIfPossible();
   });
 
   cameraFlipBtn?.addEventListener("click", async () => {
@@ -600,6 +613,7 @@
         pcmChunkParts = [];
         pcmChunkSamples = 0;
       }
+      syncPhoneAudioSession();
       return;
     }
     if (!micStream) {
@@ -628,6 +642,7 @@
       pcmSilenceGain.connect(audioCtx.destination);
       pcmProcessor.onaudioprocess = onPcmProcess;
     }
+    syncPhoneAudioSession();
     await resumeAudioContext();
     startAudioLoop();
   }
@@ -759,48 +774,171 @@
     renderPrimaryAction();
   }
 
-  async function primeAlertAudio() {
+  function setDocumentAudioSessionType(type) {
+    const nextType = String(type || "").trim();
+    if (!nextType) return false;
+    try {
+      if (!navigator.audioSession || navigator.audioSession.type === nextType) return false;
+      navigator.audioSession.type = nextType;
+      return true;
+    } catch {}
+    return false;
+  }
+
+  function syncPhoneAudioSession({ preferAlertPlayback = false } = {}) {
+    const micActive = !!(runConfig.streams.audio?.enabled && (micStream || audioCtx));
+    const desiredType = (micActive && !preferAlertPlayback) ? "play-and-record" : "playback";
+    setDocumentAudioSessionType(desiredType);
+  }
+
+  async function primeAlertAudio(options = {}) {
+    return primeAlertAudioWithOptions(options);
+  }
+
+  function ensureAlertAudioGraph() {
+    if (!alertAudioCtx) return false;
+    try {
+      if (!alertAudioCompressor) {
+        alertAudioCompressor = alertAudioCtx.createDynamicsCompressor();
+        alertAudioCompressor.threshold.value = -24;
+        alertAudioCompressor.knee.value = 18;
+        alertAudioCompressor.ratio.value = 10;
+        alertAudioCompressor.attack.value = 0.003;
+        alertAudioCompressor.release.value = 0.18;
+      }
+      if (!alertAudioMasterGain) {
+        alertAudioMasterGain = alertAudioCtx.createGain();
+        alertAudioMasterGain.gain.value = 0.18;
+      }
+      if (!alertAudioGraphReady) {
+        alertAudioMasterGain.connect(alertAudioCompressor);
+        alertAudioCompressor.connect(alertAudioCtx.destination);
+        alertAudioGraphReady = true;
+      }
+      return true;
+    } catch {}
+    return false;
+  }
+
+  function warmAlertAudioOutput() {
+    if (!alertAudioCtx || !alertAudioMasterGain) return;
+    try {
+      if (alertAudioWarmup) {
+        try { alertAudioWarmup.osc.stop(); } catch {}
+        try { alertAudioWarmup.osc.disconnect(); } catch {}
+        try { alertAudioWarmup.gain.disconnect(); } catch {}
+        alertAudioWarmup = null;
+      }
+      const osc = alertAudioCtx.createOscillator();
+      const gain = alertAudioCtx.createGain();
+      const now = alertAudioCtx.currentTime;
+      gain.gain.setValueAtTime(0.00001, now);
+      osc.frequency.setValueAtTime(140, now);
+      osc.connect(gain);
+      gain.connect(alertAudioMasterGain);
+      osc.start(now);
+      osc.stop(now + 0.05);
+      osc.onended = () => {
+        try { osc.disconnect(); } catch {}
+        try { gain.disconnect(); } catch {}
+        if (alertAudioWarmup?.osc === osc) alertAudioWarmup = null;
+      };
+      alertAudioWarmup = { osc, gain };
+    } catch {}
+  }
+
+  async function primeAlertAudioWithOptions({ interactive = false } = {}) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return false;
+    syncPhoneAudioSession({ preferAlertPlayback: true });
     try {
       if (!alertAudioCtx || alertAudioCtx.state === "closed") {
         alertAudioCtx = new Ctx();
+        alertAudioMasterGain = null;
+        alertAudioCompressor = null;
+        alertAudioGraphReady = false;
+        alertAudioWarmup = null;
       }
       if (alertAudioCtx.state === "suspended") {
         await alertAudioCtx.resume();
       }
+      if (!ensureAlertAudioGraph()) return false;
+      if (interactive) warmAlertAudioOutput();
     } catch {}
     return !!alertAudioCtx && alertAudioCtx.state === "running";
   }
 
-  async function playAlertTone() {
+  function playAlertHaptics() {
+    try {
+      if (typeof navigator?.vibrate === "function") {
+        return navigator.vibrate([150, 90, 150, 120, 260]);
+      }
+    } catch {}
+    return false;
+  }
+
+  function queuePendingAlertReplay(sourceDeviceName, kind = "") {
+    pendingAlertReplay = {
+      sourceDeviceName: String(sourceDeviceName || "another phone").trim() || "another phone",
+      kind: String(kind || "").trim(),
+      queuedAtMs: Date.now()
+    };
+  }
+
+  async function replayPendingAlertIfPossible() {
+    if (!pendingAlertReplay) return;
+    const pending = pendingAlertReplay;
+    if (Date.now() - pending.queuedAtMs > 15000) {
+      pendingAlertReplay = null;
+      return;
+    }
+    const ready = await primeAlertAudioWithOptions({ interactive: true });
+    if (!ready) return;
+    const played = await playAlertTone({ allowThrottle: false, interactive: true });
+    if (!played) return;
+    pendingAlertReplay = null;
+    if (pending.kind === "permission_refresh") {
+      setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      return;
+    }
+    setAlertFeedback(`Alert from ${pending.sourceDeviceName}.`, "muted");
+  }
+
+  async function playAlertTone({ allowThrottle = true, interactive = false } = {}) {
     const nowMs = Date.now();
-    if (nowMs - lastAlertPlayedAtMs < 400) return true;
-    const ready = await primeAlertAudio();
+    if (allowThrottle && nowMs - lastAlertPlayedAtMs < 400) return true;
+    const ready = await primeAlertAudioWithOptions({ interactive });
     if (!ready || !alertAudioCtx) return false;
     lastAlertPlayedAtMs = nowMs;
     const pattern = [
-      { delay: 0, duration: 0.12, freq: 880 },
-      { delay: 0.18, duration: 0.12, freq: 880 },
-      { delay: 0.36, duration: 0.18, freq: 660 }
+      { delay: 0, duration: 0.16, freq: 1046, accentFreq: 1568, gain: 0.10 },
+      { delay: 0.22, duration: 0.16, freq: 1046, accentFreq: 1318, gain: 0.10 },
+      { delay: 0.44, duration: 0.24, freq: 784, accentFreq: 1174, gain: 0.12 }
     ];
     const startedAt = alertAudioCtx.currentTime + 0.02;
     for (const step of pattern) {
       const osc = alertAudioCtx.createOscillator();
+      const accentOsc = alertAudioCtx.createOscillator();
       const gain = alertAudioCtx.createGain();
       const t0 = startedAt + step.delay;
       const t1 = t0 + step.duration;
-      osc.type = "triangle";
+      osc.type = "square";
+      accentOsc.type = "triangle";
       osc.frequency.setValueAtTime(step.freq, t0);
+      accentOsc.frequency.setValueAtTime(step.accentFreq, t0);
       gain.gain.setValueAtTime(0.0001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.05, t0 + 0.01);
+      gain.gain.exponentialRampToValueAtTime(step.gain, t0 + 0.015);
       gain.gain.exponentialRampToValueAtTime(0.0001, t1);
       osc.connect(gain);
-      gain.connect(alertAudioCtx.destination);
+      accentOsc.connect(gain);
+      gain.connect(alertAudioMasterGain || alertAudioCtx.destination);
       osc.start(t0);
+      accentOsc.start(t0);
       osc.stop(t1 + 0.02);
+      accentOsc.stop(t1 + 0.02);
       osc.onended = () => {
         try { osc.disconnect(); } catch {}
+        try { accentOsc.disconnect(); } catch {}
         try { gain.disconnect(); } catch {}
       };
     }
@@ -815,7 +953,7 @@
     if (isAlertCoolingDown()) return;
     lastAlertSentAtMs = Date.now();
     scheduleAlertCooldownRefresh();
-    await primeAlertAudio();
+    await primeAlertAudioWithOptions({ interactive: true });
     setAlertFeedback("Sending alert...", "muted", 1200);
     queueJson({
       type: "fleet_alert",
@@ -829,7 +967,9 @@
     const sourceDeviceName = String(msg.source_device_name || sourceDeviceId || "another phone").trim();
     const targetCount = Math.max(1, Number(msg.target_count || 0) || 1);
     const fromSelf = !!sourceDeviceId && sourceDeviceId === runConfig.device_id;
+    if (!fromSelf || kind === "permission_refresh") playAlertHaptics();
     const played = await playAlertTone();
+    if (played) pendingAlertReplay = null;
     if (kind === "permission_refresh") {
       const title = String(msg.title || "Enable access").trim() || "Enable access";
       const message = String(msg.message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.").trim();
@@ -838,7 +978,12 @@
         message,
         modalities: msg.modalities
       });
-      setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      if (!played) {
+        queuePendingAlertReplay("Dashboard", kind);
+        setAlertFeedback("Dashboard requested a permission refresh. Tap once anywhere on this phone if Safari kept sound blocked.", "warning", 5200);
+      } else {
+        setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      }
       return;
     }
     if (fromSelf) {
@@ -849,7 +994,8 @@
       setAlertFeedback(`Alert from ${sourceDeviceName}.`, "muted");
       return;
     }
-    setAlertFeedback(`Alert from ${sourceDeviceName}. Tap Alert once on this phone if Safari kept sound blocked.`, "warning", 4200);
+    queuePendingAlertReplay(sourceDeviceName, kind);
+    setAlertFeedback(`Alert from ${sourceDeviceName}. Tap once anywhere on this phone if Safari kept sound blocked; it will replay automatically.`, "warning", 5200);
   }
 
   async function restartPcmCapture() {
@@ -880,6 +1026,7 @@
         analyser.fftSize = 512;
         analyserSource.connect(analyser);
       }
+      syncPhoneAudioSession();
       await resumeAudioContext();
       pcmProcessor = audioCtx.createScriptProcessor(2048, 1, 1);
       pcmSilenceGain = audioCtx.createGain();
@@ -1508,6 +1655,7 @@
       pcmChunkParts = [];
       pcmChunkSamples = 0;
     }
+    syncPhoneAudioSession();
     if (gpsWatchId != null && navigator.geolocation) {
       try { navigator.geolocation.clearWatch(gpsWatchId); } catch {}
     }

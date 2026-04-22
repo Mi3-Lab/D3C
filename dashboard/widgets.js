@@ -10,6 +10,24 @@ export function getWidgetDevice(settings) {
   return "";
 }
 
+function normalizeRecordingPhase(value, isRecording = false) {
+  const phase = String(value || "").toLowerCase();
+  if (phase === "starting" || phase === "recording" || phase === "stopping") return phase;
+  return isRecording ? "recording" : "idle";
+}
+
+function resolveDeviceReadiness(summary, rec) {
+  const connected = summary?.connected !== false;
+  if (!connected) {
+    return { label: "not ready", className: "not-ready", phase: "idle" };
+  }
+  const phase = normalizeRecordingPhase(rec?.phase || summary?.recordingState, rec?.recording || summary?.recordingActive);
+  if (phase === "starting") return { label: "starting", className: "starting", phase };
+  if (phase === "recording") return { label: "recording", className: "recording", phase };
+  if (phase === "stopping") return { label: "stopping", className: "stopping", phase };
+  return { label: "armed", className: "armed", phase: "idle" };
+}
+
 const GPS_LIVE_TILE_SIZE = 256;
 const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
 const GPS_LIVE_STALE_MS = 15000;
@@ -81,7 +99,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         content.appendChild(list);
         const pendingKicks = new Set();
 
-        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice }), () => {
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, recordByDevice: s.recordByDevice }), () => {
           const st = store.getState();
           list.innerHTML = "";
           const activeIds = new Set();
@@ -101,8 +119,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const tone = connected ? (streaming ? "ok" : "warn") : "bad";
             const label = tone === "ok" ? "Streaming" : tone === "warn" ? "Idle" : "Disconnected";
 
-            const readiness = connected ? (d.recordingActive ? "recording" : "armed") : "not ready";
-            const readinessClass = readiness === "recording" ? "recording" : (readiness === "armed" ? "armed" : "not-ready");
+            const rec = st.recordByDevice?.[d.device_id];
+            const readinessState = resolveDeviceReadiness(d, rec);
             const dropped = Number(d.droppedPackets ?? 0);
             const lastSeen = d.lastSeenTs ? formatTs(d.lastSeenTs) : "-";
             const displayName = escapeHtml(String(d.deviceName || d.device_id));
@@ -158,7 +176,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
                   </div>
                 </div>
                 <div class="device-roster-badges">
-                  <span class="readiness-badge ${readinessClass}">${escapeHtml(readiness)}</span>
+                  <span class="readiness-badge ${readinessState.className}">${escapeHtml(readinessState.label)}</span>
                   <span class="health-badge ${healthClass}" title="${escapeHtml(healthTitle)}">${escapeHtml(healthText)}</span>
                 </div>
               </div>
@@ -334,6 +352,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
         setupDetails.open = false;
         let prevIsActive = false;
+        let lastEstimateKey = "";
         let lastFormKey = "";
         const pendingCaptureToggles = new Map();
         const pendingCaptureTimers = new Map();
@@ -360,6 +379,13 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           onStateChange();
         }
 
+        const captureToggleRenderer = createPrimaryCaptureToggleRenderer(
+          captureGrid,
+          updateSessionCfg,
+          pendingCaptureToggles,
+          markCaptureTogglePending
+        );
+
         const onStateChange = () => {
           const st = store.getState();
           const cfg = mergeRunConfig(st.sessionConfig || defaultRunConfig);
@@ -375,16 +401,21 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           const online = (st.deviceList || []).filter((d) => d?.connected !== false).length;
           const estimates = computeSessionEstimates(cfg);
           const captureItems = describeCapturePlan(cfg);
+          const estimateSummary = `${estimates.storageMbPerMin.toFixed(1)} MB/min/device`;
+          const estimateCopy = `${captureItems.join(", ")} · ${estimates.bandwidthMbps.toFixed(2)} Mbps/device live`;
+          const estimateKey = `${estimateSummary}|${estimateCopy}`;
+          if (estimateKey !== lastEstimateKey) {
+            lastEstimateKey = estimateKey;
+            estimatePanel.innerHTML = `
+              <div class="session-estimate-head">
+                <span class="session-estimate-label">Estimated Data</span>
+                <strong>${escapeHtml(estimateSummary)}</strong>
+              </div>
+              <div class="session-estimate-copy">${escapeHtml(estimateCopy)}</div>
+            `;
+          }
 
-          estimatePanel.innerHTML = `
-            <div class="session-estimate-head">
-              <span class="session-estimate-label">Estimated Data</span>
-              <strong>${escapeHtml(`${estimates.storageMbPerMin.toFixed(1)} MB/min/device`)}</strong>
-            </div>
-            <div class="session-estimate-copy">${escapeHtml(`${captureItems.join(", ")} · ${estimates.bandwidthMbps.toFixed(2)} Mbps/device live`)}</div>
-          `;
-
-          renderPrimaryCaptureToggles(captureGrid, cfg, controlsDisabled, updateSessionCfg, pendingCaptureToggles, markCaptureTogglePending);
+          captureToggleRenderer(cfg, controlsDisabled);
 
           const phase = st.recording?.phase || (isActive ? "RECORDING" : "IDLE");
           const isStopping = phase === "STOPPING";
@@ -491,7 +522,17 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           sendJson({ type: "session_auth_update", joinCode: next });
         }
 
-        const unsub = store.subscribe((s) => ({ cfg: s.sessionConfig, rec: s.recording, list: s.deviceList, state: s.sessionState, joinCode: s.sessionJoinCode, wsConnected: s.wsConnected }), onStateChange);
+        const unsub = store.subscribe((s) => ({
+          cfg: s.sessionConfig,
+          recordingActive: !!s.recording?.active,
+          recordingPhase: s.recording?.phase || "IDLE",
+          recordingElapsed: Number(s.recording?.elapsed_sec || 0),
+          recordingLastError: s.recording?.last_error || null,
+          onlineCount: (s.deviceList || []).filter((d) => d?.connected !== false).length,
+          state: s.sessionState,
+          joinCode: s.sessionJoinCode,
+          wsConnected: s.wsConnected
+        }), onStateChange);
         onStateChange();
 
         return () => {
@@ -854,7 +895,8 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const fresh = camTs > 0 && (now - camTs) < 4000;
             const fpsVal = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
             const rec = st.recordByDevice?.[deviceId];
-            const isCamRecording = !!rec?.recording && !!rec?.modalities?.cam;
+            const recordingPhase = normalizeRecordingPhase(rec?.phase || summary?.recordingState, rec?.recording || summary?.recordingActive);
+            const isCamRecording = recordingPhase === "recording" && !!rec?.modalities?.cam;
             const isOnline = summary.connected !== false;
             const previewEnabled = !!state?.stream_status?.camera?.enabled;
             previewRtc?.updateAvailability(deviceId, { connected: isOnline, previewEnabled });
@@ -866,6 +908,12 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             let placeholderText = previewEnabled ? "No feed" : "Camera disabled";
             if (!isOnline) {
               placeholderText = "Device offline";
+            } else if (recordingPhase === "stopping") {
+              statusClass = "rec";
+              statusLabel = "STOP";
+            } else if (recordingPhase === "starting") {
+              statusClass = "live";
+              statusLabel = "START";
             } else if (showVideo) {
               statusClass = isCamRecording ? "rec" : "live";
               statusLabel = isCamRecording ? "REC" : "LIVE";
@@ -1745,7 +1793,7 @@ function mountGpsLivePanel(container, { store, getDeviceId = () => "" } = {}) {
   };
 }
 
-function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg, pendingToggles = new Map(), onToggleStart = null) {
+function createPrimaryCaptureToggleRenderer(parent, updateSessionCfg, pendingToggles = new Map(), onToggleStart = null) {
   parent.innerHTML = "";
   const items = [
     {
@@ -1809,43 +1857,91 @@ function renderPrimaryCaptureToggles(parent, cfg, disabled, updateSessionCfg, pe
       }
     }
   ];
+  const entries = new Map();
 
   for (const item of items) {
-    const enabled = item.isEnabled(cfg);
-    const isPending = pendingToggles.has(item.key);
-    const pendingEnabled = pendingToggles.get(item.key);
-    const nextEnabled = isPending ? !!pendingEnabled : enabled;
     const card = document.createElement("article");
-    card.className = `session-capture-card ${nextEnabled ? "is-on" : "is-off"}${disabled ? " is-disabled" : ""}${isPending ? " is-pending" : ""}`;
+    card.className = "session-capture-card";
 
     const copy = document.createElement("div");
     copy.className = "session-capture-copy";
-    copy.innerHTML = `
-      <div class="session-capture-head">
-        <strong>${escapeHtml(item.title)}</strong>
-        <span class="session-capture-status">${isPending ? (nextEnabled ? "Turning On" : "Turning Off") : (enabled ? "On" : "Off")}</span>
-      </div>
-      <span class="session-capture-desc">${escapeHtml(item.description)}</span>
-      <span class="session-capture-detail mono">${escapeHtml(isPending ? "Applying..." : item.detail(cfg))}</span>
-    `;
+
+    const head = document.createElement("div");
+    head.className = "session-capture-head";
+
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+
+    const status = document.createElement("span");
+    status.className = "session-capture-status";
+
+    head.append(title, status);
+
+    const desc = document.createElement("span");
+    desc.className = "session-capture-desc";
+    desc.textContent = item.description;
+
+    const detail = document.createElement("span");
+    detail.className = "session-capture-detail mono";
+
+    copy.append(head, desc, detail);
 
     const action = document.createElement("button");
-    action.className = nextEnabled ? "btn btn-small session-capture-action" : "btn btn-alt btn-small session-capture-action";
-    action.textContent = isPending ? "Working..." : (enabled ? "Turn Off" : "Turn On");
-    action.disabled = !!disabled || isPending;
+    action.className = "btn btn-alt btn-small session-capture-action";
     action.addEventListener("click", () => {
-      if (disabled || isPending) return;
-      const targetEnabled = !enabled;
+      const entry = entries.get(item.key);
+      if (!entry || entry.disabled || entry.isPending) return;
+      const targetEnabled = !entry.enabled;
       const applied = updateSessionCfg((nextCfg) => {
-        const currentEnabled = item.isEnabled(nextCfg);
-        item.toggle(nextCfg, !currentEnabled);
+        item.toggle(nextCfg, targetEnabled);
       }, { optimistic: false });
       if (applied) onToggleStart?.(item.key, targetEnabled);
     });
 
     card.append(copy, action);
     parent.appendChild(card);
+    entries.set(item.key, {
+      item,
+      card,
+      status,
+      detail,
+      action,
+      enabled: false,
+      disabled: false,
+      isPending: false
+    });
   }
+
+  return function render(cfg, disabled = false) {
+    for (const item of items) {
+      const entry = entries.get(item.key);
+      if (!entry) continue;
+      const enabled = item.isEnabled(cfg);
+      const isPending = pendingToggles.has(item.key);
+      const pendingEnabled = pendingToggles.get(item.key);
+      const nextEnabled = isPending ? !!pendingEnabled : enabled;
+      entry.enabled = enabled;
+      entry.disabled = !!disabled;
+      entry.isPending = isPending;
+
+      entry.card.classList.toggle("is-on", nextEnabled);
+      entry.card.classList.toggle("is-off", !nextEnabled);
+      entry.card.classList.toggle("is-disabled", !!disabled);
+      entry.card.classList.toggle("is-pending", isPending);
+
+      entry.status.textContent = nextEnabled ? "On" : "Off";
+      entry.status.title = isPending
+        ? (nextEnabled ? "Turning on" : "Turning off")
+        : (nextEnabled ? "On" : "Off");
+      entry.detail.textContent = item.detail(cfg);
+
+      entry.action.className = nextEnabled
+        ? "btn btn-small session-capture-action"
+        : "btn btn-alt btn-small session-capture-action";
+      entry.action.textContent = isPending ? "Working..." : (enabled ? "Turn Off" : "Turn On");
+      entry.action.disabled = !!disabled || isPending;
+    }
+  };
 }
 
 function getPrimaryCaptureToggleState(cfg) {
