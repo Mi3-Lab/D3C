@@ -136,6 +136,8 @@
   let lastAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
   let pendingAlertReplay = null;
+  let suppressSelfWorkzonePlaybackUntilMs = 0;
+  let suppressSelfGenericAlertUntilMs = 0;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
   let fleetOverview = { devices: [], generated_at_ms: 0 };
@@ -885,6 +887,61 @@
     };
   }
 
+  function pickWorkzoneAlertVoice(voices) {
+    const list = Array.isArray(voices) ? voices : [];
+    if (!list.length) return null;
+    const preferredNames = ["Samantha", "Ava", "Allison", "Serena", "Victoria", "Karen", "Moira", "Fiona"];
+    for (const name of preferredNames) {
+      const preferred = list.find((voice) => String(voice?.name || "").toLowerCase() === name.toLowerCase());
+      if (preferred) return preferred;
+    }
+    const localEnglish = list.find((voice) => {
+      const lang = String(voice?.lang || "").toLowerCase();
+      return voice?.localService && lang.startsWith("en");
+    });
+    if (localEnglish) return localEnglish;
+    const anyEnglish = list.find((voice) => String(voice?.lang || "").toLowerCase().startsWith("en"));
+    return anyEnglish || list[0] || null;
+  }
+
+  async function speakWorkzoneDetectedVoice() {
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    const synth = window.speechSynthesis;
+    const Utterance = window.SpeechSynthesisUtterance;
+    if (!synth || typeof Utterance !== "function") return false;
+    try {
+      const utterance = new Utterance("Workzone detected");
+      utterance.lang = "en-US";
+      utterance.rate = 0.96;
+      utterance.pitch = 1.02;
+      utterance.volume = 1;
+      const voice = pickWorkzoneAlertVoice(synth.getVoices?.() || []);
+      if (voice) utterance.voice = voice;
+      synth.cancel();
+      return await new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutId);
+          resolve(value);
+        };
+        const timeoutId = setTimeout(() => finish(false), 1200);
+        utterance.onstart = () => finish(true);
+        utterance.onerror = () => finish(false);
+        utterance.onend = () => finish(true);
+        synth.speak(utterance);
+      });
+    } catch {}
+    return false;
+  }
+
+  async function playWorkzoneAnnouncement({ interactive = false } = {}) {
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    const spoken = await speakWorkzoneDetectedVoice();
+    return { played: spoken, mode: spoken ? "speech" : "none" };
+  }
+
   async function replayPendingAlertIfPossible() {
     if (!pendingAlertReplay) return;
     const pending = pendingAlertReplay;
@@ -892,13 +949,23 @@
       pendingAlertReplay = null;
       return;
     }
-    const ready = await primeAlertAudioWithOptions({ interactive: true });
-    if (!ready) return;
-    const played = await playAlertTone({ allowThrottle: false, interactive: true });
+    let played = false;
+    if (pending.kind === "workzone_detected") {
+      const result = await playWorkzoneAnnouncement({ interactive: true });
+      played = result.played;
+    } else {
+      const ready = await primeAlertAudioWithOptions({ interactive: true });
+      if (!ready) return;
+      played = await playAlertTone({ allowThrottle: false, interactive: true });
+    }
     if (!played) return;
     pendingAlertReplay = null;
     if (pending.kind === "permission_refresh") {
       setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      return;
+    }
+    if (pending.kind === "workzone_detected") {
+      setAlertFeedback("Workzone detected.", "warning", 5000);
       return;
     }
     setAlertFeedback(`Alert from ${pending.sourceDeviceName}.`, "muted");
@@ -945,19 +1012,46 @@
     return true;
   }
 
-  async function triggerFleetAlert() {
+  async function triggerFleetAlert({ kind = "", title = "", message = "", feedbackText = "Sending alert..." } = {}) {
     if (!started || !authState?.joinToken || !ws || ws.readyState !== WebSocket.OPEN) {
       setAlertFeedback("Reconnect to send alerts.", "warning");
       return;
     }
     if (isAlertCoolingDown()) return;
     lastAlertSentAtMs = Date.now();
+    suppressSelfGenericAlertUntilMs = 0;
     scheduleAlertCooldownRefresh();
     await primeAlertAudioWithOptions({ interactive: true });
-    setAlertFeedback("Sending alert...", "muted", 1200);
-    queueJson({
+    setAlertFeedback(String(feedbackText || "Sending alert..."), "muted", 1200);
+    const payload = {
       type: "fleet_alert",
       device_id: runConfig.device_id
+    };
+    if (kind) payload.kind = String(kind).trim();
+    if (title) payload.title = String(title).trim();
+    if (message) payload.message = String(message).trim();
+    queueJson(payload);
+  }
+
+  async function triggerWorkzoneAlert() {
+    if (!started || !authState?.joinToken || !ws || ws.readyState !== WebSocket.OPEN) {
+      setAlertFeedback("Reconnect to send alerts.", "warning");
+      return;
+    }
+    if (isAlertCoolingDown()) return;
+    lastAlertSentAtMs = Date.now();
+    suppressSelfGenericAlertUntilMs = lastAlertSentAtMs + 4000;
+    scheduleAlertCooldownRefresh();
+    const result = await playWorkzoneAnnouncement({ interactive: true });
+    if (result.played) suppressSelfWorkzonePlaybackUntilMs = Date.now() + 4000;
+    else suppressSelfWorkzonePlaybackUntilMs = 0;
+    setAlertFeedback("Sending workzone alert...", result.mode === "speech" ? "success" : "muted", 1400);
+    queueJson({
+      type: "fleet_alert",
+      device_id: runConfig.device_id,
+      kind: "workzone_detected",
+      title: "Workzone detected",
+      message: "Workzone detected."
     });
   }
 
@@ -967,8 +1061,15 @@
     const sourceDeviceName = String(msg.source_device_name || sourceDeviceId || "another phone").trim();
     const targetCount = Math.max(1, Number(msg.target_count || 0) || 1);
     const fromSelf = !!sourceDeviceId && sourceDeviceId === runConfig.device_id;
-    if (!fromSelf || kind === "permission_refresh") playAlertHaptics();
-    const played = await playAlertTone();
+    if (fromSelf && !kind && Date.now() < suppressSelfGenericAlertUntilMs) {
+      setAlertFeedback(`Workzone detected. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
+      return;
+    }
+    const shouldPlayHaptics = kind === "permission_refresh" || (!fromSelf && kind !== "workzone_detected");
+    if (shouldPlayHaptics) playAlertHaptics();
+    const played = kind === "workzone_detected"
+      ? ((fromSelf && Date.now() < suppressSelfWorkzonePlaybackUntilMs) ? true : (await playWorkzoneAnnouncement()).played)
+      : await playAlertTone();
     if (played) pendingAlertReplay = null;
     if (kind === "permission_refresh") {
       const title = String(msg.title || "Enable access").trim() || "Enable access";
@@ -990,6 +1091,11 @@
       const title = String(msg.title || "Workzone detected").trim() || "Workzone detected";
       const message = String(msg.message || `Workzone detected by ${sourceDeviceName}.`).trim();
       if (fromSelf) {
+        if (!played) {
+          queuePendingAlertReplay(sourceDeviceName, kind);
+          setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}. Tap once anywhere on this phone if Safari kept speech blocked; it will replay automatically.`, "warning", 5200);
+          return;
+        }
         setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
         return;
       }
@@ -997,7 +1103,8 @@
         setAlertFeedback(message, "warning", 5000);
         return;
       }
-      setAlertFeedback(`${message} Tap Alert once on this phone if Safari kept sound blocked.`, "warning", 5200);
+      queuePendingAlertReplay(sourceDeviceName, kind);
+      setAlertFeedback(`${message} Tap once anywhere on this phone if Safari kept sound blocked; it will replay automatically.`, "warning", 5200);
       return;
     }
     if (fromSelf) {
@@ -1409,12 +1516,18 @@
     alertBtn.textContent = isAlertCoolingDown() ? "Alerting..." : "Alert";
     alertBtn.disabled = !connected || isAlertCoolingDown();
     alertBtn.addEventListener("click", () => { void triggerFleetAlert(); });
+    const workzoneBtn = document.createElement("button");
+    workzoneBtn.type = "button";
+    workzoneBtn.className = "btn btn-alt btn-small phone-alert-btn";
+    workzoneBtn.textContent = "Workzone Alert";
+    workzoneBtn.disabled = !connected || isAlertCoolingDown();
+    workzoneBtn.addEventListener("click", () => { void triggerWorkzoneAlert(); });
     const hint = document.createElement("div");
     hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
     hint.textContent = alertFeedbackText || (connected
-      ? "Plays a short tone on every connected phone."
+      ? "Alert plays a tone. Workzone Alert says “workzone detected” on every connected phone."
       : "Reconnect to send alerts.");
-    actions.append(alertBtn, hint);
+    actions.append(alertBtn, workzoneBtn, hint);
     primaryActionArea.appendChild(actions);
   }
 

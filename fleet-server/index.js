@@ -638,10 +638,17 @@ function handlePhoneJson(ws, msg) {
 
   if (msg.type === "fleet_alert") {
     const sourceDeviceName = d.device_name || deviceId;
-    broadcastFleetAlert({
+    const kind = typeof msg.kind === "string" ? String(msg.kind).trim() : "";
+    const title = typeof msg.title === "string" ? String(msg.title).trim() : "";
+    const message = typeof msg.message === "string" ? String(msg.message).trim() : "";
+    const payload = {
       source_device_id: deviceId,
       source_device_name: sourceDeviceName
-    }, { critical: true });
+    };
+    if (kind) payload.kind = kind.slice(0, 64);
+    if (title) payload.title = title.slice(0, 120);
+    if (message) payload.message = message.slice(0, 280);
+    broadcastFleetAlert(payload, { critical: true });
     return;
   }
 
