@@ -17,14 +17,22 @@ WORKZONE_PROJECT_DIR="${WORKZONE_PROJECT_DIR:-/home/proy/projects/mi3/workzone}"
 WORKZONE_PYTHON="${WORKZONE_PYTHON:-/home/proy/miniconda3/envs/workzone/bin/python}"
 WORKZONE_WEIGHTS="${WORKZONE_WEIGHTS:-weights/yolo12s_hardneg_1280.pt}"
 WORKZONE_DEVICE="${WORKZONE_DEVICE:-cpu}"
-WORKZONE_POLL_INTERVAL="${WORKZONE_POLL_INTERVAL:-0.5}"
+WORKZONE_LIVE_ENABLE="${WORKZONE_LIVE_ENABLE:-auto}"
+WORKZONE_LIVE_IMGSZ="${WORKZONE_LIVE_IMGSZ:-1280}"
+WORKZONE_LIVE_CONF="${WORKZONE_LIVE_CONF:-0.18}"
+WORKZONE_LIVE_IOU="${WORKZONE_LIVE_IOU:-0.45}"
+WORKZONE_LIVE_SCORE_THRESHOLD="${WORKZONE_LIVE_SCORE_THRESHOLD:-0.40}"
+WORKZONE_POLL_INTERVAL="${WORKZONE_POLL_INTERVAL:-0.2}"
 WORKZONE_OUTPUT_FOLDER_NAME="${WORKZONE_OUTPUT_FOLDER_NAME:-workzone}"
+WORKZONE_NO_SAVE_ANNOTATED_FRAMES="${WORKZONE_NO_SAVE_ANNOTATED_FRAMES:-0}"
+WORKZONE_NO_SAVE_ANNOTATED_VIDEO="${WORKZONE_NO_SAVE_ANNOTATED_VIDEO:-0}"
 WORKZONE_VIDEO_SEGMENT_FRAMES="${WORKZONE_VIDEO_SEGMENT_FRAMES:-}"
 WORKZONE_LOG=""
 SERVER_PID=""
 TUNNEL_PID=""
 WORKZONE_PID=""
 QUICK_TUNNEL_RETRIES="${QUICK_TUNNEL_RETRIES:-4}"
+WORKZONE_ALERT_COOLDOWN_MS="${WORKZONE_ALERT_COOLDOWN_MS:-0}"
 
 cleanup() {
   local exit_code=$?
@@ -75,7 +83,19 @@ fi
 should_start_workzone() {
   local normalized="${WORKZONE_ENABLE,,}"
   case "${normalized}" in
-    1|true|yes|on|auto) return 0 ;;
+    1|true|yes|on) return 0 ;;
+    auto)
+      case "${WORKZONE_LIVE_ENABLE,,}" in
+        1|true|yes|on) return 1 ;;
+        auto)
+          if [[ -d "${WORKZONE_PROJECT_DIR}" ]] && [[ -x "${WORKZONE_PYTHON}" ]]; then
+            return 1
+          fi
+          return 0
+          ;;
+        *) return 0 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
 }
@@ -84,7 +104,18 @@ cd "${ROOT_DIR}"
 mkdir -p "${RUNTIME_DIR}"
 
 echo "Starting D3C server on ${SERVER_URL} ..."
-PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH}" node fleet-server/index.js --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
+PUBLIC_RUNTIME_STATE_PATH="${PUBLIC_RUNTIME_STATE_PATH}" \
+WORKZONE_ALERT_COOLDOWN_MS="${WORKZONE_ALERT_COOLDOWN_MS}" \
+WORKZONE_LIVE_ENABLE="${WORKZONE_LIVE_ENABLE}" \
+WORKZONE_LIVE_PROJECT_DIR="${WORKZONE_PROJECT_DIR}" \
+WORKZONE_LIVE_PYTHON="${WORKZONE_PYTHON}" \
+WORKZONE_LIVE_WEIGHTS="${WORKZONE_WEIGHTS}" \
+WORKZONE_LIVE_DEVICE="${WORKZONE_DEVICE}" \
+WORKZONE_LIVE_IMGSZ="${WORKZONE_LIVE_IMGSZ}" \
+WORKZONE_LIVE_CONF="${WORKZONE_LIVE_CONF}" \
+WORKZONE_LIVE_IOU="${WORKZONE_LIVE_IOU}" \
+WORKZONE_LIVE_SCORE_THRESHOLD="${WORKZONE_LIVE_SCORE_THRESHOLD}" \
+node fleet-server/index.js --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 for _ in {1..30}; do
@@ -128,6 +159,12 @@ if should_start_workzone; then
       --poll-interval "${WORKZONE_POLL_INTERVAL}"
       --output-folder-name "${WORKZONE_OUTPUT_FOLDER_NAME}"
     )
+    if [[ "${WORKZONE_NO_SAVE_ANNOTATED_FRAMES,,}" =~ ^(1|true|yes|on)$ ]]; then
+      WORKZONE_CMD+=(--no-save-annotated-frames)
+    fi
+    if [[ "${WORKZONE_NO_SAVE_ANNOTATED_VIDEO,,}" =~ ^(1|true|yes|on)$ ]]; then
+      WORKZONE_CMD+=(--no-save-annotated-video)
+    fi
     if [[ -n "${WORKZONE_VIDEO_SEGMENT_FRAMES}" ]]; then
       WORKZONE_CMD+=(--video-segment-frames "${WORKZONE_VIDEO_SEGMENT_FRAMES}")
     fi

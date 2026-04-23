@@ -51,7 +51,15 @@ const store = createStore({
   sessionJoinCode: "",
   sessionState: "draft",
   recording: { active: false, phase: "IDLE", mode: "all", session_id: null, session_dir: null, started_at_utc_ms: null, elapsed_sec: 0, devices_recording: 0, devices_online: 0 },
-  runtime: { server_started_at_ms: null, server_uptime_sec: 0, public_started_at_ms: null, public_uptime_sec: null, public_url: null, public_mode: null },
+  runtime: {
+    server_started_at_ms: null,
+    server_uptime_sec: 0,
+    public_started_at_ms: null,
+    public_uptime_sec: null,
+    public_url: null,
+    public_mode: null,
+    workzone_live: null
+  },
   recordByDevice: {},
   replaySessions: [],
   storage: { sessions_size_gb: 0, session_count: 0, free_disk_bytes: null },

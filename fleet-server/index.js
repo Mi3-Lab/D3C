@@ -4,6 +4,7 @@ const http = require("http");
 const https = require("https");
 const os = require("os");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 const express = require("express");
 const { WebSocketServer, WebSocket } = require("ws");
 const { DEFAULT_RUN_CONFIG, STATE_BROADCAST_HZ, DATASETS_ROOT } = require("./config");
@@ -39,9 +40,69 @@ const PUBLIC_RUNTIME_STATE_PATH = process.env.PUBLIC_RUNTIME_STATE_PATH
   : "";
 const SERVER_STARTED_AT_MS = Date.now();
 const FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS = 500;
-const WORKZONE_ALERT_POLL_INTERVAL_MS = 1000;
-const WORKZONE_ALERT_COOLDOWN_MS = 30000;
+const WORKZONE_ALERT_POLL_INTERVAL_MS = Math.max(
+  100,
+  Math.round(Number(process.env.WORKZONE_ALERT_POLL_INTERVAL_MS || 250) || 250)
+);
+const WORKZONE_ALERT_COOLDOWN_MS = Math.max(
+  0,
+  Math.round(Number(process.env.WORKZONE_ALERT_COOLDOWN_MS || 0) || 0)
+);
 const WORKZONE_ALERT_STALE_MS = 15000;
+const WORKZONE_LIVE_ENABLE = String(process.env.WORKZONE_LIVE_ENABLE || "auto").trim().toLowerCase();
+const WORKZONE_LIVE_PROJECT_DIR = path.resolve(String(
+  process.env.WORKZONE_LIVE_PROJECT_DIR
+  || process.env.WORKZONE_PROJECT_DIR
+  || "/home/proy/projects/mi3/workzone"
+));
+const WORKZONE_LIVE_PYTHON = path.resolve(String(
+  process.env.WORKZONE_LIVE_PYTHON
+  || process.env.WORKZONE_PYTHON
+  || "/home/proy/miniconda3/envs/workzone/bin/python"
+));
+const WORKZONE_LIVE_WEIGHTS = String(
+  process.env.WORKZONE_LIVE_WEIGHTS
+  || process.env.WORKZONE_WEIGHTS
+  || "weights/yolo12s_hardneg_1280.pt"
+).trim();
+const WORKZONE_LIVE_DEVICE = String(
+  process.env.WORKZONE_LIVE_DEVICE
+  || process.env.WORKZONE_DEVICE
+  || "cpu"
+).trim() || "cpu";
+const WORKZONE_LIVE_IMGSZ = Math.max(64, Math.round(Number(process.env.WORKZONE_LIVE_IMGSZ || 1280) || 1280));
+const WORKZONE_LIVE_CONF = Math.max(0, Number(process.env.WORKZONE_LIVE_CONF || 0.18) || 0.18);
+const WORKZONE_LIVE_IOU = Math.max(0, Number(process.env.WORKZONE_LIVE_IOU || 0.45) || 0.45);
+const WORKZONE_LIVE_SCORE_THRESHOLD = Math.max(0, Number(process.env.WORKZONE_LIVE_SCORE_THRESHOLD || 0.40) || 0.40);
+const WORKZONE_LIVE_PING_INTERVAL_MS = Math.max(
+  500,
+  Math.round(Number(process.env.WORKZONE_LIVE_PING_INTERVAL_MS || 2500) || 2500)
+);
+const WORKZONE_LIVE_BUSY_TIMEOUT_MS = Math.max(
+  2000,
+  Math.round(Number(process.env.WORKZONE_LIVE_BUSY_TIMEOUT_MS || 8000) || 8000)
+);
+const WORKZONE_LIVE_RESTART_DELAY_MS = Math.max(
+  250,
+  Math.round(Number(process.env.WORKZONE_LIVE_RESTART_DELAY_MS || 1500) || 1500)
+);
+const WORKZONE_LIVE_RESULT_STALE_MS = Math.max(
+  1000,
+  Math.round(Number(process.env.WORKZONE_LIVE_RESULT_STALE_MS || 3500) || 3500)
+);
+const WORKZONE_LIVE_EVIDENCE_WINDOW_MS = Math.max(
+  1000,
+  Math.round(Number(process.env.WORKZONE_LIVE_EVIDENCE_WINDOW_MS || 2500) || 2500)
+);
+const WORKZONE_LIVE_ACTIVE_HOLD_MS = Math.max(
+  500,
+  Math.round(Number(process.env.WORKZONE_LIVE_ACTIVE_HOLD_MS || 1800) || 1800)
+);
+const WORKZONE_LIVE_ALERT_BANNER_MS = Math.max(
+  1000,
+  Math.round(Number(process.env.WORKZONE_LIVE_ALERT_BANNER_MS || 8000) || 8000)
+);
+const WORKZONE_LIVE_WORKER_SCRIPT = path.join(process.cwd(), "fleet-server", "workzone_live_worker.py");
 
 const args = parseArgs(process.argv.slice(2));
 const useHttps = !!(args.cert && args.key);
@@ -387,7 +448,36 @@ const workzoneAlertState = {
   sessionDir: null,
   devices: new Map()
 };
+const workzoneLiveState = {
+  configured: shouldEnableWorkzoneLive(),
+  proc: null,
+  ready: false,
+  failed: false,
+  stdoutBuffer: "",
+  busy: false,
+  currentTask: null,
+  pendingByDevice: new Map(),
+  nextSeqByDevice: new Map(),
+  lastStartAtMs: 0,
+  lastReadyAtMs: 0,
+  lastPongAtMs: 0,
+  lastPingSentAtMs: 0,
+  lastDispatchAtMs: 0,
+  lastResultAtMs: 0,
+  lastInferenceMs: 0,
+  avgInferenceMs: 0,
+  framesProcessed: 0,
+  framesDropped: 0,
+  restartCount: 0,
+  restartTimer: null,
+  lastExitCode: null,
+  lastExitSignal: null,
+  lastError: "",
+  lastStatus: "idle"
+};
 let publicRuntimeInfo = loadPublicRuntimeInfo();
+
+startWorkzoneLiveWorker();
 
 wss.on("connection", (ws, req) => {
   connectionStats.sockets_connected += 1;
@@ -451,6 +541,8 @@ setInterval(() => {
   pruneAuthRateLimit();
   prunePhoneAuthTokens();
   publicRuntimeInfo = loadPublicRuntimeInfo();
+  tickWorkzoneLiveHealth();
+  refreshWorkzoneLiveDeviceStates();
   for (const [id, d] of devices.entries()) {
     const expectedImu = d.config.streams.imu.enabled ? d.config.streams.imu.rate_hz : 0;
     const expectedCam = getExpectedCameraIngressFps(d, { recordingActive: !!d.recordingStatus?.recording });
@@ -942,6 +1034,15 @@ function handlePhoneBinary(ws, data) {
   if (Number.isFinite(header.lighting_score)) d.state.camera_quality.lighting_score = header.lighting_score;
   d.stats.camera_count += 1;
   if (recording.active && header.record_for_session !== false) {
+    queueLiveWorkzoneFrame({
+      deviceId: ws.device_id,
+      jpegBuffer: d.latestCameraBuffer,
+      tDeviceMs: header.t_device_ms,
+      tRecvMs,
+      format: header.format || "jpeg"
+    });
+  }
+  if (recording.active && header.record_for_session !== false) {
     sessionManager.writeCamera(ws.device_id, {
       jpegBuffer: d.latestCameraBuffer,
       t_device_ms: header.t_device_ms,
@@ -1140,6 +1241,10 @@ function startRecordingSession({ scope, session_name, modalities = ["imu", "cam"
   recording.target_device_ids = targetEntries.map(([id]) => id);
   recording.last_error = null;
   recording.stop_requested_at_ms = null;
+  clearQueuedWorkzoneLiveFrames();
+  workzoneLiveState.nextSeqByDevice.clear();
+  resetWorkzoneAlertState(res.sessionDir);
+  resetAllDeviceWorkzoneLiveStates();
 
   for (const [id, d] of devices.entries()) {
     const targeted = recording.target_device_ids.includes(id);
@@ -1254,6 +1359,10 @@ async function stopRecordingSession() {
   recording.target_device_ids = [];
   recording.stop_requested_at_ms = null;
   recording.last_error = timedOut ? { type: "stop_timeout", timeout_ms: timeoutMs } : null;
+  clearQueuedWorkzoneLiveFrames();
+  workzoneLiveState.nextSeqByDevice.clear();
+  resetWorkzoneAlertState(null);
+  resetAllDeviceWorkzoneLiveStates();
 
   if (timedOut) {
     broadcastToDashboards({
@@ -1332,6 +1441,54 @@ function emptyRecordingModalities() {
 
 function emptyRecordingWriter(dropped = 0) {
   return { last_write_utc_ms: null, dropped: Number(dropped || 0) };
+}
+
+function emptyWorkzoneLivePublicState() {
+  return {
+    enabled: !!workzoneLiveState.configured,
+    source: workzoneLiveState.configured ? "live" : null,
+    status: workzoneLiveState.configured ? "idle" : "disabled",
+    worker_state: workzoneLiveState.configured ? "starting" : "disabled",
+    recording_active: false,
+    pending: false,
+    checking: false,
+    active: false,
+    banner_active: false,
+    found: false,
+    tracking: false,
+    last_frame_at_ms: null,
+    last_checked_at_ms: null,
+    last_result_age_ms: null,
+    last_frame_age_ms: null,
+    queue_age_ms: null,
+    frame_index: 0,
+    score: 0,
+    smoothed_score: 0,
+    score_threshold: WORKZONE_LIVE_SCORE_THRESHOLD,
+    max_confidence: 0,
+    detection_count: 0,
+    class_counts: {},
+    class_summary: "",
+    top_detections: [],
+    inference_ms: 0,
+    inference_avg_ms: 0,
+    pipeline_latency_ms: null,
+    positive_frames_recent: 0,
+    strong_frames_recent: 0,
+    consecutive_positive_frames: 0,
+    consecutive_negative_frames: 0,
+    frames_processed: 0,
+    frames_dropped: 0,
+    last_alert_at_ms: null,
+    last_error: "",
+    message: workzoneLiveState.configured ? "Waiting for recording to start." : "WorkZone live worker is disabled."
+  };
+}
+
+function resetAllDeviceWorkzoneLiveStates() {
+  for (const [, device] of devices.entries()) {
+    device.state.workzone_live = emptyWorkzoneLivePublicState();
+  }
 }
 
 function normalizeDeviceRecordingPhase(value) {
@@ -1435,6 +1592,7 @@ function publicStateForDevice(deviceId, d) {
       rtt_ms: d.stats.rtt_ms
     },
     event_timeline: d.state.event_timeline,
+    workzone_live: d.state.workzone_live,
     stream_status: buildStreamStatus(d.config, d)
   };
 }
@@ -1459,6 +1617,11 @@ function deviceSummaries() {
       recordingState: normalizeDeviceRecordingPhase(d.recordingStatus?.phase),
       recordingModalities: d.recordingStatus?.modalities || emptyRecordingModalities(),
       recordingSessionId: d.recordingStatus?.session_id || null,
+      workzoneStatus: d.state.workzone_live?.status || "disabled",
+      workzoneActive: !!d.state.workzone_live?.banner_active,
+      workzoneScore: Number(d.state.workzone_live?.score || 0),
+      workzoneSmoothedScore: Number(d.state.workzone_live?.smoothed_score || 0),
+      workzoneClassSummary: d.state.workzone_live?.class_summary || "",
       healthAlerts: computeDeviceAlerts(d),
       syncSummary: summarizeSyncStats(d)
     });
@@ -1674,7 +1837,8 @@ function newDeviceEntry(deviceId) {
       device_latest: null,
       camera_quality: { lighting_score: null },
       fusion: { connection_quality: 0, sensing_confidence: 0 },
-      event_timeline: []
+      event_timeline: [],
+      workzone_live: emptyWorkzoneLivePublicState()
     },
     stats: {
       imu_count: 0,
@@ -1803,12 +1967,709 @@ function buildFleetOverviewPayload() {
   };
 }
 
+function shouldEnableWorkzoneLive() {
+  const enabledValues = new Set(["1", "true", "yes", "on"]);
+  const disabledValues = new Set(["0", "false", "no", "off"]);
+  if (enabledValues.has(WORKZONE_LIVE_ENABLE)) return true;
+  if (disabledValues.has(WORKZONE_LIVE_ENABLE)) return false;
+  return fs.existsSync(WORKZONE_LIVE_PYTHON)
+    && fs.existsSync(WORKZONE_LIVE_PROJECT_DIR)
+    && fs.existsSync(WORKZONE_LIVE_WORKER_SCRIPT);
+}
+
+function isWorkzoneLiveActive() {
+  return !!workzoneLiveState.proc && !workzoneLiveState.failed;
+}
+
+function classifyWorkzoneLiveRuntimeStatus(now = Date.now()) {
+  if (!workzoneLiveState.configured) return "disabled";
+  if (workzoneLiveState.busy && workzoneLiveState.currentTask?.startedAtMs) {
+    if ((now - workzoneLiveState.currentTask.startedAtMs) > WORKZONE_LIVE_BUSY_TIMEOUT_MS) return "stalled";
+  }
+  if (workzoneLiveState.proc && !workzoneLiveState.ready) return "starting";
+  if (workzoneLiveState.failed && workzoneLiveState.restartTimer) return "restarting";
+  if (!workzoneLiveState.proc) return workzoneLiveState.failed ? "offline" : "idle";
+  if (!workzoneLiveState.ready) return "starting";
+  if (
+    recording.active
+    && workzoneLiveState.lastResultAtMs
+    && (now - workzoneLiveState.lastResultAtMs) > (WORKZONE_LIVE_RESULT_STALE_MS * 2)
+  ) {
+    return "stale";
+  }
+  if (workzoneLiveState.busy) return "checking";
+  return "ready";
+}
+
+function buildWorkzoneLiveRuntimeInfo(now = Date.now()) {
+  const status = classifyWorkzoneLiveRuntimeStatus(now);
+  workzoneLiveState.lastStatus = status;
+  const currentTask = workzoneLiveState.currentTask || null;
+  return {
+    configured: !!workzoneLiveState.configured,
+    enabled: !!workzoneLiveState.configured,
+    status,
+    ready: !!workzoneLiveState.ready,
+    failed: !!workzoneLiveState.failed,
+    busy: !!workzoneLiveState.busy,
+    pid: Number.isFinite(Number(workzoneLiveState.proc?.pid)) ? Number(workzoneLiveState.proc.pid) : null,
+    pending_frames: workzoneLiveState.pendingByDevice.size,
+    last_start_at_ms: workzoneLiveState.lastStartAtMs || null,
+    last_ready_at_ms: workzoneLiveState.lastReadyAtMs || null,
+    last_pong_at_ms: workzoneLiveState.lastPongAtMs || null,
+    last_result_at_ms: workzoneLiveState.lastResultAtMs || null,
+    last_dispatch_at_ms: workzoneLiveState.lastDispatchAtMs || null,
+    last_result_age_ms: workzoneLiveState.lastResultAtMs ? Math.max(0, now - workzoneLiveState.lastResultAtMs) : null,
+    last_pong_age_ms: workzoneLiveState.lastPongAtMs ? Math.max(0, now - workzoneLiveState.lastPongAtMs) : null,
+    current_device_id: currentTask?.deviceId || null,
+    current_frame_index: Number.isFinite(Number(currentTask?.frameIndex)) ? Number(currentTask.frameIndex) : null,
+    current_task_age_ms: currentTask?.startedAtMs ? Math.max(0, now - currentTask.startedAtMs) : null,
+    frames_processed: Number(workzoneLiveState.framesProcessed || 0),
+    frames_dropped: Number(workzoneLiveState.framesDropped || 0),
+    last_inference_ms: Number.isFinite(Number(workzoneLiveState.lastInferenceMs)) ? Number(workzoneLiveState.lastInferenceMs) : null,
+    avg_inference_ms: Number.isFinite(Number(workzoneLiveState.avgInferenceMs)) ? Number(workzoneLiveState.avgInferenceMs) : null,
+    restart_count: Number(workzoneLiveState.restartCount || 0),
+    last_exit_code: workzoneLiveState.lastExitCode,
+    last_exit_signal: workzoneLiveState.lastExitSignal,
+    last_error: workzoneLiveState.lastError || null,
+    project_dir: WORKZONE_LIVE_PROJECT_DIR,
+    weights: WORKZONE_LIVE_WEIGHTS,
+    device: WORKZONE_LIVE_DEVICE,
+    imgsz: WORKZONE_LIVE_IMGSZ,
+    conf: WORKZONE_LIVE_CONF,
+    iou: WORKZONE_LIVE_IOU,
+    score_threshold: WORKZONE_LIVE_SCORE_THRESHOLD
+  };
+}
+
+function scheduleWorkzoneLiveRestart(reason = "retry") {
+  if (!workzoneLiveState.configured || workzoneLiveState.restartTimer) return;
+  if (
+    !fs.existsSync(WORKZONE_LIVE_PYTHON)
+    || !fs.existsSync(WORKZONE_LIVE_PROJECT_DIR)
+    || !fs.existsSync(WORKZONE_LIVE_WORKER_SCRIPT)
+  ) {
+    return;
+  }
+  const delayMs = Math.min(10000, WORKZONE_LIVE_RESTART_DELAY_MS * Math.max(1, workzoneLiveState.restartCount + 1));
+  workzoneLiveState.restartTimer = setTimeout(() => {
+    workzoneLiveState.restartTimer = null;
+    workzoneLiveState.restartCount += 1;
+    startWorkzoneLiveWorker();
+  }, delayMs);
+  console.warn("[workzone-live] restart scheduled", { delay_ms: delayMs, reason });
+}
+
+function sendWorkzoneLiveMessage(payload) {
+  const proc = workzoneLiveState.proc;
+  if (!proc?.stdin || proc.stdin.destroyed) {
+    workzoneLiveState.failed = true;
+    workzoneLiveState.lastError = "worker stdin is unavailable";
+    scheduleWorkzoneLiveRestart("stdin_unavailable");
+    return false;
+  }
+  try {
+    proc.stdin.write(`${JSON.stringify(payload)}\n`);
+    return true;
+  } catch (err) {
+    workzoneLiveState.failed = true;
+    workzoneLiveState.lastError = String(err?.message || err || "worker stdin write failed");
+    console.error("[workzone-live] stdin write failed", err?.message || err);
+    scheduleWorkzoneLiveRestart("stdin_write_failed");
+    return false;
+  }
+}
+
+function startWorkzoneLiveWorker() {
+  if (!workzoneLiveState.configured || workzoneLiveState.proc) return;
+  if (
+    !fs.existsSync(WORKZONE_LIVE_PYTHON)
+    || !fs.existsSync(WORKZONE_LIVE_PROJECT_DIR)
+    || !fs.existsSync(WORKZONE_LIVE_WORKER_SCRIPT)
+  ) {
+    workzoneLiveState.failed = true;
+    workzoneLiveState.lastError = "WorkZone live worker files are unavailable.";
+    console.warn("[workzone-live] unavailable", {
+      python: WORKZONE_LIVE_PYTHON,
+      project_dir: WORKZONE_LIVE_PROJECT_DIR,
+      worker_script: WORKZONE_LIVE_WORKER_SCRIPT
+    });
+    return;
+  }
+
+  const proc = spawn(
+    WORKZONE_LIVE_PYTHON,
+    [
+      WORKZONE_LIVE_WORKER_SCRIPT,
+      "--workzone-project-dir", WORKZONE_LIVE_PROJECT_DIR,
+      "--weights", WORKZONE_LIVE_WEIGHTS,
+      "--device", WORKZONE_LIVE_DEVICE,
+      "--imgsz", String(WORKZONE_LIVE_IMGSZ),
+      "--conf", String(WORKZONE_LIVE_CONF),
+      "--iou", String(WORKZONE_LIVE_IOU),
+      "--score-threshold", String(WORKZONE_LIVE_SCORE_THRESHOLD)
+    ],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    }
+  );
+
+  workzoneLiveState.proc = proc;
+  workzoneLiveState.ready = false;
+  workzoneLiveState.failed = false;
+  workzoneLiveState.stdoutBuffer = "";
+  workzoneLiveState.busy = false;
+  workzoneLiveState.currentTask = null;
+  workzoneLiveState.lastStartAtMs = Date.now();
+  workzoneLiveState.lastExitCode = null;
+  workzoneLiveState.lastExitSignal = null;
+  workzoneLiveState.lastError = "";
+
+  proc.stdout.on("data", (chunk) => {
+    handleWorkzoneLiveStdoutChunk(chunk);
+  });
+  proc.stderr.on("data", (chunk) => {
+    const text = String(chunk || "").trim();
+    if (!text) return;
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim()) console.error(`[workzone-live] ${line.trim()}`);
+    }
+  });
+  proc.on("error", (err) => {
+    workzoneLiveState.failed = true;
+    workzoneLiveState.lastError = String(err?.message || err || "worker process error");
+    console.error("[workzone-live] process error", err?.message || err);
+  });
+  proc.on("exit", (code, signal) => {
+    workzoneLiveState.ready = false;
+    workzoneLiveState.failed = true;
+    workzoneLiveState.proc = null;
+    workzoneLiveState.busy = false;
+    workzoneLiveState.currentTask = null;
+    workzoneLiveState.stdoutBuffer = "";
+    workzoneLiveState.lastExitCode = Number.isFinite(Number(code)) ? Number(code) : code;
+    workzoneLiveState.lastExitSignal = signal || null;
+    workzoneLiveState.lastError = signal
+      ? `WorkZone worker exited with signal ${signal}`
+      : `WorkZone worker exited with code ${code}`;
+    clearQueuedWorkzoneLiveFrames({ countAsDropped: true });
+    console.warn("[workzone-live] exited", { code, signal });
+    scheduleWorkzoneLiveRestart("exit");
+  });
+
+  console.log("[workzone-live] starting", {
+    python: WORKZONE_LIVE_PYTHON,
+    project_dir: WORKZONE_LIVE_PROJECT_DIR,
+    weights: WORKZONE_LIVE_WEIGHTS,
+    device: WORKZONE_LIVE_DEVICE,
+    imgsz: WORKZONE_LIVE_IMGSZ
+  });
+}
+
+function handleWorkzoneLiveStdoutChunk(chunk) {
+  workzoneLiveState.stdoutBuffer += chunk.toString("utf8");
+  while (true) {
+    const newlineIndex = workzoneLiveState.stdoutBuffer.indexOf("\n");
+    if (newlineIndex < 0) break;
+    const line = workzoneLiveState.stdoutBuffer.slice(0, newlineIndex).trim();
+    workzoneLiveState.stdoutBuffer = workzoneLiveState.stdoutBuffer.slice(newlineIndex + 1);
+    if (!line) continue;
+    let msg = null;
+    try {
+      msg = JSON.parse(line);
+    } catch (err) {
+      console.warn("[workzone-live] invalid stdout", { line, error: err?.message || err });
+      continue;
+    }
+    handleWorkzoneLiveMessage(msg);
+  }
+}
+
+function handleWorkzoneLiveMessage(msg) {
+  const type = String(msg?.type || "").trim();
+  if (type === "ready") {
+    workzoneLiveState.ready = true;
+    workzoneLiveState.failed = false;
+    workzoneLiveState.lastReadyAtMs = Date.now();
+    workzoneLiveState.lastPongAtMs = Date.now();
+    workzoneLiveState.lastError = "";
+    console.log("[workzone-live] ready", {
+      weights: msg.weights || WORKZONE_LIVE_WEIGHTS,
+      device: msg.device || WORKZONE_LIVE_DEVICE,
+      imgsz: Number(msg.imgsz || WORKZONE_LIVE_IMGSZ)
+    });
+    dispatchNextWorkzoneLiveFrame();
+    return;
+  }
+  if (type === "pong") {
+    workzoneLiveState.lastPongAtMs = Date.now();
+    workzoneLiveState.failed = false;
+    return;
+  }
+  if (type === "error") {
+    workzoneLiveState.lastError = String(msg?.error || msg?.stage || "worker error");
+    console.warn("[workzone-live] worker error", msg);
+    return;
+  }
+  if (type !== "result") return;
+  workzoneLiveState.busy = false;
+  workzoneLiveState.currentTask = null;
+  workzoneLiveState.lastResultAtMs = Date.now();
+  workzoneLiveState.lastInferenceMs = Number.isFinite(Number(msg?.inference_ms)) ? Number(msg.inference_ms) : 0;
+  if (workzoneLiveState.lastInferenceMs > 0) {
+    workzoneLiveState.avgInferenceMs = workzoneLiveState.avgInferenceMs > 0
+      ? Number(((workzoneLiveState.avgInferenceMs * 0.8) + (workzoneLiveState.lastInferenceMs * 0.2)).toFixed(2))
+      : Number(workzoneLiveState.lastInferenceMs.toFixed(2));
+  }
+  workzoneLiveState.framesProcessed += 1;
+  handleLiveWorkzoneResult(msg);
+  dispatchNextWorkzoneLiveFrame();
+}
+
+function clearQueuedWorkzoneLiveFrames({ countAsDropped = false } = {}) {
+  for (const [deviceId] of workzoneLiveState.pendingByDevice.entries()) {
+    const device = devices.get(deviceId);
+    if (!device?.state?.workzone_live) continue;
+    device.state.workzone_live.pending = false;
+    device.state.workzone_live.queue_age_ms = null;
+    if (countAsDropped) {
+      device.state.workzone_live.frames_dropped = Number(device.state.workzone_live.frames_dropped || 0) + 1;
+    }
+  }
+  workzoneLiveState.pendingByDevice.clear();
+}
+
+function nextWorkzoneLiveSeq(deviceId) {
+  const next = (workzoneLiveState.nextSeqByDevice.get(deviceId) || 0) + 1;
+  workzoneLiveState.nextSeqByDevice.set(deviceId, next);
+  return next;
+}
+
+function queueLiveWorkzoneFrame({ deviceId, jpegBuffer, tDeviceMs = 0, tRecvMs = Date.now(), format = "jpeg" }) {
+  if (!isWorkzoneLiveActive()) return;
+  if (!recording.active || !recording.session_dir) return;
+  if (!recording.target_device_ids.includes(deviceId)) return;
+  if (!jpegBuffer?.length || String(format || "jpeg").toLowerCase() !== "jpeg") return;
+
+  const seq = nextWorkzoneLiveSeq(deviceId);
+  const existing = workzoneLiveState.pendingByDevice.get(deviceId);
+  if (existing) {
+    workzoneLiveState.framesDropped += 1;
+    const device = devices.get(deviceId);
+    if (device?.state?.workzone_live) {
+      device.state.workzone_live.frames_dropped = Number(device.state.workzone_live.frames_dropped || 0) + 1;
+    }
+  }
+  workzoneLiveState.pendingByDevice.set(deviceId, {
+    deviceId,
+    sessionDir: recording.session_dir,
+    seq,
+    frameIndex: seq,
+    jpegBuffer,
+    tDeviceMs: Number(tDeviceMs || 0),
+    tRecvMs: Number(tRecvMs || Date.now()),
+    queuedAtMs: Date.now()
+  });
+  const device = devices.get(deviceId);
+  if (device?.state?.workzone_live) {
+    device.state.workzone_live.enabled = !!workzoneLiveState.configured;
+    device.state.workzone_live.source = "live";
+    device.state.workzone_live.recording_active = true;
+    device.state.workzone_live.last_frame_at_ms = Number(tRecvMs || Date.now());
+    device.state.workzone_live.pending = true;
+    device.state.workzone_live.checking = false;
+    device.state.workzone_live.queue_age_ms = 0;
+    device.state.workzone_live.last_error = "";
+  }
+  dispatchNextWorkzoneLiveFrame();
+}
+
+function selectNextQueuedWorkzoneFrame() {
+  let next = null;
+  for (const pending of workzoneLiveState.pendingByDevice.values()) {
+    if (!next || pending.queuedAtMs < next.queuedAtMs) next = pending;
+  }
+  return next;
+}
+
+function dispatchNextWorkzoneLiveFrame() {
+  if (!isWorkzoneLiveActive() || !workzoneLiveState.ready || workzoneLiveState.busy) return;
+  if (!recording.active || !recording.session_dir) {
+    clearQueuedWorkzoneLiveFrames();
+    return;
+  }
+  const next = selectNextQueuedWorkzoneFrame();
+  if (!next) return;
+  workzoneLiveState.pendingByDevice.delete(next.deviceId);
+  const proc = workzoneLiveState.proc;
+  if (!proc?.stdin || proc.stdin.destroyed) {
+    workzoneLiveState.failed = true;
+    workzoneLiveState.lastError = "worker stdin is unavailable";
+    scheduleWorkzoneLiveRestart("dispatch_without_stdin");
+    return;
+  }
+  workzoneLiveState.busy = true;
+  workzoneLiveState.currentTask = {
+    deviceId: next.deviceId,
+    seq: next.seq,
+    sessionDir: next.sessionDir,
+    frameIndex: next.frameIndex,
+    startedAtMs: Date.now(),
+    tRecvMs: next.tRecvMs
+  };
+  workzoneLiveState.lastDispatchAtMs = workzoneLiveState.currentTask.startedAtMs;
+  const payload = {
+    type: "frame",
+    device_id: next.deviceId,
+    seq: next.seq,
+    frame_index: next.frameIndex,
+    session_dir: next.sessionDir,
+    t_device_ms: next.tDeviceMs,
+    t_recv_ms: next.tRecvMs,
+    jpeg_base64: next.jpegBuffer.toString("base64")
+  };
+  const device = devices.get(next.deviceId);
+  if (device?.state?.workzone_live) {
+    device.state.workzone_live.pending = false;
+    device.state.workzone_live.checking = true;
+    device.state.workzone_live.queue_age_ms = null;
+  }
+  if (!sendWorkzoneLiveMessage(payload)) {
+    workzoneLiveState.busy = false;
+    workzoneLiveState.currentTask = null;
+  }
+}
+
+function sanitizeWorkzoneTopDetections(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) => {
+      const label = String(entry?.label || "").trim();
+      const confidence = Number(entry?.confidence || 0);
+      if (!label || !Number.isFinite(confidence)) return null;
+      return {
+        label,
+        confidence: Number(confidence.toFixed(4))
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
+function createWorkzoneAlertDeviceState() {
+  return {
+    active: false,
+    lastAlertAtMs: 0,
+    lastAlertFrameIndex: 0,
+    lastPositiveAtMs: 0,
+    smoothedScore: 0,
+    stickyUntilMs: 0,
+    consecutivePositiveFrames: 0,
+    consecutiveNegativeFrames: 0,
+    history: []
+  };
+}
+
+function ensureWorkzoneAlertDeviceState(deviceId) {
+  const existing = workzoneAlertState.devices.get(deviceId);
+  if (existing) return existing;
+  const next = createWorkzoneAlertDeviceState();
+  workzoneAlertState.devices.set(deviceId, next);
+  return next;
+}
+
+function resolveWorkzoneDeviceStatus(publicState, now = Date.now()) {
+  if (!publicState?.enabled) return "disabled";
+  if (!publicState.recording_active) return "idle";
+  const workerState = String(publicState.worker_state || "");
+  if (["starting", "restarting", "offline", "stalled"].includes(workerState)) return workerState;
+  if (publicState.last_error) return "error";
+  if (publicState.banner_active && publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) <= WORKZONE_LIVE_RESULT_STALE_MS) return "detected";
+  if (publicState.tracking && publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) <= WORKZONE_LIVE_RESULT_STALE_MS) return "tracking";
+  if (publicState.checking) return "checking";
+  if (publicState.pending) return "queued";
+  if (publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) > WORKZONE_LIVE_RESULT_STALE_MS) return "stale";
+  return "waiting";
+}
+
+function resolveWorkzoneDeviceMessage(publicState, now = Date.now()) {
+  const status = resolveWorkzoneDeviceStatus(publicState, now);
+  if (status === "disabled") return "WorkZone live worker is disabled.";
+  if (status === "idle") return "Start recording to enable WorkZone live checks.";
+  if (status === "starting") return "Starting WorkZone live worker.";
+  if (status === "restarting") return "Restarting WorkZone live worker.";
+  if (status === "offline") return publicState.last_error || "WorkZone live worker is offline.";
+  if (status === "stalled") return publicState.last_error || "WorkZone live worker is stalled.";
+  if (status === "error") return publicState.last_error || "Latest WorkZone check failed.";
+  if (status === "detected") {
+    return publicState.class_summary
+      ? `Detected ${publicState.class_summary}.`
+      : "WorkZone detected.";
+  }
+  if (status === "tracking") {
+    return publicState.class_summary
+      ? `Tracking ${publicState.class_summary}.`
+      : "Tracking low-confidence WorkZone evidence.";
+  }
+  if (status === "checking") return "Checking newest camera frame.";
+  if (status === "queued") return "Newest camera frame queued for WorkZone.";
+  if (status === "stale") return "WorkZone results are stale.";
+  if (publicState?.source === "file") return "Waiting for WorkZone status updates.";
+  return "Waiting for live camera frames.";
+}
+
+function refreshWorkzoneLiveDeviceStates(now = Date.now()) {
+  const runtimeStatus = classifyWorkzoneLiveRuntimeStatus(now);
+  for (const [deviceId, device] of devices.entries()) {
+    const publicState = device.state.workzone_live || emptyWorkzoneLivePublicState();
+    const alertState = workzoneAlertState.devices.get(deviceId);
+    const pending = workzoneLiveState.pendingByDevice.get(deviceId) || null;
+    publicState.enabled = publicState.source === "file" ? true : !!workzoneLiveState.configured;
+    publicState.recording_active = !!(recording.active && recording.target_device_ids.includes(deviceId));
+    publicState.worker_state = publicState.source === "file" ? "file" : runtimeStatus;
+    publicState.pending = !!pending;
+    publicState.checking = !!(workzoneLiveState.busy && workzoneLiveState.currentTask?.deviceId === deviceId);
+    publicState.queue_age_ms = pending ? Math.max(0, now - pending.queuedAtMs) : null;
+    publicState.last_result_age_ms = publicState.last_checked_at_ms ? Math.max(0, now - publicState.last_checked_at_ms) : null;
+    publicState.last_frame_age_ms = publicState.last_frame_at_ms ? Math.max(0, now - publicState.last_frame_at_ms) : null;
+    if (alertState) {
+      publicState.active = !!alertState.active;
+      publicState.banner_active = !!alertState.active || (alertState.lastAlertAtMs && (now - alertState.lastAlertAtMs) <= WORKZONE_LIVE_ALERT_BANNER_MS);
+      publicState.last_alert_at_ms = alertState.lastAlertAtMs || publicState.last_alert_at_ms || null;
+      publicState.smoothed_score = Number((alertState.smoothedScore || publicState.smoothed_score || 0).toFixed(3));
+      publicState.consecutive_positive_frames = Number(alertState.consecutivePositiveFrames || 0);
+      publicState.consecutive_negative_frames = Number(alertState.consecutiveNegativeFrames || 0);
+    } else {
+      publicState.active = false;
+      publicState.banner_active = false;
+    }
+    publicState.status = resolveWorkzoneDeviceStatus(publicState, now);
+    publicState.message = resolveWorkzoneDeviceMessage(publicState, now);
+    device.state.workzone_live = publicState;
+  }
+}
+
+function tickWorkzoneLiveHealth() {
+  const now = Date.now();
+  workzoneLiveState.lastStatus = classifyWorkzoneLiveRuntimeStatus(now);
+  if (workzoneLiveState.proc && workzoneLiveState.ready && !workzoneLiveState.busy) {
+    if ((now - workzoneLiveState.lastPingSentAtMs) >= WORKZONE_LIVE_PING_INTERVAL_MS) {
+      if (sendWorkzoneLiveMessage({ type: "ping" })) {
+        workzoneLiveState.lastPingSentAtMs = now;
+      }
+    }
+  }
+  if (
+    workzoneLiveState.busy
+    && workzoneLiveState.currentTask?.startedAtMs
+    && (now - workzoneLiveState.currentTask.startedAtMs) > WORKZONE_LIVE_BUSY_TIMEOUT_MS
+  ) {
+    workzoneLiveState.lastError = `WorkZone worker stalled for more than ${WORKZONE_LIVE_BUSY_TIMEOUT_MS}ms`;
+    console.error("[workzone-live] worker timeout", {
+      device_id: workzoneLiveState.currentTask.deviceId,
+      frame_index: workzoneLiveState.currentTask.frameIndex,
+      busy_timeout_ms: WORKZONE_LIVE_BUSY_TIMEOUT_MS
+    });
+    try { workzoneLiveState.proc?.kill(); } catch {}
+  }
+  if (!workzoneLiveState.proc && workzoneLiveState.configured && workzoneLiveState.failed && !workzoneLiveState.restartTimer) {
+    scheduleWorkzoneLiveRestart("health_tick");
+  }
+}
+
+function updateWorkzoneDetectionState({
+  deviceId,
+  info,
+  payload,
+  source = "live",
+  statusPath = null,
+  rawResult = null
+}) {
+  const device = devices.get(deviceId);
+  if (!device) return;
+  const now = Date.now();
+  const score = Number(info?.score || 0);
+  const maxConfidence = Number(info?.max_confidence || 0);
+  const detectionCount = Math.max(0, Number(info?.detection_count || 0));
+  const frameIndex = Math.max(0, Number(info?.frame_index || 0));
+  const scoreThreshold = Number.isFinite(Number(payload?.score_threshold))
+    ? Number(payload.score_threshold)
+    : WORKZONE_LIVE_SCORE_THRESHOLD;
+  const updatedAtMs = Date.parse(String(info?.updated_at || payload?.updated_at || ""));
+  const checkedAtMs = Number.isFinite(updatedAtMs) ? updatedAtMs : now;
+  const topDetections = sanitizeWorkzoneTopDetections(rawResult?.top_detections);
+  const rawPositive = isWorkzoneDetectionActive(info, payload, now);
+  const alertState = ensureWorkzoneAlertDeviceState(deviceId);
+  const publicState = device.state.workzone_live || emptyWorkzoneLivePublicState();
+
+  if (!alertState.lastPositiveAtMs || (now - alertState.lastPositiveAtMs) > (WORKZONE_LIVE_EVIDENCE_WINDOW_MS * 2)) {
+    alertState.smoothedScore = score;
+  } else {
+    alertState.smoothedScore = (alertState.smoothedScore * 0.58) + (score * 0.42);
+  }
+  alertState.history.push({
+    ts: now,
+    positive: rawPositive,
+    score,
+    maxConfidence,
+    detectionCount
+  });
+  while (alertState.history.length && (now - alertState.history[0].ts) > WORKZONE_LIVE_EVIDENCE_WINDOW_MS) {
+    alertState.history.shift();
+  }
+
+  if (rawPositive) {
+    alertState.lastPositiveAtMs = now;
+    alertState.consecutivePositiveFrames += 1;
+    alertState.consecutiveNegativeFrames = 0;
+  } else {
+    alertState.consecutivePositiveFrames = 0;
+    alertState.consecutiveNegativeFrames += 1;
+  }
+
+  const positiveFramesRecent = alertState.history.filter((entry) => entry.positive).length;
+  const strongFramesRecent = alertState.history.filter((entry) => entry.positive && (
+    entry.score >= (scoreThreshold + 0.12)
+    || entry.maxConfidence >= 0.6
+  )).length;
+  const trackingFramesRecent = alertState.history.filter((entry) => (
+    entry.detectionCount > 0 || entry.score >= (scoreThreshold * 0.55)
+  )).length;
+  const wasActive = !!alertState.active;
+  const shouldActivate = (
+    rawPositive && (strongFramesRecent >= 1 || positiveFramesRecent >= 2 || alertState.consecutivePositiveFrames >= 2)
+  ) || (
+    !rawPositive
+    && positiveFramesRecent >= 2
+    && alertState.smoothedScore >= (scoreThreshold * 0.95)
+    && trackingFramesRecent >= 2
+  );
+  if (shouldActivate) {
+    alertState.active = true;
+    alertState.stickyUntilMs = now + WORKZONE_LIVE_ACTIVE_HOLD_MS;
+  } else if (alertState.active) {
+    const keepActive = (
+      now <= Number(alertState.stickyUntilMs || 0)
+      || (alertState.lastPositiveAtMs && (now - alertState.lastPositiveAtMs) <= WORKZONE_LIVE_ACTIVE_HOLD_MS)
+      || positiveFramesRecent >= 2
+    );
+    alertState.active = !!keepActive;
+  }
+
+  let alertSent = false;
+  if (
+    alertState.active
+    && !wasActive
+    && (now - alertState.lastAlertAtMs) >= WORKZONE_ALERT_COOLDOWN_MS
+  ) {
+    const targetCount = sendWorkzoneDetectedAlert({
+      deviceId,
+      info,
+      payload,
+      statusPath
+    });
+    if (targetCount > 0) {
+      alertState.lastAlertAtMs = now;
+      alertState.lastAlertFrameIndex = frameIndex;
+      alertSent = true;
+    }
+  }
+
+  publicState.enabled = true;
+  publicState.source = source;
+  publicState.recording_active = !!(recording.active && recording.target_device_ids.includes(deviceId));
+  publicState.pending = false;
+  publicState.checking = false;
+  publicState.worker_state = source === "file" ? "file" : classifyWorkzoneLiveRuntimeStatus(now);
+  publicState.found = rawPositive;
+  publicState.tracking = alertState.active || trackingFramesRecent > 0;
+  publicState.active = !!alertState.active;
+  publicState.banner_active = !!alertState.active || (alertState.lastAlertAtMs && (now - alertState.lastAlertAtMs) <= WORKZONE_LIVE_ALERT_BANNER_MS);
+  publicState.last_checked_at_ms = checkedAtMs;
+  publicState.last_result_age_ms = Math.max(0, now - checkedAtMs);
+  publicState.frame_index = frameIndex;
+  publicState.score = Number(score.toFixed(3));
+  publicState.smoothed_score = Number(alertState.smoothedScore.toFixed(3));
+  publicState.score_threshold = Number(scoreThreshold.toFixed(3));
+  publicState.max_confidence = Number(maxConfidence.toFixed(3));
+  publicState.detection_count = detectionCount;
+  publicState.class_counts = info?.class_counts && typeof info.class_counts === "object" ? info.class_counts : {};
+  publicState.class_summary = summarizeWorkzoneClasses(publicState.class_counts);
+  publicState.top_detections = topDetections;
+  publicState.inference_ms = Number(Number(rawResult?.inference_ms || 0).toFixed(2));
+  publicState.inference_avg_ms = Number(Number(workzoneLiveState.avgInferenceMs || publicState.inference_avg_ms || 0).toFixed(2));
+  publicState.pipeline_latency_ms = Number.isFinite(Number(rawResult?.t_recv_ms))
+    ? Math.max(0, now - Number(rawResult.t_recv_ms))
+    : publicState.pipeline_latency_ms;
+  publicState.positive_frames_recent = positiveFramesRecent;
+  publicState.strong_frames_recent = strongFramesRecent;
+  publicState.consecutive_positive_frames = Number(alertState.consecutivePositiveFrames || 0);
+  publicState.consecutive_negative_frames = Number(alertState.consecutiveNegativeFrames || 0);
+  publicState.frames_processed = Number(publicState.frames_processed || 0) + 1;
+  publicState.frames_dropped = Number(publicState.frames_dropped || 0);
+  publicState.last_alert_at_ms = alertState.lastAlertAtMs || publicState.last_alert_at_ms || null;
+  publicState.last_error = rawResult?.status && rawResult.status !== "ok"
+    ? String(rawResult?.error || rawResult.status || "workzone result error")
+    : "";
+  publicState.status = resolveWorkzoneDeviceStatus(publicState, now);
+  publicState.message = resolveWorkzoneDeviceMessage(publicState, now);
+
+  if (!alertSent && source === "live" && rawResult?.status && rawResult.status !== "ok") {
+    publicState.status = "error";
+    publicState.message = resolveWorkzoneDeviceMessage(publicState, now);
+  }
+
+  device.state.workzone_live = publicState;
+}
+
+function handleLiveWorkzoneResult(result) {
+  if (!recording.active || !recording.session_dir) return;
+  const sessionDir = String(result?.session_dir || "").trim();
+  if (sessionDir && sessionDir !== recording.session_dir) return;
+  const deviceId = sanitizeDeviceId(String(result?.device_id || "").trim());
+  if (!deviceId) return;
+  if (workzoneAlertState.sessionDir !== recording.session_dir) {
+    resetWorkzoneAlertState(recording.session_dir);
+  }
+
+  const info = {
+    found: !!result?.found,
+    score: Number(result?.score || 0),
+    max_confidence: Number(result?.max_confidence || 0),
+    detection_count: Math.max(0, Number(result?.detection_count || 0)),
+    class_counts: result?.class_counts && typeof result.class_counts === "object" ? result.class_counts : {},
+    top_detections: sanitizeWorkzoneTopDetections(result?.top_detections),
+    frame_index: Math.max(0, Number(result?.frame_index || result?.seq || 0)),
+    frame_filename: "",
+    updated_at: String(result?.updated_at || new Date().toISOString())
+  };
+  const payload = {
+    score_threshold: Number.isFinite(Number(result?.score_threshold))
+      ? Number(result.score_threshold)
+      : WORKZONE_LIVE_SCORE_THRESHOLD,
+    updated_at: info.updated_at,
+    output_root: null
+  };
+  updateWorkzoneDetectionState({
+    deviceId,
+    info,
+    payload,
+    source: "live",
+    statusPath: null,
+    rawResult: result
+  });
+}
+
 function resetWorkzoneAlertState(sessionDir = null) {
   workzoneAlertState.sessionDir = sessionDir || null;
   workzoneAlertState.devices.clear();
 }
 
 function pollWorkzoneAlerts() {
+  if (isWorkzoneLiveActive()) return;
   const sessionDir = recording.active ? recording.session_dir : null;
   if (!sessionDir) {
     if (workzoneAlertState.sessionDir) resetWorkzoneAlertState(null);
@@ -1830,37 +2691,17 @@ function pollWorkzoneAlerts() {
 
   const entries = payload.devices && typeof payload.devices === "object" ? Object.entries(payload.devices) : [];
   const seen = new Set();
-  const now = Date.now();
   for (const [deviceId, rawInfo] of entries) {
     seen.add(deviceId);
     const info = rawInfo && typeof rawInfo === "object" ? rawInfo : {};
-    const found = isWorkzoneDetectionActive(info, payload, now);
-    const frameIndex = Number(info.frame_index || 0);
-    const prev = workzoneAlertState.devices.get(deviceId) || {
-      active: false,
-      lastAlertAtMs: 0,
-      lastAlertFrameIndex: 0
-    };
-    let alertSent = false;
-    if (
-      found &&
-      (!prev.active || frameIndex > prev.lastAlertFrameIndex) &&
-      (now - prev.lastAlertAtMs) >= WORKZONE_ALERT_COOLDOWN_MS
-    ) {
-      const targetCount = sendWorkzoneDetectedAlert({
-        deviceId,
-        info,
-        payload,
-        statusPath
-      });
-      if (targetCount > 0) {
-        prev.lastAlertAtMs = now;
-        prev.lastAlertFrameIndex = frameIndex;
-        alertSent = true;
-      }
-    }
-    prev.active = found && (prev.active || alertSent);
-    workzoneAlertState.devices.set(deviceId, prev);
+    updateWorkzoneDetectionState({
+      deviceId,
+      info,
+      payload,
+      source: "file",
+      statusPath,
+      rawResult: null
+    });
   }
 
   for (const [deviceId] of workzoneAlertState.devices.entries()) {
@@ -1901,6 +2742,7 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
   const frameIndex = Math.max(0, Number(info.frame_index || 0));
   const classCounts = info.class_counts && typeof info.class_counts === "object" ? info.class_counts : {};
   const classSummary = summarizeWorkzoneClasses(classCounts);
+  const topDetections = sanitizeWorkzoneTopDetections(info.top_detections);
   const message = classSummary
     ? `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"} (${classSummary}).`
     : `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"}.`;
@@ -1915,9 +2757,12 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
       frame_index: frameIndex,
       frame_filename: typeof info.frame_filename === "string" ? info.frame_filename : "",
       score,
+      score_threshold: Number.isFinite(Number(payload?.score_threshold)) ? Number(payload.score_threshold) : WORKZONE_LIVE_SCORE_THRESHOLD,
       max_confidence: maxConfidence,
       detection_count: detectionCount,
       class_counts: classCounts,
+      class_summary: classSummary,
+      top_detections: topDetections,
       session_dir: recording.session_dir || null,
       status_path: statusPath,
       output_root: typeof payload?.output_root === "string" ? payload.output_root : null,
@@ -2004,7 +2849,8 @@ function buildRuntimeInfo() {
     public_started_at_ms: null,
     public_uptime_sec: null,
     public_url: null,
-    public_mode: null
+    public_mode: null,
+    workzone_live: buildWorkzoneLiveRuntimeInfo()
   };
   const publicStart = Number(publicRuntimeInfo?.started_at_ms || 0);
   if (publicStart > 0) {

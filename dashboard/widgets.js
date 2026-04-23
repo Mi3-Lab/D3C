@@ -28,6 +28,108 @@ function resolveDeviceReadiness(summary, rec) {
   return { label: "armed", className: "armed", phase: "idle" };
 }
 
+function formatRelativeAgeMs(value, empty = "-") {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return empty;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const sec = ms / 1000;
+  if (sec < 10) return `${sec.toFixed(1)} s`;
+  if (sec < 60) return `${Math.round(sec)} s`;
+  const min = sec / 60;
+  if (min < 10) return `${min.toFixed(1)} m`;
+  return `${Math.round(min)} m`;
+}
+
+function humanizeWorkzoneStatus(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "detected": return "Detected";
+    case "tracking": return "Tracking";
+    case "checking": return "Checking";
+    case "queued": return "Queued";
+    case "waiting": return "Waiting";
+    case "stale": return "Stale";
+    case "starting": return "Starting";
+    case "restarting": return "Restarting";
+    case "offline": return "Offline";
+    case "stalled": return "Stalled";
+    case "error": return "Error";
+    case "idle": return "Idle";
+    case "disabled": return "Disabled";
+    case "ready": return "Ready";
+    case "file": return "File";
+    default: return "Unknown";
+  }
+}
+
+function workzoneToneClass(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "detected": return "detected";
+    case "tracking": return "tracking";
+    case "checking":
+    case "queued":
+    case "waiting":
+    case "starting":
+    case "restarting":
+    case "ready":
+    case "file":
+      return "watching";
+    case "stale":
+    case "offline":
+    case "stalled":
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+function formatWorkzoneScore(workzone) {
+  const score = Number(workzone?.score);
+  const threshold = Number(workzone?.score_threshold);
+  if (!Number.isFinite(score)) return "-";
+  if (!Number.isFinite(threshold) || threshold <= 0) return score.toFixed(2);
+  return `${score.toFixed(2)} / ${threshold.toFixed(2)}`;
+}
+
+function formatWorkzoneSmoothedScore(workzone) {
+  const smooth = Number(workzone?.smoothed_score);
+  if (!Number.isFinite(smooth)) return "-";
+  return smooth.toFixed(2);
+}
+
+function formatWorkzoneClassSummary(workzone) {
+  const summary = String(workzone?.class_summary || "").trim();
+  if (summary) return summary;
+  const top = Array.isArray(workzone?.top_detections) ? workzone.top_detections : [];
+  if (!top.length) return "";
+  return top
+    .slice(0, 3)
+    .map((item) => `${String(item?.label || "").trim()} ${Number(item?.confidence || 0).toFixed(2)}`)
+    .filter(Boolean)
+    .join(" • ");
+}
+
+function formatWorkzoneDetailLine(workzone) {
+  const parts = [];
+  const maxConfidence = Number(workzone?.max_confidence);
+  if (Number.isFinite(maxConfidence) && maxConfidence > 0) parts.push(`conf ${maxConfidence.toFixed(2)}`);
+  const detectionCount = Number(workzone?.detection_count);
+  if (Number.isFinite(detectionCount) && detectionCount > 0) parts.push(`${detectionCount} det`);
+  const inferenceMs = Number(workzone?.inference_ms);
+  if (Number.isFinite(inferenceMs) && inferenceMs > 0) parts.push(`${Math.round(inferenceMs)} ms`);
+  const ageLabel = formatRelativeAgeMs(workzone?.last_result_age_ms, "");
+  if (ageLabel) parts.push(ageLabel);
+  return parts.join(" • ");
+}
+
+function formatWorkzoneWorkerSummary(runtime) {
+  if (!runtime || typeof runtime !== "object") return "Unavailable";
+  const status = humanizeWorkzoneStatus(runtime.status || (runtime.configured ? "idle" : "disabled"));
+  const ageLabel = formatRelativeAgeMs(runtime.last_result_age_ms, "");
+  if (ageLabel && runtime.status !== "disabled") return `${status} • ${ageLabel}`;
+  return status;
+}
+
 const GPS_LIVE_TILE_SIZE = 256;
 const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
 const GPS_LIVE_STALE_MS = 15000;
@@ -48,7 +150,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const box = document.createElement("div");
         box.className = "kv-grid";
         content.appendChild(box);
-        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, rec: s.recording }), () => render(box, ctx));
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, rec: s.recording, runtime: s.runtime }), () => render(box, ctx));
         render(box, ctx);
         return () => unsub();
       }
@@ -127,6 +229,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const secondaryId = escapeHtml(String(d.device_id));
             const now = Date.now();
             const deviceState = st.statesByDevice?.[d.device_id] || {};
+            const workzone = deviceState.workzone_live || {};
             const gpsLatest = deviceState.gps_latest || null;
             const gpsStream = deviceState.stream_status?.gps || null;
             const gpsEnabled = !!gpsStream?.enabled;
@@ -164,8 +267,16 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
               : "No active alerts";
             const pendingKick = pendingKicks.has(d.device_id);
+            const workzoneVisible = workzone?.status && workzone.status !== "disabled";
+            const workzoneTone = workzoneToneClass(workzone?.status);
+            const workzoneTitle = humanizeWorkzoneStatus(workzone?.status);
+            const workzoneSummary = formatWorkzoneClassSummary(workzone) || String(workzone?.message || "").trim() || "No WorkZone evidence yet.";
+            const workzoneDetail = formatWorkzoneDetailLine(workzone);
+            const workzoneScore = formatWorkzoneScore(workzone);
             const card = document.createElement("article");
             card.className = `device-roster-card tone-${tone}`;
+            if (workzone?.banner_active) card.classList.add("workzone-hot");
+            else if (String(workzone?.status || "").toLowerCase() === "tracking") card.classList.add("workzone-tracking");
             card.innerHTML = `
               <div class="device-roster-head">
                 <div class="device-roster-title">
@@ -207,6 +318,20 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
                 </div>
               </div>
             `;
+            if (workzoneVisible) {
+              const banner = document.createElement("div");
+              banner.className = `device-workzone-banner is-${workzoneTone}`;
+              banner.innerHTML = `
+                <div class="device-workzone-head">
+                  <span class="device-workzone-chip is-${workzoneTone}">WorkZone ${escapeHtml(workzoneTitle)}</span>
+                  <span class="device-workzone-score">${escapeHtml(workzoneScore)}</span>
+                </div>
+                <div class="device-workzone-copy">${escapeHtml(workzoneSummary)}</div>
+                <div class="device-workzone-meta">${escapeHtml(workzoneDetail || String(workzone?.message || "").trim() || "Waiting for WorkZone data.")}</div>
+              `;
+              const grid = card.querySelector(".device-roster-grid");
+              card.insertBefore(banner, grid);
+            }
             if (connected) {
               const actions = document.createElement("div");
               actions.className = "device-roster-actions";
@@ -759,6 +884,22 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         stage.append(mapPanel.panel, cameraPanel.panel);
         content.append(tabs, stage);
 
+        const WORKZONE_HUD_STORAGE_KEY = "d3c_dashboard_workzone_hud_mode";
+        const allowedHudModes = new Set(["off", "compact", "full"]);
+        let workzoneHudMode = localStorage.getItem(WORKZONE_HUD_STORAGE_KEY) || "compact";
+        if (!allowedHudModes.has(workzoneHudMode)) workzoneHudMode = "compact";
+
+        const workzoneToolbar = document.createElement("div");
+        workzoneToolbar.className = "workzone-toolbar";
+        const workzoneHealth = document.createElement("div");
+        workzoneHealth.className = "workzone-health-pill";
+        const workzoneHudButtons = document.createElement("div");
+        workzoneHudButtons.className = "workzone-toolbar-actions";
+        const hudModeButtons = new Map();
+        const workzoneBanner = document.createElement("div");
+        workzoneBanner.className = "workzone-dashboard-banner";
+        workzoneBanner.hidden = true;
+
         let activeMode = "cameras";
         const tabButtons = new Map();
         const mapView = mountGpsLivePanel(mapPanel.body, {
@@ -788,13 +929,33 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           tabs.appendChild(button);
         }
 
+        const setWorkzoneHudMode = (nextMode) => {
+          workzoneHudMode = allowedHudModes.has(nextMode) ? nextMode : "compact";
+          localStorage.setItem(WORKZONE_HUD_STORAGE_KEY, workzoneHudMode);
+          for (const [mode, button] of hudModeButtons.entries()) {
+            button.classList.toggle("is-active", mode === workzoneHudMode);
+          }
+          renderCards();
+        };
+
+        for (const [mode, label] of [["compact", "WorkZone HUD"], ["full", "Verbose"], ["off", "Hidden"]]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "workzone-toolbar-btn";
+          button.textContent = label;
+          button.addEventListener("click", () => setWorkzoneHudMode(mode));
+          hudModeButtons.set(mode, button);
+          workzoneHudButtons.appendChild(button);
+        }
+
         const grid = document.createElement("div");
         grid.className = "camview-grid";
         const cards = new Map();
         const empty = document.createElement("div");
         empty.className = "camview-empty";
         empty.textContent = "No devices connected";
-        cameraPanel.body.appendChild(grid);
+        workzoneToolbar.append(workzoneHealth, workzoneHudButtons);
+        cameraPanel.body.append(workzoneToolbar, workzoneBanner, grid);
         grid.appendChild(empty);
 
         function destroyCard(deviceId) {
@@ -841,7 +1002,10 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           placeholder.className = "camview-placeholder";
           placeholder.innerHTML = `<div class="camera-icon" aria-hidden="true"></div><p>No feed</p>`;
           const placeholderText = placeholder.querySelector("p");
-          frame.append(video, img, placeholder);
+          const workzoneHud = document.createElement("div");
+          workzoneHud.className = "camview-workzone is-idle";
+          workzoneHud.hidden = true;
+          frame.append(video, img, placeholder, workzoneHud);
 
           root.append(header, frame);
           grid.appendChild(root);
@@ -855,6 +1019,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             img,
             placeholder,
             placeholderText,
+            workzoneHud,
             lastCamTs: 0,
             detachPreview: previewRtc?.registerSink(deviceId, video) || null
           };
@@ -885,12 +1050,18 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           if (mapPanel.metaEl) mapPanel.metaEl.textContent = selectedDeviceId ? "Focused GPS" : "Live GPS";
           const activeIds = new Set();
           const now = Date.now();
+          const runtimeWorkzone = st.runtime?.workzone_live || {};
+          const runtimeTone = workzoneToneClass(runtimeWorkzone?.status);
+          workzoneHealth.className = `workzone-health-pill is-${runtimeTone}`;
+          workzoneHealth.textContent = `WorkZone ${formatWorkzoneWorkerSummary(runtimeWorkzone)}`;
+          const activeWorkzones = [];
 
           for (const summary of visibleDevices) {
             const deviceId = summary.device_id;
             activeIds.add(deviceId);
             const card = ensureCard(deviceId);
             const state = st.statesByDevice?.[deviceId] || {};
+            const workzone = state.workzone_live || {};
             const camTs = Number(state?.camera_latest_ts || 0);
             const fresh = camTs > 0 && (now - camTs) < 4000;
             const fpsVal = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
@@ -932,6 +1103,9 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               placeholderText = "Waiting for camera";
             }
             const displayName = String(summary.deviceName || deviceId);
+            if (workzone?.banner_active) {
+              activeWorkzones.push({ deviceId, displayName, workzone });
+            }
 
             card.title.textContent = displayName;
             card.badge.className = `camview-badge ${statusClass}`;
@@ -948,6 +1122,64 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             card.video.style.display = showVideo ? "" : "none";
             card.img.style.display = showImage ? "" : "none";
             card.placeholder.style.display = showVideo || showImage ? "none" : "flex";
+            card.root.classList.toggle("workzone-hot", !!workzone?.banner_active);
+            card.root.classList.toggle("workzone-tracking", !workzone?.banner_active && String(workzone?.status || "").toLowerCase() === "tracking");
+            if (workzoneHudMode === "off" || !workzone || workzone.status === "disabled") {
+              card.workzoneHud.hidden = true;
+            } else {
+              const tone = workzoneToneClass(workzone.status);
+              const detail = formatWorkzoneDetailLine(workzone) || String(workzone?.message || "").trim() || "Waiting for WorkZone data.";
+              const summaryLine = formatWorkzoneClassSummary(workzone) || String(workzone?.message || "").trim() || "No WorkZone evidence yet.";
+              card.workzoneHud.hidden = false;
+              card.workzoneHud.className = `camview-workzone is-${tone} is-${workzoneHudMode}`;
+              if (workzoneHudMode === "full") {
+                card.workzoneHud.innerHTML = `
+                  <div class="camview-workzone-head">
+                    <span class="camview-workzone-chip is-${tone}">${escapeHtml(humanizeWorkzoneStatus(workzone.status))}</span>
+                    <span class="camview-workzone-score">${escapeHtml(formatWorkzoneScore(workzone))}</span>
+                  </div>
+                  <div class="camview-workzone-copy">${escapeHtml(summaryLine)}</div>
+                  <div class="camview-workzone-meta">${escapeHtml(detail)}</div>
+                  <div class="camview-workzone-meta">${escapeHtml(`smooth ${formatWorkzoneSmoothedScore(workzone)} • ${String(workzone?.message || "").trim() || "Watching live frames."}`)}</div>
+                `;
+              } else {
+                card.workzoneHud.innerHTML = `
+                  <div class="camview-workzone-head">
+                    <span class="camview-workzone-chip is-${tone}">${escapeHtml(humanizeWorkzoneStatus(workzone.status))}</span>
+                    <span class="camview-workzone-score">${escapeHtml(formatWorkzoneScore(workzone))}</span>
+                  </div>
+                  <div class="camview-workzone-copy">${escapeHtml(summaryLine)}</div>
+                `;
+              }
+            }
+          }
+
+          if (activeWorkzones.length) {
+            workzoneBanner.hidden = false;
+            workzoneBanner.className = "workzone-dashboard-banner is-detected";
+            workzoneBanner.innerHTML = activeWorkzones
+              .map(({ displayName, workzone }) => `
+                <div class="workzone-dashboard-banner-item">
+                  <span class="workzone-dashboard-banner-label">WorkZone detected</span>
+                  <strong>${escapeHtml(displayName)}</strong>
+                  <span>${escapeHtml(formatWorkzoneScore(workzone))}</span>
+                  <span>${escapeHtml(formatWorkzoneClassSummary(workzone) || String(workzone?.message || "").trim() || "active detection")}</span>
+                </div>
+              `)
+              .join("");
+          } else if (["starting", "restarting", "offline", "stalled", "error"].includes(String(runtimeWorkzone?.status || "").toLowerCase())) {
+            workzoneBanner.hidden = false;
+            workzoneBanner.className = `workzone-dashboard-banner is-${runtimeTone}`;
+            workzoneBanner.innerHTML = `
+              <div class="workzone-dashboard-banner-item">
+                <span class="workzone-dashboard-banner-label">WorkZone worker</span>
+                <strong>${escapeHtml(humanizeWorkzoneStatus(runtimeWorkzone?.status))}</strong>
+                <span>${escapeHtml(String(runtimeWorkzone?.last_error || "Waiting for the worker to become ready."))}</span>
+              </div>
+            `;
+          } else {
+            workzoneBanner.hidden = true;
+            workzoneBanner.innerHTML = "";
           }
 
           for (const deviceId of [...cards.keys()]) {
@@ -959,10 +1191,11 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           empty.style.display = activeIds.size ? "none" : "";
         }
 
-        const unsubStore = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice, recordByDevice: s.recordByDevice }), renderCards);
+        const unsubStore = store.subscribe((s) => ({ deviceList: s.deviceList, statesByDevice: s.statesByDevice, recordByDevice: s.recordByDevice, runtime: s.runtime }), renderCards);
         const unsubPreview = bus.on("preview_rtc_update", ({ deviceId } = {}) => {
           if (!deviceId || cards.has(deviceId)) renderCards();
         });
+        setWorkzoneHudMode(workzoneHudMode);
         setMode("cameras");
         renderCards();
 
@@ -1163,6 +1396,8 @@ function render(box, ctx) {
   const st = ctx.store.getState();
   const deviceId = getWidgetDevice(ctx.instance.settings);
   const d = st.statesByDevice[deviceId] || {};
+  const workzone = d.workzone_live || null;
+  const runtimeWorkzone = st.runtime?.workzone_live || null;
   const rtt = d.net?.rtt_ms == null ? "-" : `${Number(d.net.rtt_ms).toFixed(0)} ms`;
   box.innerHTML = "";
   kv(box, "WS", st.wsConnected ? "connected" : "disconnected");
@@ -1172,6 +1407,14 @@ function render(box, ctx) {
   kv(box, "Camera FPS", Number(d.net?.camera_fps || 0).toFixed(1));
   kv(box, "Dropped", String(d.net?.dropped_packets || 0));
   kv(box, "RTT", rtt);
+  kv(box, "WorkZone", formatWorkzoneWorkerSummary(runtimeWorkzone));
+  kv(box, "WZ Queue", runtimeWorkzone ? String(runtimeWorkzone.pending_frames || 0) : "-");
+  kv(box, "WZ Infer", Number.isFinite(Number(runtimeWorkzone?.last_inference_ms)) ? `${Math.round(Number(runtimeWorkzone.last_inference_ms))} ms` : "-");
+  if (workzone && workzone.status !== "disabled") {
+    kv(box, "WZ State", humanizeWorkzoneStatus(workzone.status));
+    kv(box, "WZ Score", formatWorkzoneScore(workzone));
+    kv(box, "WZ Smooth", formatWorkzoneSmoothedScore(workzone));
+  }
 }
 
 function drawImu(canvas, points) {

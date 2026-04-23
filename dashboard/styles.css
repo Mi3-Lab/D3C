@@ -3478,6 +3478,14 @@ body {
   border-color: rgba(213, 91, 91, 0.2);
 }
 
+.device-roster-card.workzone-hot {
+  box-shadow: 0 0 0 1px rgba(224, 162, 74, 0.24), 0 18px 44px rgba(224, 162, 74, 0.10);
+}
+
+.device-roster-card.workzone-tracking {
+  box-shadow: 0 0 0 1px rgba(77, 171, 247, 0.18), 0 14px 32px rgba(77, 171, 247, 0.08);
+}
+
 .device-roster-head {
   display: flex;
   align-items: flex-start;
@@ -3503,6 +3511,96 @@ body {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.device-workzone-banner {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.device-workzone-banner.is-detected {
+  border-color: rgba(224, 162, 74, 0.32);
+  background: linear-gradient(135deg, rgba(224, 162, 74, 0.12), rgba(213, 91, 91, 0.06));
+}
+
+.device-workzone-banner.is-tracking,
+.device-workzone-banner.is-watching {
+  border-color: rgba(77, 171, 247, 0.22);
+  background: linear-gradient(135deg, rgba(77, 171, 247, 0.10), rgba(63, 110, 232, 0.05));
+}
+
+.device-workzone-banner.is-error {
+  border-color: rgba(213, 91, 91, 0.24);
+  background: linear-gradient(135deg, rgba(213, 91, 91, 0.12), rgba(120, 38, 54, 0.05));
+}
+
+.device-workzone-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.device-workzone-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.device-workzone-chip.is-detected {
+  color: #ffdb9d;
+  border-color: rgba(224, 162, 74, 0.32);
+  background: rgba(224, 162, 74, 0.12);
+}
+
+.device-workzone-chip.is-tracking,
+.device-workzone-chip.is-watching {
+  color: #b5d6ff;
+  border-color: rgba(77, 171, 247, 0.28);
+  background: rgba(77, 171, 247, 0.10);
+}
+
+.device-workzone-chip.is-error {
+  color: #ffc1c1;
+  border-color: rgba(213, 91, 91, 0.28);
+  background: rgba(213, 91, 91, 0.10);
+}
+
+.device-workzone-chip.is-idle {
+  color: var(--muted);
+  border-color: rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.device-workzone-score {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.device-workzone-copy {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+
+.device-workzone-meta {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
 }
 
 .device-roster-metric {
@@ -3570,6 +3668,225 @@ body {
   min-height: 220px;
 }
 
+.workzone-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.workzone-health-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.workzone-health-pill.is-detected {
+  border-color: rgba(224, 162, 74, 0.30);
+  background: rgba(224, 162, 74, 0.12);
+  color: #ffdb9d;
+}
+
+.workzone-health-pill.is-tracking,
+.workzone-health-pill.is-watching {
+  border-color: rgba(77, 171, 247, 0.26);
+  background: rgba(77, 171, 247, 0.10);
+  color: #b5d6ff;
+}
+
+.workzone-health-pill.is-error {
+  border-color: rgba(213, 91, 91, 0.28);
+  background: rgba(213, 91, 91, 0.12);
+  color: #ffc1c1;
+}
+
+.workzone-health-pill.is-idle {
+  color: var(--muted);
+}
+
+.workzone-toolbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workzone-toolbar-btn {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.workzone-toolbar-btn:hover,
+.workzone-toolbar-btn.is-active {
+  color: var(--ink);
+  border-color: rgba(77, 171, 247, 0.32);
+  background: rgba(77, 171, 247, 0.10);
+}
+
+.workzone-dashboard-banner {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.workzone-dashboard-banner.is-detected {
+  border-color: rgba(224, 162, 74, 0.32);
+  background: linear-gradient(135deg, rgba(224, 162, 74, 0.14), rgba(213, 91, 91, 0.06));
+}
+
+.workzone-dashboard-banner.is-tracking,
+.workzone-dashboard-banner.is-watching {
+  border-color: rgba(77, 171, 247, 0.24);
+  background: linear-gradient(135deg, rgba(77, 171, 247, 0.10), rgba(63, 110, 232, 0.05));
+}
+
+.workzone-dashboard-banner.is-error {
+  border-color: rgba(213, 91, 91, 0.28);
+  background: linear-gradient(135deg, rgba(213, 91, 91, 0.12), rgba(120, 38, 54, 0.05));
+}
+
+.workzone-dashboard-banner-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.workzone-dashboard-banner-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.camview-card.workzone-hot {
+  box-shadow: 0 0 0 1px rgba(224, 162, 74, 0.24), 0 12px 32px rgba(224, 162, 74, 0.10);
+}
+
+.camview-card.workzone-tracking {
+  box-shadow: 0 0 0 1px rgba(77, 171, 247, 0.18), 0 10px 24px rgba(77, 171, 247, 0.08);
+}
+
+.camview-workzone {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  z-index: 2;
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(3, 6, 15, 0.82);
+  backdrop-filter: blur(10px);
+  color: var(--ink);
+}
+
+.camview-workzone.is-detected {
+  border-color: rgba(224, 162, 74, 0.34);
+  background: rgba(42, 28, 12, 0.82);
+}
+
+.camview-workzone.is-tracking,
+.camview-workzone.is-watching {
+  border-color: rgba(77, 171, 247, 0.30);
+  background: rgba(8, 19, 40, 0.84);
+}
+
+.camview-workzone.is-error {
+  border-color: rgba(213, 91, 91, 0.30);
+  background: rgba(42, 12, 18, 0.82);
+}
+
+.camview-workzone-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.camview-workzone-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.camview-workzone-chip.is-detected {
+  color: #ffdb9d;
+  border-color: rgba(224, 162, 74, 0.34);
+  background: rgba(224, 162, 74, 0.14);
+}
+
+.camview-workzone-chip.is-tracking,
+.camview-workzone-chip.is-watching {
+  color: #b5d6ff;
+  border-color: rgba(77, 171, 247, 0.30);
+  background: rgba(77, 171, 247, 0.12);
+}
+
+.camview-workzone-chip.is-error {
+  color: #ffc1c1;
+  border-color: rgba(213, 91, 91, 0.30);
+  background: rgba(213, 91, 91, 0.12);
+}
+
+.camview-workzone-score {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.camview-workzone-copy,
+.camview-workzone-meta {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.camview-workzone-meta {
+  color: rgba(215, 223, 239, 0.74);
+}
+
 .phone-stack {
   gap: 18px;
   max-width: 760px;
@@ -3603,6 +3920,102 @@ body {
   border-radius: 16px;
   background: rgba(36, 194, 122, 0.08);
   border: 1px solid rgba(36, 194, 122, 0.2);
+}
+
+.phone-workzone-card {
+  display: grid;
+  gap: 12px;
+  border-color: rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.phone-workzone-card.is-detected {
+  border-color: rgba(224, 162, 74, 0.30);
+  background: linear-gradient(135deg, rgba(224, 162, 74, 0.16), rgba(213, 91, 91, 0.06));
+}
+
+.phone-workzone-card.is-self {
+  border-color: rgba(77, 171, 247, 0.28);
+  background: linear-gradient(135deg, rgba(77, 171, 247, 0.14), rgba(63, 110, 232, 0.05));
+}
+
+.phone-workzone-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.phone-workzone-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.phone-workzone-badge.detected {
+  color: #ffdb9d;
+  border-color: rgba(224, 162, 74, 0.30);
+  background: rgba(224, 162, 74, 0.14);
+}
+
+.phone-workzone-badge.self {
+  color: #b5d6ff;
+  border-color: rgba(77, 171, 247, 0.28);
+  background: rgba(77, 171, 247, 0.12);
+}
+
+.phone-workzone-badge.idle {
+  color: var(--muted);
+}
+
+.phone-workzone-message {
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.55;
+}
+
+.phone-workzone-meta {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.phone-workzone-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.phone-workzone-metric {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.phone-workzone-metric span {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.phone-workzone-metric strong {
+  font-size: 14px;
+  color: var(--ink);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
 }
 
 .phone-primary-btn {
@@ -3642,6 +4055,14 @@ body {
 
 .phone-status-card .checklist strong {
   white-space: normal;
+}
+
+.phone-workzone-head {
+  flex-direction: column;
+}
+
+.phone-workzone-metrics {
+  grid-template-columns: 1fr;
 }
 
 .primary-action-hint {
