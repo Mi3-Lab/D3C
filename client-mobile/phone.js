@@ -87,6 +87,7 @@
   let cameraFacingMode = "environment";
   let reconnectState = "stable";
   let sessionRecordingActive = false;
+  let hasSeenRecordingState = false;
   let joinCodeTouched = false;
   let lastImuEventMs = 0;
   let lastCameraFrameMs = 0;
@@ -327,6 +328,8 @@
         if (msg.type === "auth_required") {
           started = false;
           authState = null;
+          sessionRecordingActive = false;
+          hasSeenRecordingState = false;
           resetWorkzoneAnnouncementTracking({ clearRecent: true });
           updateJoinFieldLock();
           renderStatus();
@@ -343,7 +346,10 @@
         }
         if (msg.type === "recording_state") {
           const wasRecording = sessionRecordingActive;
-          sessionRecordingActive = !!msg.active;
+          const nextRecording = !!msg.active;
+          const shouldPlayRecordingCue = hasSeenRecordingState && nextRecording !== wasRecording;
+          sessionRecordingActive = nextRecording;
+          hasSeenRecordingState = true;
           if (sessionRecordingActive && !wasRecording) {
             cameraVideoRecorderFallback = false;
           }
@@ -354,6 +360,7 @@
           updateCameraTransport();
           void ensureAudioRunning();
           renderStatus();
+          if (shouldPlayRecordingCue) void playRecordingStateCue({ active: sessionRecordingActive });
           return;
         }
         if (msg.type === "force_disconnect") {
@@ -1353,15 +1360,10 @@
 
   async function playWorkzoneAnnouncement({ interactive = false, announcementText = "Workzone detected" } = {}) {
     syncPhoneAudioSession({ preferAlertPlayback: true });
-    const toned = await playWorkzoneTone({ allowThrottle: false, interactive });
-    if (toned) {
-      setTimeout(() => {
-        void speakWorkzoneDetectedVoice(announcementText);
-      }, 120);
-      return { played: true, mode: "tone" };
-    }
     const spoken = await speakWorkzoneDetectedVoice(announcementText);
-    return { played: spoken, mode: spoken ? "speech" : "none" };
+    if (spoken) return { played: true, mode: "speech" };
+    const toned = await playWorkzoneTone({ allowThrottle: false, interactive });
+    return { played: toned, mode: toned ? "tone" : "none" };
   }
 
   async function replayPendingAlertIfPossible() {
@@ -1441,6 +1443,19 @@
       };
     }
     return true;
+  }
+
+  async function playRecordingStateCue({ active = false } = {}) {
+    const played = await playAlertTone({ allowThrottle: false });
+    if (played) {
+      setAlertFeedback(active ? "Recording started." : "Recording stopped.", active ? "success" : "muted", 2200);
+      return;
+    }
+    setAlertFeedback(
+      active ? "Recording started. Sound may be blocked on this phone." : "Recording stopped. Sound may be blocked on this phone.",
+      "warning",
+      4200
+    );
   }
 
   async function triggerFleetAlert({ kind = "", title = "", message = "", feedbackText = "Sending alert..." } = {}) {
@@ -2045,7 +2060,7 @@
     const hint = document.createElement("div");
     hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
     hint.textContent = alertFeedbackText || (connected
-      ? "Alert plays a tone. Workzone Alert announces the source phone on every connected phone."
+      ? "Alert plays a tone. Workzone Alert speaks the source phone name on every connected phone, with a tone only as fallback."
       : "Reconnect to send alerts.");
     actions.append(alertBtn, workzoneBtn, hint);
     primaryActionArea.appendChild(actions);
@@ -2310,6 +2325,7 @@
     started = false;
     authState = null;
     sessionRecordingActive = false;
+    hasSeenRecordingState = false;
     runConfig = mergeRunConfig({ device_id: runConfig.device_id });
     closeAllPreviewPeers("removed_by_dashboard");
     lastPreviewStatusSent = "";

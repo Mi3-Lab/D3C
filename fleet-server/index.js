@@ -524,24 +524,11 @@ wss.on("connection", (ws, req) => {
     console.log("[ws] socket closed", { role: ws.role, device_id: ws.device_id, sockets_connected: connectionStats.sockets_connected, sockets_closed: connectionStats.sockets_closed, phones_connected: connectionStats.phones_connected, phones_disconnected: connectionStats.phones_disconnected });
     pendingBinaryHeadersBySocket.delete(ws);
     if (ws.role === "phone") {
-      const d = devices.get(ws.device_id);
-      if (d && d.ws === ws) {
-        const targeted = recording.active && recording.target_device_ids.includes(ws.device_id);
-        d.connected = false;
-        d.ws = null;
-        d.lastSeenTs = Date.now();
-        d.state.camera_preview = { live: false, peer_count: 0, updated_at_ms: Date.now() };
-        d.recordingStatus.recording = false;
-        d.recordingStatus.phase = targeted ? "starting" : "idle";
-        d.recordingStatus.acknowledged_at_utc_ms = targeted ? null : d.recordingStatus.acknowledged_at_utc_ms;
-        d.recordingStatus.modalities = emptyRecordingModalities();
-      }
-      if (focusedDeviceId === ws.device_id) {
-        focusedDeviceId = firstConnectedDeviceId() || null;
-      }
-      broadcastDeviceList();
-      broadcastRecordStatuses();
-      queueFleetOverviewBroadcast({ immediate: true });
+      removeDeviceFromSession(ws.device_id, {
+        expectedWs: ws,
+        notify: false,
+        removalReason: "offline_auto_kick"
+      });
     }
     if (ws.role === "dashboard" && ws.client_id) {
       relayPreviewDisconnectToPhones(ws.client_id, "dashboard_disconnected");
@@ -3427,35 +3414,62 @@ function validatePhoneAuthGrant(token) {
   return grant;
 }
 
-function kickDeviceFromDashboard(deviceId) {
+function removeDeviceFromSession(deviceId, {
+  expectedWs = null,
+  notify = false,
+  removalReason = "removed_by_dashboard",
+  disconnectReason = "removed_by_dashboard",
+  disconnectMessage = "Dashboard removed this phone from the session. Tap Start Device to join again."
+} = {}) {
   const targetId = sanitizeDeviceId(deviceId);
   if (!targetId) return false;
   const entry = devices.get(targetId);
   if (!entry) return false;
+  if (expectedWs && entry.ws !== expectedWs) return false;
 
   revokePhoneAuthTokensForDevice(targetId);
+  const targetWasFocused = focusedDeviceId === targetId;
+  const targetWasRecording = (recording.target_device_ids || []).includes(targetId);
   const targetWs = entry.ws;
   recording.target_device_ids = (recording.target_device_ids || []).filter((id) => id !== targetId);
-  if (targetWs && isSocketOpen(targetWs)) {
+  workzoneLiveState.pendingByDevice.delete(targetId);
+  workzoneLiveState.nextSeqByDevice.delete(targetId);
+  workzoneAlertState.devices.delete(targetId);
+  if (notify && targetWs && isSocketOpen(targetWs)) {
     sendWs(targetWs, {
       type: "force_disconnect",
-      reason: "removed_by_dashboard",
-      message: "Dashboard removed this phone from the session. Tap Start Device to join again."
+      reason: disconnectReason,
+      message: disconnectMessage
     }, { critical: true });
     setTimeout(() => {
-      try { targetWs.close(4002, "removed_by_dashboard"); } catch {}
+      try { targetWs.close(4002, disconnectReason); } catch {}
     }, 80);
   }
 
   devices.delete(targetId);
-  if (focusedDeviceId === targetId) {
+  if (targetWasFocused) {
     focusedDeviceId = firstConnectedDeviceId() || null;
   }
+  console.log("[device] removed", {
+    device_id: targetId,
+    reason: removalReason,
+    connected: !!entry.connected,
+    recording_targeted: targetWasRecording
+  });
   broadcastDeviceList();
   queueFleetOverviewBroadcast({ immediate: true });
   broadcastState();
   broadcastRecordStatuses();
   return true;
+}
+
+function kickDeviceFromDashboard(deviceId) {
+  return removeDeviceFromSession(deviceId, {
+    notify: true,
+    removalReason: "removed_by_dashboard",
+    disconnectReason: "removed_by_dashboard",
+    disconnectMessage: "Dashboard removed this phone from the session. Tap Start Device to join again."
+  });
 }
 
 function getClientIp(req) {
