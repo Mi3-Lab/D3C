@@ -42,7 +42,7 @@ const SERVER_STARTED_AT_MS = Date.now();
 const FLEET_OVERVIEW_BROADCAST_MIN_INTERVAL_MS = 500;
 const WORKZONE_ALERT_POLL_INTERVAL_MS = Math.max(
   100,
-  Math.round(Number(process.env.WORKZONE_ALERT_POLL_INTERVAL_MS || 250) || 250)
+  Math.round(Number(process.env.WORKZONE_ALERT_POLL_INTERVAL_MS || 100) || 100)
 );
 const WORKZONE_ALERT_COOLDOWN_MS = Math.max(
   0,
@@ -97,6 +97,10 @@ const WORKZONE_LIVE_EVIDENCE_WINDOW_MS = Math.max(
 const WORKZONE_LIVE_ACTIVE_HOLD_MS = Math.max(
   500,
   Math.round(Number(process.env.WORKZONE_LIVE_ACTIVE_HOLD_MS || 1800) || 1800)
+);
+const WORKZONE_LIVE_MIN_POSITIVE_FRAMES = Math.max(
+  1,
+  Math.round(Number(process.env.WORKZONE_LIVE_MIN_POSITIVE_FRAMES || 1) || 1)
 );
 const WORKZONE_LIVE_ALERT_BANNER_MS = Math.max(
   1000,
@@ -473,7 +477,16 @@ const workzoneLiveState = {
   lastExitCode: null,
   lastExitSignal: null,
   lastError: "",
-  lastStatus: "idle"
+  lastStatus: "idle",
+  workerDevice: null,
+  acceleratorKind: null,
+  acceleratorIndex: null,
+  acceleratorName: null,
+  gpuUtilizationPct: null,
+  gpuMemoryUsedMb: null,
+  gpuMemoryTotalMb: null,
+  gpuMemoryPct: null,
+  lastTelemetryAtMs: 0
 };
 let publicRuntimeInfo = loadPublicRuntimeInfo();
 
@@ -1473,6 +1486,10 @@ function emptyWorkzoneLivePublicState() {
     inference_ms: 0,
     inference_avg_ms: 0,
     pipeline_latency_ms: null,
+    queue_wait_ms: null,
+    dispatch_latency_ms: null,
+    alert_latency_ms: null,
+    result_to_alert_ms: null,
     positive_frames_recent: 0,
     strong_frames_recent: 0,
     consecutive_positive_frames: 0,
@@ -1618,7 +1635,7 @@ function deviceSummaries() {
       recordingModalities: d.recordingStatus?.modalities || emptyRecordingModalities(),
       recordingSessionId: d.recordingStatus?.session_id || null,
       workzoneStatus: d.state.workzone_live?.status || "disabled",
-      workzoneActive: !!d.state.workzone_live?.banner_active,
+      workzoneActive: !!d.state.workzone_live?.active,
       workzoneScore: Number(d.state.workzone_live?.score || 0),
       workzoneSmoothedScore: Number(d.state.workzone_live?.smoothed_score || 0),
       workzoneClassSummary: d.state.workzone_live?.class_summary || "",
@@ -1895,7 +1912,9 @@ function sendWs(ws, payload, opts = {}) {
 }
 
 function broadcastFleetAlert(payload, opts = {}) {
-  const now = Date.now();
+  const now = Number.isFinite(Number(payload?.t_server_ms)) && Number(payload.t_server_ms) > 0
+    ? Number(payload.t_server_ms)
+    : Date.now();
   let targetCount = 0;
   for (const [, target] of devices.entries()) {
     if (!target.connected || !isSocketOpen(target.ws)) continue;
@@ -1947,6 +1966,22 @@ function buildFleetOverviewPayload() {
       recording: !!device.recordingStatus?.recording,
       motion_state: device.state?.motion_state || "UNKNOWN",
       camera_preview_live: !!device.state?.camera_preview?.live,
+      workzone_active: !!device.state?.workzone_live?.active,
+      workzone_found: !!device.state?.workzone_live?.found,
+      workzone_tracking: !!device.state?.workzone_live?.tracking,
+      workzone_status: String(device.state?.workzone_live?.status || "disabled"),
+      workzone_score: Number(device.state?.workzone_live?.score || 0),
+      workzone_score_threshold: Number(device.state?.workzone_live?.score_threshold || 0),
+      workzone_max_confidence: Number(device.state?.workzone_live?.max_confidence || 0),
+      workzone_detection_count: Math.max(0, Number(device.state?.workzone_live?.detection_count || 0)),
+      workzone_class_summary: String(device.state?.workzone_live?.class_summary || ""),
+      workzone_updated_at_ms: Number(device.state?.workzone_live?.last_checked_at_ms || 0),
+      workzone_alert_latency_ms: Number(device.state?.workzone_live?.alert_latency_ms || 0),
+      workzone_queue_wait_ms: Number(device.state?.workzone_live?.queue_wait_ms || 0),
+      workzone_dispatch_latency_ms: Number(device.state?.workzone_live?.dispatch_latency_ms || 0),
+      workzone_pipeline_latency_ms: Number(device.state?.workzone_live?.pipeline_latency_ms || 0),
+      workzone_inference_ms: Number(device.state?.workzone_live?.inference_ms || 0),
+      rtt_ms: Number(device.stats?.rtt_ms || 0),
       gps_latest: device.state?.gps_latest
         ? {
             t_recv_ms: Number(device.state.gps_latest.t_recv_ms || 0),
@@ -2005,6 +2040,22 @@ function buildWorkzoneLiveRuntimeInfo(now = Date.now()) {
   const status = classifyWorkzoneLiveRuntimeStatus(now);
   workzoneLiveState.lastStatus = status;
   const currentTask = workzoneLiveState.currentTask || null;
+  const gpuUtilizationPct = Number.isFinite(Number(workzoneLiveState.gpuUtilizationPct))
+    ? Number(workzoneLiveState.gpuUtilizationPct)
+    : null;
+  const gpuMemoryUsedMb = Number.isFinite(Number(workzoneLiveState.gpuMemoryUsedMb))
+    ? Number(workzoneLiveState.gpuMemoryUsedMb)
+    : null;
+  const gpuMemoryTotalMb = Number.isFinite(Number(workzoneLiveState.gpuMemoryTotalMb))
+    ? Number(workzoneLiveState.gpuMemoryTotalMb)
+    : null;
+  const gpuMemoryPct = Number.isFinite(Number(workzoneLiveState.gpuMemoryPct))
+    ? Number(workzoneLiveState.gpuMemoryPct)
+    : (
+      gpuMemoryUsedMb !== null && gpuMemoryTotalMb !== null && gpuMemoryTotalMb > 0
+        ? Number(((gpuMemoryUsedMb / gpuMemoryTotalMb) * 100).toFixed(1))
+        : null
+    );
   return {
     configured: !!workzoneLiveState.configured,
     enabled: !!workzoneLiveState.configured,
@@ -2032,6 +2083,16 @@ function buildWorkzoneLiveRuntimeInfo(now = Date.now()) {
     last_exit_code: workzoneLiveState.lastExitCode,
     last_exit_signal: workzoneLiveState.lastExitSignal,
     last_error: workzoneLiveState.lastError || null,
+    worker_device: workzoneLiveState.workerDevice || WORKZONE_LIVE_DEVICE,
+    accelerator_kind: typeof workzoneLiveState.acceleratorKind === "string" ? workzoneLiveState.acceleratorKind : null,
+    accelerator_index: Number.isFinite(Number(workzoneLiveState.acceleratorIndex)) ? Number(workzoneLiveState.acceleratorIndex) : null,
+    accelerator_name: typeof workzoneLiveState.acceleratorName === "string" ? workzoneLiveState.acceleratorName : null,
+    gpu_utilization_pct: gpuUtilizationPct,
+    gpu_memory_used_mb: gpuMemoryUsedMb,
+    gpu_memory_total_mb: gpuMemoryTotalMb,
+    gpu_memory_pct: gpuMemoryPct,
+    last_telemetry_at_ms: workzoneLiveState.lastTelemetryAtMs || null,
+    telemetry_age_ms: workzoneLiveState.lastTelemetryAtMs ? Math.max(0, now - workzoneLiveState.lastTelemetryAtMs) : null,
     project_dir: WORKZONE_LIVE_PROJECT_DIR,
     weights: WORKZONE_LIVE_WEIGHTS,
     device: WORKZONE_LIVE_DEVICE,
@@ -2127,6 +2188,15 @@ function startWorkzoneLiveWorker() {
   workzoneLiveState.lastExitCode = null;
   workzoneLiveState.lastExitSignal = null;
   workzoneLiveState.lastError = "";
+  workzoneLiveState.workerDevice = null;
+  workzoneLiveState.acceleratorKind = null;
+  workzoneLiveState.acceleratorIndex = null;
+  workzoneLiveState.acceleratorName = null;
+  workzoneLiveState.gpuUtilizationPct = null;
+  workzoneLiveState.gpuMemoryUsedMb = null;
+  workzoneLiveState.gpuMemoryTotalMb = null;
+  workzoneLiveState.gpuMemoryPct = null;
+  workzoneLiveState.lastTelemetryAtMs = 0;
 
   proc.stdout.on("data", (chunk) => {
     handleWorkzoneLiveStdoutChunk(chunk);
@@ -2188,6 +2258,78 @@ function handleWorkzoneLiveStdoutChunk(chunk) {
   }
 }
 
+function updateWorkzoneLiveTelemetry(message) {
+  if (!message || typeof message !== "object") return;
+  let touched = false;
+
+  const resolvedDevice = typeof message.resolved_device === "string" ? message.resolved_device.trim() : "";
+  if (resolvedDevice) {
+    workzoneLiveState.workerDevice = resolvedDevice;
+    touched = true;
+  } else if (typeof message.device === "string" && message.device.trim()) {
+    workzoneLiveState.workerDevice = message.device.trim();
+    touched = true;
+  }
+
+  if (typeof message.accelerator_kind === "string") {
+    const value = message.accelerator_kind.trim().toLowerCase();
+    workzoneLiveState.acceleratorKind = value || null;
+    touched = true;
+  }
+
+  if (typeof message.accelerator_name === "string") {
+    const value = message.accelerator_name.trim();
+    workzoneLiveState.acceleratorName = value || null;
+    touched = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(message, "accelerator_index")) {
+    workzoneLiveState.acceleratorIndex = Number.isFinite(Number(message.accelerator_index))
+      ? Number(message.accelerator_index)
+      : null;
+    touched = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(message, "gpu_utilization_pct")) {
+    workzoneLiveState.gpuUtilizationPct = Number.isFinite(Number(message.gpu_utilization_pct))
+      ? Number(message.gpu_utilization_pct)
+      : null;
+    touched = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(message, "gpu_memory_used_mb")) {
+    workzoneLiveState.gpuMemoryUsedMb = Number.isFinite(Number(message.gpu_memory_used_mb))
+      ? Number(message.gpu_memory_used_mb)
+      : null;
+    touched = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(message, "gpu_memory_total_mb")) {
+    workzoneLiveState.gpuMemoryTotalMb = Number.isFinite(Number(message.gpu_memory_total_mb))
+      ? Number(message.gpu_memory_total_mb)
+      : null;
+    touched = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(message, "gpu_memory_pct")) {
+    workzoneLiveState.gpuMemoryPct = Number.isFinite(Number(message.gpu_memory_pct))
+      ? Number(message.gpu_memory_pct)
+      : null;
+    touched = true;
+  } else if (
+    Number.isFinite(Number(workzoneLiveState.gpuMemoryUsedMb))
+    && Number.isFinite(Number(workzoneLiveState.gpuMemoryTotalMb))
+    && Number(workzoneLiveState.gpuMemoryTotalMb) > 0
+  ) {
+    workzoneLiveState.gpuMemoryPct = Number(((Number(workzoneLiveState.gpuMemoryUsedMb) / Number(workzoneLiveState.gpuMemoryTotalMb)) * 100).toFixed(1));
+    touched = true;
+  }
+
+  if (touched) {
+    workzoneLiveState.lastTelemetryAtMs = Date.now();
+  }
+}
+
 function handleWorkzoneLiveMessage(msg) {
   const type = String(msg?.type || "").trim();
   if (type === "ready") {
@@ -2196,10 +2338,14 @@ function handleWorkzoneLiveMessage(msg) {
     workzoneLiveState.lastReadyAtMs = Date.now();
     workzoneLiveState.lastPongAtMs = Date.now();
     workzoneLiveState.lastError = "";
+    updateWorkzoneLiveTelemetry(msg);
     console.log("[workzone-live] ready", {
       weights: msg.weights || WORKZONE_LIVE_WEIGHTS,
       device: msg.device || WORKZONE_LIVE_DEVICE,
-      imgsz: Number(msg.imgsz || WORKZONE_LIVE_IMGSZ)
+      imgsz: Number(msg.imgsz || WORKZONE_LIVE_IMGSZ),
+      accelerator_kind: msg.accelerator_kind || null,
+      accelerator_index: Number.isFinite(Number(msg.accelerator_index)) ? Number(msg.accelerator_index) : null,
+      accelerator_name: msg.accelerator_name || null
     });
     dispatchNextWorkzoneLiveFrame();
     return;
@@ -2207,6 +2353,7 @@ function handleWorkzoneLiveMessage(msg) {
   if (type === "pong") {
     workzoneLiveState.lastPongAtMs = Date.now();
     workzoneLiveState.failed = false;
+    updateWorkzoneLiveTelemetry(msg);
     return;
   }
   if (type === "error") {
@@ -2217,15 +2364,20 @@ function handleWorkzoneLiveMessage(msg) {
   if (type !== "result") return;
   workzoneLiveState.busy = false;
   workzoneLiveState.currentTask = null;
-  workzoneLiveState.lastResultAtMs = Date.now();
+  const resultReceivedAtMs = Date.now();
+  workzoneLiveState.lastResultAtMs = resultReceivedAtMs;
   workzoneLiveState.lastInferenceMs = Number.isFinite(Number(msg?.inference_ms)) ? Number(msg.inference_ms) : 0;
+  updateWorkzoneLiveTelemetry(msg);
   if (workzoneLiveState.lastInferenceMs > 0) {
     workzoneLiveState.avgInferenceMs = workzoneLiveState.avgInferenceMs > 0
       ? Number(((workzoneLiveState.avgInferenceMs * 0.8) + (workzoneLiveState.lastInferenceMs * 0.2)).toFixed(2))
       : Number(workzoneLiveState.lastInferenceMs.toFixed(2));
   }
   workzoneLiveState.framesProcessed += 1;
-  handleLiveWorkzoneResult(msg);
+  handleLiveWorkzoneResult({
+    ...msg,
+    result_received_at_ms: resultReceivedAtMs
+  });
   dispatchNextWorkzoneLiveFrame();
 }
 
@@ -2317,6 +2469,7 @@ function dispatchNextWorkzoneLiveFrame() {
     seq: next.seq,
     sessionDir: next.sessionDir,
     frameIndex: next.frameIndex,
+    queuedAtMs: next.queuedAtMs,
     startedAtMs: Date.now(),
     tRecvMs: next.tRecvMs
   };
@@ -2329,6 +2482,8 @@ function dispatchNextWorkzoneLiveFrame() {
     session_dir: next.sessionDir,
     t_device_ms: next.tDeviceMs,
     t_recv_ms: next.tRecvMs,
+    queued_at_ms: next.queuedAtMs,
+    dispatch_started_at_ms: workzoneLiveState.currentTask.startedAtMs,
     jpeg_base64: next.jpegBuffer.toString("base64")
   };
   const device = devices.get(next.deviceId);
@@ -2359,6 +2514,45 @@ function sanitizeWorkzoneTopDetections(raw) {
     .slice(0, 5);
 }
 
+function normalizeLatencyTimestamp(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function computeLatencyDurationMs(startMs, endMs) {
+  const start = normalizeLatencyTimestamp(startMs);
+  const end = normalizeLatencyTimestamp(endMs);
+  if (start === null || end === null || end < start) return null;
+  return Math.max(0, Math.round(end - start));
+}
+
+function buildWorkzoneAlertLatency({ deviceId = "", rawResult = null, alertSentAtMs = Date.now() } = {}) {
+  const frameReceivedAtMs = normalizeLatencyTimestamp(rawResult?.t_recv_ms);
+  const queuedAtMs = normalizeLatencyTimestamp(rawResult?.queued_at_ms);
+  const dispatchStartedAtMs = normalizeLatencyTimestamp(rawResult?.dispatch_started_at_ms);
+  const resultReceivedAtMs = normalizeLatencyTimestamp(rawResult?.result_received_at_ms);
+  const inferenceMs = Number.isFinite(Number(rawResult?.inference_ms))
+    ? Number(Number(rawResult.inference_ms).toFixed(2))
+    : null;
+  const sourceRttMs = Number.isFinite(Number(devices.get(deviceId)?.stats?.rtt_ms))
+    ? Number(Number(devices.get(deviceId).stats.rtt_ms).toFixed(1))
+    : null;
+  return {
+    frame_received_at_ms: frameReceivedAtMs,
+    queued_at_ms: queuedAtMs,
+    dispatch_started_at_ms: dispatchStartedAtMs,
+    result_received_at_ms: resultReceivedAtMs,
+    alert_sent_at_ms: normalizeLatencyTimestamp(alertSentAtMs),
+    queue_wait_ms: computeLatencyDurationMs(queuedAtMs, dispatchStartedAtMs),
+    dispatch_to_result_ms: computeLatencyDurationMs(dispatchStartedAtMs, resultReceivedAtMs),
+    frame_to_result_ms: computeLatencyDurationMs(frameReceivedAtMs, resultReceivedAtMs),
+    result_to_alert_ms: computeLatencyDurationMs(resultReceivedAtMs, alertSentAtMs),
+    frame_to_alert_ms: computeLatencyDurationMs(frameReceivedAtMs, alertSentAtMs),
+    inference_ms: inferenceMs,
+    source_rtt_ms: sourceRttMs
+  };
+}
+
 function createWorkzoneAlertDeviceState() {
   return {
     active: false,
@@ -2387,7 +2581,7 @@ function resolveWorkzoneDeviceStatus(publicState, now = Date.now()) {
   const workerState = String(publicState.worker_state || "");
   if (["starting", "restarting", "offline", "stalled"].includes(workerState)) return workerState;
   if (publicState.last_error) return "error";
-  if (publicState.banner_active && publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) <= WORKZONE_LIVE_RESULT_STALE_MS) return "detected";
+  if (publicState.active && publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) <= WORKZONE_LIVE_RESULT_STALE_MS) return "detected";
   if (publicState.tracking && publicState.last_checked_at_ms && (now - publicState.last_checked_at_ms) <= WORKZONE_LIVE_RESULT_STALE_MS) return "tracking";
   if (publicState.checking) return "checking";
   if (publicState.pending) return "queued";
@@ -2504,6 +2698,8 @@ function updateWorkzoneDetectionState({
   const rawPositive = isWorkzoneDetectionActive(info, payload, now);
   const alertState = ensureWorkzoneAlertDeviceState(deviceId);
   const publicState = device.state.workzone_live || emptyWorkzoneLivePublicState();
+  const queueWaitMs = computeLatencyDurationMs(rawResult?.queued_at_ms, rawResult?.dispatch_started_at_ms);
+  const dispatchLatencyMs = computeLatencyDurationMs(rawResult?.dispatch_started_at_ms, rawResult?.result_received_at_ms);
 
   if (!alertState.lastPositiveAtMs || (now - alertState.lastPositiveAtMs) > (WORKZONE_LIVE_EVIDENCE_WINDOW_MS * 2)) {
     alertState.smoothedScore = score;
@@ -2540,7 +2736,11 @@ function updateWorkzoneDetectionState({
   )).length;
   const wasActive = !!alertState.active;
   const shouldActivate = (
-    rawPositive && (strongFramesRecent >= 1 || positiveFramesRecent >= 2 || alertState.consecutivePositiveFrames >= 2)
+    rawPositive && (
+      strongFramesRecent >= 1
+      || positiveFramesRecent >= WORKZONE_LIVE_MIN_POSITIVE_FRAMES
+      || alertState.consecutivePositiveFrames >= WORKZONE_LIVE_MIN_POSITIVE_FRAMES
+    )
   ) || (
     !rawPositive
     && positiveFramesRecent >= 2
@@ -2560,20 +2760,23 @@ function updateWorkzoneDetectionState({
   }
 
   let alertSent = false;
+  let alertLatency = null;
   if (
     alertState.active
     && !wasActive
     && (now - alertState.lastAlertAtMs) >= WORKZONE_ALERT_COOLDOWN_MS
   ) {
-    const targetCount = sendWorkzoneDetectedAlert({
+    const alertOutcome = sendWorkzoneDetectedAlert({
       deviceId,
       info,
       payload,
-      statusPath
+      statusPath,
+      rawResult
     });
-    if (targetCount > 0) {
+    if (alertOutcome.targetCount > 0) {
       alertState.lastAlertAtMs = now;
       alertState.lastAlertFrameIndex = frameIndex;
+      alertLatency = alertOutcome.latency;
       alertSent = true;
     }
   }
@@ -2604,6 +2807,8 @@ function updateWorkzoneDetectionState({
   publicState.pipeline_latency_ms = Number.isFinite(Number(rawResult?.t_recv_ms))
     ? Math.max(0, now - Number(rawResult.t_recv_ms))
     : publicState.pipeline_latency_ms;
+  publicState.queue_wait_ms = queueWaitMs;
+  publicState.dispatch_latency_ms = dispatchLatencyMs;
   publicState.positive_frames_recent = positiveFramesRecent;
   publicState.strong_frames_recent = strongFramesRecent;
   publicState.consecutive_positive_frames = Number(alertState.consecutivePositiveFrames || 0);
@@ -2611,6 +2816,12 @@ function updateWorkzoneDetectionState({
   publicState.frames_processed = Number(publicState.frames_processed || 0) + 1;
   publicState.frames_dropped = Number(publicState.frames_dropped || 0);
   publicState.last_alert_at_ms = alertState.lastAlertAtMs || publicState.last_alert_at_ms || null;
+  publicState.alert_latency_ms = Number.isFinite(Number(alertLatency?.frame_to_alert_ms))
+    ? Number(alertLatency.frame_to_alert_ms)
+    : publicState.alert_latency_ms;
+  publicState.result_to_alert_ms = Number.isFinite(Number(alertLatency?.result_to_alert_ms))
+    ? Number(alertLatency.result_to_alert_ms)
+    : publicState.result_to_alert_ms;
   publicState.last_error = rawResult?.status && rawResult.status !== "ok"
     ? String(rawResult?.error || rawResult.status || "workzone result error")
     : "";
@@ -2734,7 +2945,7 @@ function isWorkzoneDetectionActive(info, payload, now = Date.now()) {
   return found && detectionCount > 0 && score >= payloadThreshold;
 }
 
-function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
+function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath, rawResult = null }) {
   const sourceDeviceName = devices.get(deviceId)?.device_name || deviceId;
   const score = Number(info.score || 0);
   const maxConfidence = Number(info.max_confidence || 0);
@@ -2743,10 +2954,17 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
   const classCounts = info.class_counts && typeof info.class_counts === "object" ? info.class_counts : {};
   const classSummary = summarizeWorkzoneClasses(classCounts);
   const topDetections = sanitizeWorkzoneTopDetections(info.top_detections);
+  const alertSentAtMs = Date.now();
+  const latency = buildWorkzoneAlertLatency({
+    deviceId,
+    rawResult,
+    alertSentAtMs
+  });
   const message = classSummary
     ? `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"} (${classSummary}).`
     : `Workzone detected by ${sourceDeviceName} with ${detectionCount} detection${detectionCount === 1 ? "" : "s"}.`;
   const targetCount = broadcastFleetAlert({
+    t_server_ms: alertSentAtMs,
     kind: "workzone_detected",
     title: "Workzone detected",
     message,
@@ -2766,7 +2984,9 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
       session_dir: recording.session_dir || null,
       status_path: statusPath,
       output_root: typeof payload?.output_root === "string" ? payload.output_root : null,
-      updated_at: typeof info.updated_at === "string" ? info.updated_at : (typeof payload?.updated_at === "string" ? payload.updated_at : null)
+      updated_at: typeof info.updated_at === "string" ? info.updated_at : (typeof payload?.updated_at === "string" ? payload.updated_at : null),
+      inference_ms: Number.isFinite(Number(rawResult?.inference_ms)) ? Number(Number(rawResult.inference_ms).toFixed(2)) : null,
+      latency
     }
   }, { critical: true });
   if (targetCount > 0) {
@@ -2779,7 +2999,8 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
       score: Number(score.toFixed(3)),
       max_confidence: Number(maxConfidence.toFixed(3)),
       detection_count: detectionCount,
-      classes: classCounts
+      classes: classCounts,
+      latency
     });
     appendControlLog(path.join(recording.session_dir, "control_log.jsonl"), {
       type: "workzone_alert_sent",
@@ -2792,10 +3013,11 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath }) {
       score,
       max_confidence: maxConfidence,
       detection_count: detectionCount,
-      class_counts: classCounts
+      class_counts: classCounts,
+      latency
     });
   }
-  return targetCount;
+  return { targetCount, latency };
 }
 
 function summarizeWorkzoneClasses(classCounts) {

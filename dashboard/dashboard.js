@@ -40,6 +40,8 @@ const els = {
 let ws = null;
 let dragSession = null;
 let snapOverlayEl = null;
+let dashboardResizeRaf = null;
+let dashboardGridColumnCount = 12;
 const mountedWidgets = new Map();
 
 const store = createStore({
@@ -104,6 +106,7 @@ function init() {
   });
 
   bindTopUi();
+  bindResponsiveDashboard();
   document.body.setAttribute("data-theme", "dark");
   renderWidgetTypeOptions();
   renderLayoutSelectors();
@@ -480,6 +483,24 @@ function updateGlobalStatusBar() {
   );
 }
 
+function bindResponsiveDashboard() {
+  window.addEventListener("resize", () => {
+    if (dashboardResizeRaf) return;
+    dashboardResizeRaf = requestAnimationFrame(() => {
+      dashboardResizeRaf = null;
+      const nextColumnCount = getWidgetGridColumnCount();
+      if (nextColumnCount === dashboardGridColumnCount) return;
+      renderDashboard();
+    });
+  });
+}
+
+function getWidgetGridColumnCount() {
+  if (window.matchMedia("(max-width: 768px)").matches) return 2;
+  if (window.matchMedia("(max-width: 980px)").matches) return 6;
+  return 12;
+}
+
 function setHeaderStatus(el, value, tone = null) {
   if (!el) return;
   const textEl = el.querySelector(".status-text");
@@ -838,6 +859,7 @@ function renderDashboard() {
   snapOverlayEl = document.createElement("div");
   snapOverlayEl.className = "grid-snap-overlay";
   els.widgetGrid.appendChild(snapOverlayEl);
+  dashboardGridColumnCount = getWidgetGridColumnCount();
 
   const st = store.getState();
   const layout = getActiveLayout();
@@ -857,7 +879,7 @@ function renderDashboard() {
     const controlTypes = new Set(["stream_controls", "events_timeline", "replay"]);
     card.classList.add(controlTypes.has(instance.type) ? "widget-control" : "widget-telemetry");
     card.dataset.widgetId = instance.id;
-    card.style.gridColumn = `span ${clamp(instance.w || 4, 2, 12)}`;
+    card.style.gridColumn = `span ${clamp(instance.w || 4, 2, dashboardGridColumnCount)}`;
     card.style.gridRow = `span ${clamp(instance.h || 2, 1, 6)}`;
     if (instance.pinned) card.classList.add("widget-pinned");
     if (st.focusWidgetId && st.focusWidgetId === instance.id) card.classList.add("widget-focus");

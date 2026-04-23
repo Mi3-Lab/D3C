@@ -2,22 +2,25 @@ import { clamp, clone } from "./store.js";
 
 export const LAYOUTS_KEY = "d3c_widget_layouts_v5";
 export const ACTIVE_LAYOUT_KEY = "d3c_active_layout_v5";
+const COMPACT_STREAM_CONTROLS_WIDTH = 4;
 
 export function defaultLayouts(makeWidget) {
   return {
     Overview: {
       name: "Overview",
       widgets: [
-        makeWidget("stream_controls", { w: 5, h: 6, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("camera_preview", { w: 7, h: 6, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("workzone_live", { w: 12, h: 2, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("stream_controls", { w: COMPACT_STREAM_CONTROLS_WIDTH, h: 6, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("camera_preview", { w: 12 - COMPACT_STREAM_CONTROLS_WIDTH, h: 6, pinned: true, settings: { device_id: "global" } }),
         makeWidget("device_list", { w: 12, h: 4, pinned: true })
       ]
     },
     Cameras: {
       name: "Cameras",
       widgets: [
-        makeWidget("camera_preview", { w: 8, h: 5, pinned: true, settings: { device_id: "global" } }),
-        makeWidget("device_list", { w: 4, h: 5, pinned: true })
+        makeWidget("workzone_live", { w: 12, h: 2, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("camera_preview", { w: 12, h: 6, pinned: true, settings: { device_id: "global" } }),
+        makeWidget("device_list", { w: 12, h: 4, pinned: true })
       ]
     },
     Review: {
@@ -31,10 +34,67 @@ export function defaultLayouts(makeWidget) {
   };
 }
 
+function migrateBuiltInLiveLayouts(layouts, defaultsFactory) {
+  if (!layouts || typeof layouts !== "object") return false;
+  const defaults = defaultsFactory();
+  let changed = false;
+
+  function syncBuiltInLayout(layoutName) {
+    const layout = layouts[layoutName];
+    const defaultLayout = defaults[layoutName];
+    if (!layout || typeof layout !== "object" || !Array.isArray(layout.widgets) || !defaultLayout?.widgets?.length) return;
+
+    const byType = new Map();
+    const usedIds = new Set();
+    for (const widget of layout.widgets) {
+      if (!widget || typeof widget !== "object") continue;
+      const type = String(widget.type || "");
+      if (!type || byType.has(type)) continue;
+      byType.set(type, widget);
+    }
+
+    const nextWidgets = [];
+    for (const defaultWidget of defaultLayout.widgets) {
+      const current = byType.get(defaultWidget.type);
+      const nextWidget = current ? current : clone(defaultWidget);
+      if (current?.id) usedIds.add(current.id);
+      if (
+        !current
+        || Number(current.w) !== Number(defaultWidget.w)
+        || Number(current.h) !== Number(defaultWidget.h)
+        || !!current.pinned !== !!defaultWidget.pinned
+      ) {
+        changed = true;
+      }
+      nextWidget.type = defaultWidget.type;
+      nextWidget.w = defaultWidget.w;
+      nextWidget.h = defaultWidget.h;
+      nextWidget.pinned = !!defaultWidget.pinned;
+      nextWidget.settings = { ...clone(defaultWidget.settings || {}), ...(current?.settings || {}) };
+      nextWidgets.push(nextWidget);
+    }
+
+    const extras = layout.widgets.filter((widget) => widget && typeof widget === "object" && !usedIds.has(widget.id) && !defaultLayout.widgets.some((base) => base.type === widget.type));
+    const sameOrder = layout.widgets.length === nextWidgets.length + extras.length
+      && layout.widgets.every((widget, index) => widget === [...nextWidgets, ...extras][index]);
+    if (!sameOrder) changed = true;
+    layout.widgets = [...nextWidgets, ...extras];
+  }
+
+  syncBuiltInLayout("Overview");
+  syncBuiltInLayout("Cameras");
+  return changed;
+}
+
 export function loadLayouts(defaultsFactory) {
   try {
     const raw = JSON.parse(localStorage.getItem(LAYOUTS_KEY) || "null");
-    if (raw && typeof raw === "object" && Object.keys(raw).length) return raw;
+    if (raw && typeof raw === "object" && Object.keys(raw).length) {
+      if (migrateBuiltInLiveLayouts(raw, defaultsFactory)) {
+        localStorage.setItem(LAYOUTS_KEY, JSON.stringify(raw));
+      }
+      return raw;
+    }
   } catch {}
   return defaultsFactory();
 }

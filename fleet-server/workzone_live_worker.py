@@ -7,6 +7,8 @@ import argparse
 import base64
 import contextlib
 import json
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -14,7 +16,17 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
+
+try:
+    import pynvml  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency
+    pynvml = None
+
+
+MIB = 1024 * 1024
+_NVML_INITIALIZED = False
 
 
 def normalize_label(label: object) -> str:
@@ -42,6 +54,45 @@ def should_move_model_to_device(device: str) -> bool:
     return normalized not in {"0", "1", "2", "3"}
 
 
+def parse_cuda_device_index(device: str) -> int | None:
+    normalized = device.strip().lower()
+    if normalized.isdigit():
+        return int(normalized)
+    if normalized.startswith("cuda:"):
+        suffix = normalized.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+    if normalized == "cuda":
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.current_device())
+        return 0
+    return None
+
+
+def init_nvml() -> bool:
+    global _NVML_INITIALIZED
+    if _NVML_INITIALIZED:
+        return True
+    if pynvml is None:
+        return False
+    try:
+        pynvml.nvmlInit()
+        _NVML_INITIALIZED = True
+        return True
+    except Exception:
+        return False
+
+
+def safe_round_mib(value: object) -> int | None:
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if numeric < 0:
+        return None
+    return int(round(numeric / MIB))
+
+
 class LiveDetector:
     def __init__(
         self,
@@ -63,6 +114,9 @@ class LiveDetector:
         self.score_threshold = score_threshold
         self.model = self._load_model()
         self.class_counts, self.compute_workzone_score = self._load_helpers()
+        self.accelerator = self._resolve_accelerator()
+        self.last_telemetry = dict(self.accelerator)
+        self.last_telemetry_at = 0.0
 
     def _load_model(self) -> YOLO:
         with contextlib.redirect_stdout(sys.stderr):
@@ -81,6 +135,135 @@ class LiveDetector:
         from d3c_support.annotate import class_counts, compute_workzone_score
 
         return class_counts, compute_workzone_score
+
+    def _resolve_accelerator(self) -> dict:
+        requested_device = str(self.device).strip()
+        requested_index = parse_cuda_device_index(requested_device)
+        if (
+            requested_index is not None
+            and torch.cuda.is_available()
+            and 0 <= requested_index < torch.cuda.device_count()
+        ):
+            accelerator = {
+                "accelerator_kind": "gpu",
+                "accelerator_index": int(requested_index),
+                "accelerator_name": str(torch.cuda.get_device_name(requested_index)).strip(),
+                "resolved_device": f"cuda:{requested_index}",
+            }
+            with contextlib.suppress(Exception):
+                free_bytes, total_bytes = torch.cuda.mem_get_info(requested_index)
+                total_mb = safe_round_mib(total_bytes)
+                free_mb = safe_round_mib(free_bytes)
+                if total_mb is not None:
+                    accelerator["gpu_memory_total_mb"] = total_mb
+                if free_mb is not None and total_mb is not None:
+                    accelerator["gpu_memory_used_mb"] = max(0, total_mb - free_mb)
+            return accelerator
+
+        return {
+            "accelerator_kind": "cpu",
+            "accelerator_index": None,
+            "accelerator_name": "CPU",
+            "resolved_device": requested_device or "cpu",
+        }
+
+    def _query_gpu_telemetry_nvml(self, gpu_index: int) -> dict:
+        if not init_nvml():
+            return {}
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu_index))
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return {
+                "gpu_utilization_pct": int(util.gpu),
+                "gpu_memory_used_mb": safe_round_mib(memory.used),
+                "gpu_memory_total_mb": safe_round_mib(memory.total),
+            }
+        except Exception:
+            return {}
+
+    def _query_gpu_telemetry_nvidia_smi(self, gpu_index: int) -> dict:
+        binary = shutil.which("nvidia-smi")
+        if not binary:
+            return {}
+        try:
+            completed = subprocess.run(
+                [
+                    binary,
+                    "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=1.0,
+                text=True,
+            )
+        except Exception:
+            return {}
+        if completed.returncode != 0:
+            return {}
+        for raw_line in completed.stdout.splitlines():
+            parts = [part.strip() for part in raw_line.split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                line_index = int(parts[0])
+            except Exception:
+                continue
+            if line_index != int(gpu_index):
+                continue
+            telemetry = {}
+            with contextlib.suppress(Exception):
+                telemetry["gpu_utilization_pct"] = int(round(float(parts[1])))
+            with contextlib.suppress(Exception):
+                telemetry["gpu_memory_used_mb"] = int(round(float(parts[2])))
+            with contextlib.suppress(Exception):
+                telemetry["gpu_memory_total_mb"] = int(round(float(parts[3])))
+            return telemetry
+        return {}
+
+    def _query_gpu_telemetry_torch(self, gpu_index: int) -> dict:
+        if not torch.cuda.is_available():
+            return {}
+        telemetry = {}
+        with contextlib.suppress(Exception):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(int(gpu_index))
+            total_mb = safe_round_mib(total_bytes)
+            free_mb = safe_round_mib(free_bytes)
+            if total_mb is not None:
+                telemetry["gpu_memory_total_mb"] = total_mb
+            if free_mb is not None and total_mb is not None:
+                telemetry["gpu_memory_used_mb"] = max(0, total_mb - free_mb)
+        return telemetry
+
+    def collect_runtime_telemetry(self, *, force: bool = False) -> dict:
+        accelerator = dict(self.accelerator)
+        if accelerator.get("accelerator_kind") != "gpu":
+            return accelerator
+
+        now = time.monotonic()
+        if not force and self.last_telemetry and (now - self.last_telemetry_at) < 1.5:
+            return dict(self.last_telemetry)
+
+        gpu_index = accelerator.get("accelerator_index")
+        telemetry = dict(accelerator)
+        if gpu_index is not None:
+            extra = self._query_gpu_telemetry_nvml(int(gpu_index))
+            if not extra:
+                extra = self._query_gpu_telemetry_nvidia_smi(int(gpu_index))
+            if not extra:
+                extra = self._query_gpu_telemetry_torch(int(gpu_index))
+            telemetry.update({key: value for key, value in extra.items() if value is not None})
+
+        used_mb = telemetry.get("gpu_memory_used_mb")
+        total_mb = telemetry.get("gpu_memory_total_mb")
+        if isinstance(used_mb, int) and isinstance(total_mb, int) and total_mb > 0:
+            telemetry["gpu_memory_pct"] = round((used_mb / total_mb) * 100.0, 1)
+
+        self.last_telemetry = dict(telemetry)
+        self.last_telemetry_at = now
+        return telemetry
 
     def analyze_frame(self, frame_bgr: np.ndarray) -> dict:
         infer_started = time.perf_counter()
@@ -174,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         "imgsz": detector.imgsz,
         "weights": str(detector.weights),
         "updated_at": utc_now_iso(),
+        **detector.collect_runtime_telemetry(force=True),
     })
 
     for raw_line in sys.stdin:
@@ -189,7 +373,11 @@ def main(argv: list[str] | None = None) -> int:
 
         msg_type = str(message.get("type") or "").strip().lower()
         if msg_type == "ping":
-            emit({"type": "pong", "updated_at": utc_now_iso()})
+            emit({
+                "type": "pong",
+                "updated_at": utc_now_iso(),
+                **detector.collect_runtime_telemetry(force=True),
+            })
             continue
         if msg_type != "frame":
             emit({"type": "error", "stage": "message_type", "error": f"unsupported type: {msg_type}"})
@@ -203,6 +391,10 @@ def main(argv: list[str] | None = None) -> int:
                 "seq": int(message.get("seq") or 0),
                 "frame_index": int(message.get("frame_index") or 0),
                 "session_dir": str(message.get("session_dir") or ""),
+                "t_recv_ms": int(message.get("t_recv_ms") or 0),
+                "t_device_ms": int(message.get("t_device_ms") or 0),
+                "queued_at_ms": int(message.get("queued_at_ms") or 0),
+                "dispatch_started_at_ms": int(message.get("dispatch_started_at_ms") or 0),
                 "found": False,
                 "score": 0.0,
                 "max_confidence": 0.0,
@@ -212,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
                 "inference_ms": 0.0,
                 "status": "decode_failed",
                 "updated_at": utc_now_iso(),
+                **detector.collect_runtime_telemetry(),
             })
             continue
 
@@ -224,6 +417,10 @@ def main(argv: list[str] | None = None) -> int:
                 "seq": int(message.get("seq") or 0),
                 "frame_index": int(message.get("frame_index") or 0),
                 "session_dir": str(message.get("session_dir") or ""),
+                "t_recv_ms": int(message.get("t_recv_ms") or 0),
+                "t_device_ms": int(message.get("t_device_ms") or 0),
+                "queued_at_ms": int(message.get("queued_at_ms") or 0),
+                "dispatch_started_at_ms": int(message.get("dispatch_started_at_ms") or 0),
                 "found": False,
                 "score": 0.0,
                 "max_confidence": 0.0,
@@ -234,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "predict_failed",
                 "error": str(exc),
                 "updated_at": utc_now_iso(),
+                **detector.collect_runtime_telemetry(force=True),
             })
             continue
 
@@ -245,10 +443,13 @@ def main(argv: list[str] | None = None) -> int:
             "session_dir": str(message.get("session_dir") or ""),
             "t_recv_ms": int(message.get("t_recv_ms") or 0),
             "t_device_ms": int(message.get("t_device_ms") or 0),
+            "queued_at_ms": int(message.get("queued_at_ms") or 0),
+            "dispatch_started_at_ms": int(message.get("dispatch_started_at_ms") or 0),
             "score_threshold": detector.score_threshold,
             "status": "ok",
             "updated_at": utc_now_iso(),
             **result,
+            **detector.collect_runtime_telemetry(),
         })
 
     return 0

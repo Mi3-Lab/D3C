@@ -143,9 +143,16 @@
   let lastAlertPlayedAtMs = 0;
   let lastWorkzoneAlertPlayedAtMs = 0;
   let pendingAlertReplay = null;
+  let pendingAlertReplayTimer = null;
+  let workzoneSpeechPrimed = false;
+  let workzoneSpeechPrimeInFlight = null;
+  let workzoneVoiceWaitInFlight = null;
   let suppressSelfWorkzonePlaybackUntilMs = 0;
   let suppressSelfGenericAlertUntilMs = 0;
   let latestWorkzoneVisual = null;
+  const recentWorkzoneAnnouncementKeys = new Map();
+  const workzoneOverviewStateByDevice = new Map();
+  let workzoneOverviewBaselineReady = false;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
   let fleetOverview = { devices: [], generated_at_ms: 0 };
@@ -174,6 +181,10 @@
   } else {
     window.addEventListener("resize", scheduleFleetOverviewRender);
   }
+  setInterval(() => {
+    if (!latestWorkzoneVisual) return;
+    renderWorkzoneVisual();
+  }, 1000);
   permissionRefreshModalAction?.addEventListener("click", () => {
     void handlePermissionRefreshAction();
   });
@@ -185,11 +196,13 @@
   });
   document.addEventListener("pointerdown", () => {
     void primeAlertAudioWithOptions({ interactive: true });
+    void primeWorkzoneSpeechSynthesis();
     try { window.speechSynthesis?.getVoices?.(); } catch {}
     void replayPendingAlertIfPossible();
   }, { passive: true });
   document.addEventListener("keydown", (event) => {
     void primeAlertAudioWithOptions({ interactive: true });
+    void primeWorkzoneSpeechSynthesis();
     if (!pendingAlertReplay) return;
     if (event.key !== "Enter" && event.key !== " ") return;
     void replayPendingAlertIfPossible();
@@ -236,6 +249,7 @@
       return;
     }
     await primeAlertAudio();
+    await primeWorkzoneSpeechSynthesis();
     started = true;
     startBtn.disabled = true;
     updateJoinFieldLock();
@@ -313,6 +327,7 @@
         if (msg.type === "auth_required") {
           started = false;
           authState = null;
+          resetWorkzoneAnnouncementTracking({ clearRecent: true });
           updateJoinFieldLock();
           renderStatus();
           setJoinStatus("Join token expired - tap Start again");
@@ -332,7 +347,10 @@
           if (sessionRecordingActive && !wasRecording) {
             cameraVideoRecorderFallback = false;
           }
-          if (!sessionRecordingActive) flushPcmChunk(audioCtx?.sampleRate || 48000);
+          if (!sessionRecordingActive) {
+            flushPcmChunk(audioCtx?.sampleRate || 48000);
+            resetWorkzoneAnnouncementTracking({ clearRecent: true });
+          }
           updateCameraTransport();
           void ensureAudioRunning();
           renderStatus();
@@ -348,6 +366,9 @@
         }
         if (msg.type === "fleet_overview") {
           fleetOverview = normalizeFleetOverviewPayload(msg);
+          syncWorkzoneAnnouncementsFromFleetOverview();
+          reconcileLatestWorkzoneVisualFromFleetOverview();
+          renderWorkzoneVisual();
           scheduleFleetOverviewRender();
           return;
         }
@@ -895,14 +916,155 @@
       sourceDeviceName: String(sourceDeviceName || "another phone").trim() || "another phone",
       kind: String(kind || "").trim(),
       announcementText: String(announcementText || "").trim(),
-      queuedAtMs: Date.now()
+      queuedAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60000,
+      attempts: 0
     };
+    schedulePendingAlertReplay();
+  }
+
+  function clearPendingAlertReplaySchedule() {
+    if (!pendingAlertReplayTimer) return;
+    clearTimeout(pendingAlertReplayTimer);
+    pendingAlertReplayTimer = null;
+  }
+
+  function schedulePendingAlertReplay() {
+    clearPendingAlertReplaySchedule();
+    if (!pendingAlertReplay) return;
+    pendingAlertReplayTimer = setTimeout(() => {
+      pendingAlertReplayTimer = null;
+      void replayPendingAlertIfPossible();
+    }, 1400);
   }
 
   function buildWorkzoneAnnouncementText(sourceDeviceName = "") {
     const cleanName = String(sourceDeviceName || "").trim();
     if (!cleanName) return "Workzone detected";
-    return `Workzone detected from ${cleanName}`;
+    return `Workzone detected by ${cleanName}`;
+  }
+
+  function buildWorkzoneDetectedMessage(sourceDeviceName = "", { detectionCount = 0, classSummary = "" } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim() || "another phone";
+    const totalDetections = Math.max(0, Number(detectionCount || 0));
+    const summary = String(classSummary || "").trim();
+    if (summary && totalDetections > 0) {
+      return `Workzone detected by ${cleanName} with ${totalDetections} detection${totalDetections === 1 ? "" : "s"} (${summary}).`;
+    }
+    if (totalDetections > 0) {
+      return `Workzone detected by ${cleanName} with ${totalDetections} detection${totalDetections === 1 ? "" : "s"}.`;
+    }
+    if (summary) {
+      return `Workzone detected by ${cleanName} (${summary}).`;
+    }
+    return `Workzone detected by ${cleanName}.`;
+  }
+
+  function pruneRecentWorkzoneAnnouncementKeys(now = Date.now()) {
+    for (const [key, ts] of recentWorkzoneAnnouncementKeys.entries()) {
+      if ((now - Number(ts || 0)) > 20000) recentWorkzoneAnnouncementKeys.delete(key);
+    }
+  }
+
+  function resetWorkzoneAnnouncementTracking({ clearRecent = false } = {}) {
+    workzoneOverviewStateByDevice.clear();
+    workzoneOverviewBaselineReady = false;
+    if (clearRecent) recentWorkzoneAnnouncementKeys.clear();
+  }
+
+  function buildWorkzoneAnnouncementEvent({
+    sourceDeviceId = "",
+    sourceDeviceName = "",
+    updatedAtMs = 0,
+    detectionCount = 0,
+    score = 0,
+    classSummary = ""
+  } = {}) {
+    const cleanDeviceId = String(sourceDeviceId || "").trim();
+    const cleanDeviceName = String(sourceDeviceName || cleanDeviceId || "another phone").trim() || "another phone";
+    const cleanUpdatedAtMs = Number.isFinite(Number(updatedAtMs)) && Number(updatedAtMs) > 0 ? Number(updatedAtMs) : 0;
+    const cleanDetectionCount = Math.max(0, Number(detectionCount || 0));
+    const cleanScore = Number.isFinite(Number(score)) ? Number(score) : 0;
+    return {
+      sourceDeviceId: cleanDeviceId,
+      sourceDeviceName: cleanDeviceName,
+      updatedAtMs: cleanUpdatedAtMs,
+      detectionCount: cleanDetectionCount,
+      score: cleanScore,
+      classSummary: String(classSummary || "").trim(),
+      announcementText: buildWorkzoneAnnouncementText(cleanDeviceName),
+      key: [cleanDeviceId || cleanDeviceName, cleanUpdatedAtMs || 0, cleanDetectionCount, cleanScore.toFixed(3)].join("|")
+    };
+  }
+
+  async function playDedupedWorkzoneAnnouncement(eventInput = {}) {
+    const event = buildWorkzoneAnnouncementEvent(eventInput);
+    const now = Date.now();
+    pruneRecentWorkzoneAnnouncementKeys(now);
+    if (event.key && recentWorkzoneAnnouncementKeys.has(event.key)) {
+      return { played: true, mode: "deduped", deduped: true, event, announcementText: event.announcementText };
+    }
+    if (
+      pendingAlertReplay
+      && pendingAlertReplay.kind === "workzone_detected"
+      && pendingAlertReplay.announcementText === event.announcementText
+    ) {
+      return { played: true, mode: "pending", deduped: true, event, announcementText: event.announcementText };
+    }
+    const result = await playWorkzoneAnnouncement({ announcementText: event.announcementText });
+    if (result.played && event.key) recentWorkzoneAnnouncementKeys.set(event.key, now);
+    return { ...result, deduped: false, event, announcementText: event.announcementText };
+  }
+
+  async function handleWorkzoneOverviewDetection(device) {
+    const event = buildWorkzoneAnnouncementEvent({
+      sourceDeviceId: device?.device_id,
+      sourceDeviceName: device?.device_name || device?.device_id,
+      updatedAtMs: Number(device?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now()),
+      detectionCount: Number(device?.workzone_detection_count || 0),
+      score: Number(device?.workzone_score),
+      classSummary: String(device?.workzone_class_summary || "").trim()
+    });
+    const result = await playDedupedWorkzoneAnnouncement(event);
+    if (result.deduped) return;
+    const message = buildWorkzoneDetectedMessage(event.sourceDeviceName, {
+      detectionCount: event.detectionCount,
+      classSummary: event.classSummary
+    });
+    if (result.played) {
+      setAlertFeedback(message, "warning", 5000);
+      return;
+    }
+    queuePendingAlertReplay(event.sourceDeviceName, "workzone_detected", event.announcementText);
+    setAlertFeedback(`${message} If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
+  }
+
+  function syncWorkzoneAnnouncementsFromFleetOverview() {
+    const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
+    const now = Date.now();
+    const seen = new Set();
+    for (const device of devices) {
+      const deviceId = String(device?.device_id || "").trim();
+      if (!deviceId) continue;
+      seen.add(deviceId);
+      const nextDetected = !!device?.workzone_found;
+      const nextUpdatedAtMs = Number(device?.workzone_updated_at_ms || 0);
+      const prev = workzoneOverviewStateByDevice.get(deviceId) || null;
+      const hasFreshTimestamp = nextUpdatedAtMs > 0 && Math.abs(now - nextUpdatedAtMs) <= 12000;
+      const shouldAnnounce = nextDetected && (
+        (!workzoneOverviewBaselineReady && deviceId === runConfig.device_id && hasFreshTimestamp)
+        || (workzoneOverviewBaselineReady && !prev?.detected && (hasFreshTimestamp || nextUpdatedAtMs <= 0))
+      );
+      workzoneOverviewStateByDevice.set(deviceId, {
+        detected: nextDetected,
+        updatedAtMs: nextUpdatedAtMs
+      });
+      if (shouldAnnounce) void handleWorkzoneOverviewDetection(device);
+    }
+    for (const deviceId of [...workzoneOverviewStateByDevice.keys()]) {
+      if (!seen.has(deviceId)) workzoneOverviewStateByDevice.delete(deviceId);
+    }
+    workzoneOverviewBaselineReady = true;
   }
 
   function summarizeWorkzoneClassCounts(classCounts) {
@@ -926,12 +1088,25 @@
     return `${Math.round(min)} m ago`;
   }
 
+  function formatLatencyMs(value, { approximate = false } = {}) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    const prefix = approximate ? "~" : "";
+    if (ms < 1000) return `${prefix}${Math.round(ms)} ms`;
+    const sec = ms / 1000;
+    if (sec < 10) return `${prefix}${sec.toFixed(2)} s`;
+    return `${prefix}${sec.toFixed(1)} s`;
+  }
+
   function updateLatestWorkzoneVisual(msg, { fromSelf = false } = {}) {
     const workzone = msg?.workzone && typeof msg.workzone === "object" ? msg.workzone : {};
+    const latency = workzone?.latency && typeof workzone.latency === "object" ? workzone.latency : {};
     const classSummary = summarizeWorkzoneClassCounts(workzone.class_counts || {});
+    const receivedAtMs = Date.now();
     latestWorkzoneVisual = {
       title: String(msg?.title || "Workzone detected").trim() || "Workzone detected",
       message: String(msg?.message || "").trim() || `Workzone detected by ${String(msg?.source_device_name || msg?.source_device_id || "another phone").trim()}.`,
+      state: "detected",
       sourceDeviceName: String(msg?.source_device_name || msg?.source_device_id || "another phone").trim() || "another phone",
       fromSelf: !!fromSelf,
       score: Number(workzone.score),
@@ -939,7 +1114,63 @@
       maxConfidence: Number(workzone.max_confidence),
       detectionCount: Math.max(0, Number(workzone.detection_count || 0)),
       classSummary,
+      frameToAlertMs: Number(latency.frame_to_alert_ms),
+      frameToResultMs: Number(latency.frame_to_result_ms),
+      queueWaitMs: Number(latency.queue_wait_ms),
+      dispatchToResultMs: Number(latency.dispatch_to_result_ms),
+      resultToAlertMs: Number(latency.result_to_alert_ms),
+      inferenceMs: Number(latency.inference_ms ?? workzone.inference_ms),
+      sourceRttMs: Number(latency.source_rtt_ms),
+      approxPhoneReceiveMs: Number(msg?.t_server_ms) > 0 ? Math.max(0, receivedAtMs - Number(msg.t_server_ms)) : NaN,
       updatedAtMs: Date.parse(String(workzone.updated_at || "")) || Date.now(),
+      receivedAtMs
+    };
+  }
+
+  function reconcileLatestWorkzoneVisualFromFleetOverview() {
+    const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
+    const activeDevices = devices
+      .filter((device) => !!device?.workzone_found || !!device?.workzone_tracking || !!device?.workzone_active)
+      .sort((a, b) => {
+        const rankA = (a?.workzone_found ? 2 : (a?.workzone_tracking ? 1 : 0));
+        const rankB = (b?.workzone_found ? 2 : (b?.workzone_tracking ? 1 : 0));
+        if (rankA !== rankB) return rankB - rankA;
+        const scoreDiff = Number(b?.workzone_score || 0) - Number(a?.workzone_score || 0);
+        if (Math.abs(scoreDiff) > 1e-9) return scoreDiff;
+        return String(a?.device_id || "").localeCompare(String(b?.device_id || ""));
+      });
+
+    if (!activeDevices.length) {
+      latestWorkzoneVisual = null;
+      return;
+    }
+
+    const best = activeDevices[0];
+    const sourceDeviceName = String(best?.device_name || best?.device_id || "another phone").trim() || "another phone";
+    const classSummary = String(best?.workzone_class_summary || "").trim();
+    const isDetected = !!best?.workzone_found;
+    const state = isDetected ? "detected" : "tracking";
+    latestWorkzoneVisual = {
+      title: isDetected ? "Workzone detected" : "Workzone tracking",
+      message: classSummary
+        ? `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName} (${classSummary}).`
+        : `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName}.`,
+      state,
+      sourceDeviceName,
+      fromSelf: String(best?.device_id || "").trim() === runConfig.device_id,
+      score: Number(best?.workzone_score),
+      scoreThreshold: Number(best?.workzone_score_threshold),
+      maxConfidence: Number(best?.workzone_max_confidence),
+      detectionCount: Math.max(0, Number(best?.workzone_detection_count || 0)),
+      classSummary,
+      frameToAlertMs: Number(best?.workzone_alert_latency_ms),
+      frameToResultMs: Number(best?.workzone_pipeline_latency_ms),
+      queueWaitMs: Number(best?.workzone_queue_wait_ms),
+      dispatchToResultMs: Number(best?.workzone_dispatch_latency_ms),
+      inferenceMs: Number(best?.workzone_inference_ms),
+      sourceRttMs: Number(best?.rtt_ms),
+      approxPhoneReceiveMs: NaN,
+      updatedAtMs: Number(best?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now()),
       receivedAtMs: Date.now()
     };
   }
@@ -961,18 +1192,96 @@
     return anyEnglish || list[0] || null;
   }
 
+  async function waitForWorkzoneVoices(timeoutMs = 2200) {
+    const synth = window.speechSynthesis;
+    if (!synth || typeof synth.getVoices !== "function") return [];
+    const existing = synth.getVoices() || [];
+    if (existing.length) return existing;
+    if (workzoneVoiceWaitInFlight) return workzoneVoiceWaitInFlight;
+
+    workzoneVoiceWaitInFlight = new Promise((resolve) => {
+      let settled = false;
+      const finish = (voices) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        try { synth.removeEventListener?.("voiceschanged", handleVoicesChanged); } catch {}
+        resolve(Array.isArray(voices) ? voices : []);
+      };
+      const handleVoicesChanged = () => {
+        const next = synth.getVoices() || [];
+        if (next.length) finish(next);
+      };
+      const timeoutId = setTimeout(() => finish(synth.getVoices() || []), Math.max(300, Number(timeoutMs) || 2200));
+      try { synth.addEventListener?.("voiceschanged", handleVoicesChanged); } catch {}
+      handleVoicesChanged();
+    }).finally(() => {
+      workzoneVoiceWaitInFlight = null;
+    });
+
+    return workzoneVoiceWaitInFlight;
+  }
+
+  async function primeWorkzoneSpeechSynthesis() {
+    if (workzoneSpeechPrimed) return true;
+    if (workzoneSpeechPrimeInFlight) return workzoneSpeechPrimeInFlight;
+    const synth = window.speechSynthesis;
+    const Utterance = window.SpeechSynthesisUtterance;
+    if (!synth || typeof Utterance !== "function") return false;
+
+    workzoneSpeechPrimeInFlight = (async () => {
+      syncPhoneAudioSession({ preferAlertPlayback: true });
+      try {
+        const voices = await waitForWorkzoneVoices();
+        const utterance = new Utterance(".");
+        utterance.lang = "en-US";
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.volume = 0;
+        const voice = pickWorkzoneAlertVoice(voices);
+        if (voice) utterance.voice = voice;
+        try { synth.cancel(); } catch {}
+        const primed = await new Promise((resolve) => {
+          let settled = false;
+          const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeoutId);
+            resolve(value);
+          };
+          const timeoutId = setTimeout(() => finish(false), 1400);
+          utterance.onstart = () => finish(true);
+          utterance.onend = () => finish(true);
+          utterance.onerror = () => finish(false);
+          synth.speak(utterance);
+        });
+        if (primed) workzoneSpeechPrimed = true;
+        return primed;
+      } catch {
+        return false;
+      } finally {
+        workzoneSpeechPrimeInFlight = null;
+      }
+    })();
+
+    return workzoneSpeechPrimeInFlight;
+  }
+
   async function speakWorkzoneDetectedVoice(text = "Workzone detected") {
     syncPhoneAudioSession({ preferAlertPlayback: true });
     const synth = window.speechSynthesis;
     const Utterance = window.SpeechSynthesisUtterance;
     if (!synth || typeof Utterance !== "function") return false;
-    try {
+    const voices = await waitForWorkzoneVoices();
+    await primeWorkzoneSpeechSynthesis();
+
+    const speakOnce = async () => {
       const utterance = new Utterance(String(text || "Workzone detected").trim() || "Workzone detected");
       utterance.lang = "en-US";
       utterance.rate = 0.96;
       utterance.pitch = 1.02;
       utterance.volume = 1;
-      const voice = pickWorkzoneAlertVoice(synth.getVoices?.() || []);
+      const voice = pickWorkzoneAlertVoice(voices.length ? voices : (synth.getVoices?.() || []));
       if (voice) utterance.voice = voice;
       synth.cancel();
       return await new Promise((resolve) => {
@@ -983,12 +1292,20 @@
           clearTimeout(timeoutId);
           resolve(value);
         };
-        const timeoutId = setTimeout(() => finish(false), 1200);
+        const timeoutId = setTimeout(() => finish(false), 2200);
         utterance.onstart = () => finish(true);
         utterance.onerror = () => finish(false);
         utterance.onend = () => finish(true);
         synth.speak(utterance);
       });
+    };
+
+    try {
+      const first = await speakOnce();
+      if (first) return true;
+      try { synth.cancel(); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return await speakOnce();
     } catch {}
     return false;
   }
@@ -1036,21 +1353,28 @@
 
   async function playWorkzoneAnnouncement({ interactive = false, announcementText = "Workzone detected" } = {}) {
     syncPhoneAudioSession({ preferAlertPlayback: true });
-    const spoken = await speakWorkzoneDetectedVoice(announcementText);
-    if (spoken) return { played: true, mode: "speech" };
     const toned = await playWorkzoneTone({ allowThrottle: false, interactive });
-    return { played: toned, mode: toned ? "tone" : "none" };
+    if (toned) {
+      setTimeout(() => {
+        void speakWorkzoneDetectedVoice(announcementText);
+      }, 120);
+      return { played: true, mode: "tone" };
+    }
+    const spoken = await speakWorkzoneDetectedVoice(announcementText);
+    return { played: spoken, mode: spoken ? "speech" : "none" };
   }
 
   async function replayPendingAlertIfPossible() {
     if (!pendingAlertReplay) return;
     const pending = pendingAlertReplay;
-    if (Date.now() - pending.queuedAtMs > 15000) {
+    if (Date.now() > Number(pending.expiresAtMs || 0)) {
       pendingAlertReplay = null;
+      clearPendingAlertReplaySchedule();
       return;
     }
     let played = false;
     if (pending.kind === "workzone_detected") {
+      pending.attempts = Number(pending.attempts || 0) + 1;
       const result = await playWorkzoneAnnouncement({
         interactive: true,
         announcementText: pending.announcementText || buildWorkzoneAnnouncementText(pending.sourceDeviceName)
@@ -1061,8 +1385,12 @@
       if (!ready) return;
       played = await playAlertTone({ allowThrottle: false, interactive: true });
     }
-    if (!played) return;
+    if (!played) {
+      schedulePendingAlertReplay();
+      return;
+    }
     pendingAlertReplay = null;
+    clearPendingAlertReplaySchedule();
     if (pending.kind === "permission_refresh") {
       setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
       return;
@@ -1147,7 +1475,7 @@
     scheduleAlertCooldownRefresh();
     const result = await playWorkzoneAnnouncement({
       interactive: true,
-      announcementText: buildWorkzoneAnnouncementText(runConfig.device_id)
+      announcementText: buildWorkzoneAnnouncementText(authState?.deviceName || runConfig.device_id)
     });
     if (result.played) suppressSelfWorkzonePlaybackUntilMs = Date.now() + 4000;
     else suppressSelfWorkzonePlaybackUntilMs = 0;
@@ -1177,13 +1505,25 @@
     }
     const shouldPlayHaptics = kind === "permission_refresh" || (!fromSelf && kind !== "workzone_detected");
     if (shouldPlayHaptics) playAlertHaptics();
-    const workzoneAnnouncementText = buildWorkzoneAnnouncementText(sourceDeviceName);
-    const played = kind === "workzone_detected"
+    const workzoneAnnouncementEvent = kind === "workzone_detected"
+      ? buildWorkzoneAnnouncementEvent({
+          sourceDeviceId,
+          sourceDeviceName,
+          updatedAtMs: Date.parse(String(msg?.workzone?.updated_at || "")) || Number(msg?.t_server_ms || 0) || Date.now(),
+          detectionCount: Number(msg?.workzone?.detection_count || 0),
+          score: Number(msg?.workzone?.score),
+          classSummary: summarizeWorkzoneClassCounts(msg?.workzone?.class_counts || {}) || String(msg?.workzone?.class_summary || "").trim()
+        })
+      : null;
+    const workzoneAnnouncementText = workzoneAnnouncementEvent?.announcementText || buildWorkzoneAnnouncementText(sourceDeviceName);
+    const workzonePlayback = kind === "workzone_detected"
       ? ((fromSelf && Date.now() < suppressSelfWorkzonePlaybackUntilMs)
-        ? true
-        : (await playWorkzoneAnnouncement({ announcementText: workzoneAnnouncementText })).played)
-      : await playAlertTone();
-    if (played) pendingAlertReplay = null;
+        ? { played: true, mode: "suppressed", deduped: false }
+        : await playDedupedWorkzoneAnnouncement(workzoneAnnouncementEvent || { sourceDeviceId, sourceDeviceName }))
+      : { played: await playAlertTone(), mode: "tone", deduped: false };
+    const played = !!workzonePlayback.played;
+    if (played && workzonePlayback.mode !== "pending") pendingAlertReplay = null;
+    if (kind === "workzone_detected" && workzonePlayback.mode === "pending") return;
     if (kind === "permission_refresh") {
       const title = String(msg.title || "Enable access").trim() || "Enable access";
       const message = String(msg.message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.").trim();
@@ -1206,7 +1546,7 @@
       if (fromSelf) {
         if (!played) {
           queuePendingAlertReplay(sourceDeviceName, kind, workzoneAnnouncementText);
-          setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}. Tap once anywhere on this phone if Safari kept speech blocked; it will replay automatically.`, "warning", 5200);
+          setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}. If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
           return;
         }
         setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
@@ -1217,7 +1557,7 @@
         return;
       }
       queuePendingAlertReplay(sourceDeviceName, kind, workzoneAnnouncementText);
-      setAlertFeedback(`${message} Tap once anywhere on this phone if Safari kept sound blocked; it will replay automatically.`, "warning", 5200);
+      setAlertFeedback(`${message} If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
       return;
     }
     if (fromSelf) {
@@ -1429,15 +1769,23 @@
     const scoreThreshold = Number(latestWorkzoneVisual.scoreThreshold);
     const maxConfidence = Number(latestWorkzoneVisual.maxConfidence);
     const detectionCount = Number(latestWorkzoneVisual.detectionCount);
-    const tone = latestWorkzoneVisual.fromSelf ? "self" : "detected";
+    const frameToAlertMs = Number(latestWorkzoneVisual.frameToAlertMs);
+    const queueWaitMs = Number(latestWorkzoneVisual.queueWaitMs);
+    const inferenceMs = Number(latestWorkzoneVisual.inferenceMs);
+    const approxPhoneReceiveMs = Number(latestWorkzoneVisual.approxPhoneReceiveMs);
+    const sourceRttMs = Number(latestWorkzoneVisual.sourceRttMs);
+    const state = String(latestWorkzoneVisual.state || "detected").toLowerCase();
+    const tone = state === "tracking" ? "tracking" : "detected";
     phoneWorkzoneCard.hidden = false;
     phoneWorkzoneCard.className = `card phone-workzone-card is-${tone}`;
     phoneWorkzoneTitle.textContent = latestWorkzoneVisual.title;
     phoneWorkzoneBadge.className = `phone-workzone-badge ${tone}`;
-    phoneWorkzoneBadge.textContent = latestWorkzoneVisual.fromSelf ? "Sent" : "Detected";
+    phoneWorkzoneBadge.textContent = state === "tracking" ? "Tracking" : "Detected";
     phoneWorkzoneMessage.textContent = latestWorkzoneVisual.message;
     phoneWorkzoneMeta.textContent = [
-      `Source ${latestWorkzoneVisual.sourceDeviceName}`,
+      latestWorkzoneVisual.fromSelf
+        ? `Source ${latestWorkzoneVisual.sourceDeviceName} (this phone)`
+        : `Source ${latestWorkzoneVisual.sourceDeviceName}`,
       ageLabel || "",
       latestWorkzoneVisual.classSummary || ""
     ].filter(Boolean).join(" • ");
@@ -1450,6 +1798,21 @@
     }
     if (Number.isFinite(detectionCount)) {
       metrics.push({ label: "Detections", value: String(Math.max(0, detectionCount)) });
+    }
+    if (Number.isFinite(frameToAlertMs)) {
+      metrics.push({ label: "Frame->Alert", value: formatLatencyMs(frameToAlertMs) });
+    }
+    if (Number.isFinite(queueWaitMs)) {
+      metrics.push({ label: "Queue", value: formatLatencyMs(queueWaitMs) });
+    }
+    if (Number.isFinite(inferenceMs)) {
+      metrics.push({ label: "Infer", value: formatLatencyMs(inferenceMs) });
+    }
+    if (Number.isFinite(approxPhoneReceiveMs)) {
+      metrics.push({ label: "Phone RX", value: formatLatencyMs(approxPhoneReceiveMs, { approximate: true }) });
+    }
+    if (Number.isFinite(sourceRttMs)) {
+      metrics.push({ label: "RTT", value: formatLatencyMs(sourceRttMs) });
     }
     phoneWorkzoneMetrics.innerHTML = metrics
       .map((metric) => `
@@ -2631,6 +2994,22 @@ function mergeRunConfig(input) {
         recording: !!device?.recording,
         motion_state: String(device?.motion_state || "").trim(),
         camera_preview_live: !!device?.camera_preview_live,
+        workzone_active: !!device?.workzone_active,
+        workzone_found: !!device?.workzone_found,
+        workzone_tracking: !!device?.workzone_tracking,
+        workzone_status: String(device?.workzone_status || "").trim(),
+        workzone_score: Number(device?.workzone_score),
+        workzone_score_threshold: Number(device?.workzone_score_threshold),
+        workzone_max_confidence: Number(device?.workzone_max_confidence),
+        workzone_detection_count: Math.max(0, Number(device?.workzone_detection_count || 0)),
+        workzone_class_summary: String(device?.workzone_class_summary || "").trim(),
+        workzone_updated_at_ms: Number(device?.workzone_updated_at_ms || 0),
+        workzone_alert_latency_ms: Number(device?.workzone_alert_latency_ms),
+        workzone_queue_wait_ms: Number(device?.workzone_queue_wait_ms),
+        workzone_dispatch_latency_ms: Number(device?.workzone_dispatch_latency_ms),
+        workzone_pipeline_latency_ms: Number(device?.workzone_pipeline_latency_ms),
+        workzone_inference_ms: Number(device?.workzone_inference_ms),
+        rtt_ms: Number(device?.rtt_ms),
         gps_latest: device?.gps_latest && typeof device.gps_latest === "object"
           ? {
               t_recv_ms: Number(device.gps_latest.t_recv_ms || 0),
