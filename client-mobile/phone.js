@@ -135,6 +135,7 @@
   let alertCooldownTimer = null;
   let lastAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
+  let lastWorkzoneAlertPlayedAtMs = 0;
   let pendingAlertReplay = null;
   let suppressSelfWorkzonePlaybackUntilMs = 0;
   let suppressSelfGenericAlertUntilMs = 0;
@@ -176,9 +177,12 @@
     clearPermissionRefreshNotice();
   });
   document.addEventListener("pointerdown", () => {
+    void primeAlertAudioWithOptions({ interactive: true });
+    try { window.speechSynthesis?.getVoices?.(); } catch {}
     void replayPendingAlertIfPossible();
   }, { passive: true });
   document.addEventListener("keydown", (event) => {
+    void primeAlertAudioWithOptions({ interactive: true });
     if (!pendingAlertReplay) return;
     if (event.key !== "Enter" && event.key !== " ") return;
     void replayPendingAlertIfPossible();
@@ -936,10 +940,53 @@
     return false;
   }
 
+  async function playWorkzoneTone({ allowThrottle = true, interactive = false } = {}) {
+    const nowMs = Date.now();
+    if (allowThrottle && nowMs - lastWorkzoneAlertPlayedAtMs < 800) return true;
+    const ready = await primeAlertAudioWithOptions({ interactive });
+    if (!ready || !alertAudioCtx) return false;
+    lastWorkzoneAlertPlayedAtMs = nowMs;
+    const pattern = [
+      { delay: 0, duration: 0.18, freq: 659, accentFreq: 988, gain: 0.08 },
+      { delay: 0.24, duration: 0.2, freq: 784, accentFreq: 1174, gain: 0.09 },
+      { delay: 0.5, duration: 0.28, freq: 1046, accentFreq: 1568, gain: 0.11 }
+    ];
+    const startedAt = alertAudioCtx.currentTime + 0.02;
+    for (const step of pattern) {
+      const osc = alertAudioCtx.createOscillator();
+      const accentOsc = alertAudioCtx.createOscillator();
+      const gain = alertAudioCtx.createGain();
+      const t0 = startedAt + step.delay;
+      const t1 = t0 + step.duration;
+      osc.type = "sine";
+      accentOsc.type = "triangle";
+      osc.frequency.setValueAtTime(step.freq, t0);
+      accentOsc.frequency.setValueAtTime(step.accentFreq, t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(step.gain, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t1);
+      osc.connect(gain);
+      accentOsc.connect(gain);
+      gain.connect(alertAudioMasterGain || alertAudioCtx.destination);
+      osc.start(t0);
+      accentOsc.start(t0);
+      osc.stop(t1 + 0.03);
+      accentOsc.stop(t1 + 0.03);
+      osc.onended = () => {
+        try { osc.disconnect(); } catch {}
+        try { accentOsc.disconnect(); } catch {}
+        try { gain.disconnect(); } catch {}
+      };
+    }
+    return true;
+  }
+
   async function playWorkzoneAnnouncement({ interactive = false } = {}) {
     syncPhoneAudioSession({ preferAlertPlayback: true });
     const spoken = await speakWorkzoneDetectedVoice();
-    return { played: spoken, mode: spoken ? "speech" : "none" };
+    if (spoken) return { played: true, mode: "speech" };
+    const toned = await playWorkzoneTone({ allowThrottle: false, interactive });
+    return { played: toned, mode: toned ? "tone" : "none" };
   }
 
   async function replayPendingAlertIfPossible() {
@@ -1045,7 +1092,7 @@
     const result = await playWorkzoneAnnouncement({ interactive: true });
     if (result.played) suppressSelfWorkzonePlaybackUntilMs = Date.now() + 4000;
     else suppressSelfWorkzonePlaybackUntilMs = 0;
-    setAlertFeedback("Sending workzone alert...", result.mode === "speech" ? "success" : "muted", 1400);
+    setAlertFeedback("Sending workzone alert...", result.played ? "success" : "muted", 1400);
     queueJson({
       type: "fleet_alert",
       device_id: runConfig.device_id,
