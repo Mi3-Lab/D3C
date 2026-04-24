@@ -4358,6 +4358,199 @@ body {
   touch-action: manipulation;
 }
 
+.phone-car-view-btn {
+  width: 100%;
+  min-height: 44px;
+  touch-action: manipulation;
+}
+
+.phone-car-view-active {
+  overflow: hidden;
+}
+
+.phone-car-view {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+.phone-car-view[hidden] {
+  display: none !important;
+}
+
+.phone-car-view-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+.phone-car-view-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+}
+
+.phone-car-view-shade {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.42), rgba(0, 0, 0, 0.06) 32%, rgba(0, 0, 0, 0.10) 72%, rgba(0, 0, 0, 0.42));
+}
+
+.phone-car-view-hud {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  min-height: clamp(76px, 14vh, 110px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: clamp(12px, 3vw, 28px);
+  padding: max(12px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) 12px max(18px, env(safe-area-inset-left));
+  border-bottom: 2px solid rgba(255, 255, 255, 0.22);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
+}
+
+.phone-car-view-hud.is-out {
+  background: linear-gradient(90deg, rgba(21, 126, 78, 0.96), rgba(25, 84, 64, 0.90));
+}
+
+.phone-car-view-hud.is-approaching {
+  background: linear-gradient(90deg, rgba(210, 126, 20, 0.98), rgba(143, 83, 20, 0.90));
+}
+
+.phone-car-view-hud.is-inside {
+  background: linear-gradient(90deg, rgba(194, 42, 42, 0.98), rgba(119, 24, 32, 0.92));
+}
+
+.phone-car-view-hud.is-exiting {
+  background: linear-gradient(90deg, rgba(151, 58, 182, 0.98), rgba(82, 45, 150, 0.92));
+}
+
+.phone-car-view-hud-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.phone-car-view-state {
+  font-size: clamp(28px, 6.2vw, 62px);
+  font-weight: 900;
+  line-height: 0.95;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: 0 2px 16px rgba(0, 0, 0, 0.38);
+}
+
+.phone-car-view-detail {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.94);
+  font-size: clamp(13px, 2vw, 20px);
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.phone-car-view-meta {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: clamp(10px, 1.45vw, 14px);
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.phone-car-view-side {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.phone-car-view-score {
+  min-width: 118px;
+  padding: 9px 12px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.30);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.94);
+  font-size: clamp(11px, 1.4vw, 15px);
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.phone-car-view-exit {
+  min-width: 74px;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.30);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.46);
+  color: #fff;
+  font: inherit;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.phone-car-view-camera-state {
+  position: absolute;
+  left: 50%;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.62);
+  color: rgba(255, 255, 255, 0.90);
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+@media (orientation: portrait) {
+  .phone-car-view-stage {
+    top: 50%;
+    left: 50%;
+    right: auto;
+    bottom: auto;
+    width: 100vh;
+    height: 100vw;
+    transform: translate(-50%, -50%) rotate(90deg);
+    transform-origin: center;
+  }
+}
+
+@media (orientation: landscape) {
+  .phone-car-view-stage {
+    transform: none;
+  }
+}
+
+@media (max-width: 760px) and (orientation: landscape) {
+  .phone-car-view-hud {
+    min-height: 72px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    padding-bottom: 8px;
+  }
+
+  .phone-car-view-score {
+    min-width: 96px;
+  }
+}
+
 .waiting-state {
   border-radius: 16px;
   padding: 16px;

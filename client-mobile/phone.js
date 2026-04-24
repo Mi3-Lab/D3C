@@ -7,6 +7,16 @@
   const joinValidation = document.getElementById("joinValidation");
   const joinStatus = document.getElementById("joinStatus");
   const previewEl = document.getElementById("preview");
+  let carViewOverlayEl = null;
+  let carViewVideoEl = null;
+  let carViewHudEl = null;
+  let carViewStateEl = null;
+  let carViewScoreEl = null;
+  let carViewMetaEl = null;
+  let carViewDetailEl = null;
+  let carViewCameraStateEl = null;
+  let carViewActive = false;
+  let carViewStatusTimer = null;
   const deviceIdentityCard = document.getElementById("deviceIdentityCard");
   const deviceIdentityName = document.getElementById("deviceIdentityName");
   const deviceIdentityType = document.getElementById("deviceIdentityType");
@@ -219,6 +229,11 @@
     void unlockVoiceAlertsFromGesture();
     if (!pendingAlertReplay) return;
     void replayPendingAlertIfPossible();
+  });
+  document.addEventListener("fullscreenchange", handleCarViewFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleCarViewFullscreenChange);
+  window.addEventListener("resize", () => {
+    if (carViewActive) renderCarViewHud();
   });
 
   cameraFlipBtn?.addEventListener("click", async () => {
@@ -1042,6 +1057,10 @@
     schedulePendingAlertReplay();
   }
 
+  function isWorkzoneReplayKind(kind = "") {
+    return String(kind || "").trim().startsWith("workzone_");
+  }
+
   function pruneRecentFleetAlertIds(now = Date.now()) {
     for (const [alertId, ts] of recentFleetAlertIds.entries()) {
       if ((now - Number(ts || 0)) > 60000) recentFleetAlertIds.delete(alertId);
@@ -1147,6 +1166,7 @@
 
   function buildWorkzoneAnnouncementText(sourceDeviceName = "", { sourceGps = null, isSelf = false } = {}) {
     const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf) return "Workzone detected.";
     if (!isSelf) {
       const direction = buildWorkzoneDirectionPhrase(sourceGps);
       if (direction && cleanName) return `Workzone is ${direction}, detected by ${cleanName}.`;
@@ -1156,10 +1176,20 @@
     return `Workzone detected by ${cleanName}`;
   }
 
-  function buildWorkzoneDetectedMessage(sourceDeviceName = "", { detectionCount = 0, classSummary = "" } = {}) {
+  function buildWorkzoneDetectedMessage(sourceDeviceName = "", { detectionCount = 0, classSummary = "", isSelf = false } = {}) {
     const cleanName = String(sourceDeviceName || "").trim() || "another phone";
     const totalDetections = Math.max(0, Number(detectionCount || 0));
     const summary = String(classSummary || "").trim();
+    if (isSelf) {
+      if (summary && totalDetections > 0) {
+        return `Workzone detected with ${totalDetections} detection${totalDetections === 1 ? "" : "s"} (${summary}).`;
+      }
+      if (totalDetections > 0) {
+        return `Workzone detected with ${totalDetections} detection${totalDetections === 1 ? "" : "s"}.`;
+      }
+      if (summary) return `Workzone detected (${summary}).`;
+      return "Workzone detected.";
+    }
     if (summary && totalDetections > 0) {
       return `Workzone detected by ${cleanName} with ${totalDetections} detection${totalDetections === 1 ? "" : "s"} (${summary}).`;
     }
@@ -1170,6 +1200,18 @@
       return `Workzone detected by ${cleanName} (${summary}).`;
     }
     return `Workzone detected by ${cleanName}.`;
+  }
+
+  function buildWorkzoneExitedAnnouncementText(sourceDeviceName = "", { isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf || !cleanName) return "Exited workzone.";
+    return `Exited workzone, reported by ${cleanName}.`;
+  }
+
+  function buildWorkzoneExitedMessage(sourceDeviceName = "", { isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf || !cleanName) return "Exited workzone.";
+    return `Exited workzone reported by ${cleanName}.`;
   }
 
   function pruneRecentWorkzoneAnnouncementKeys(now = Date.now()) {
@@ -1207,6 +1249,7 @@
       score: cleanScore,
       classSummary: String(classSummary || "").trim(),
       sourceGps: sourceGps || null,
+      isSelf,
       announcementText: buildWorkzoneAnnouncementText(cleanDeviceName, { sourceGps, isSelf }),
       key: [cleanDeviceId || cleanDeviceName, cleanUpdatedAtMs || 0, cleanDetectionCount, cleanScore.toFixed(3)].join("|")
     };
@@ -1221,7 +1264,7 @@
     }
     if (
       pendingAlertReplay
-      && pendingAlertReplay.kind === "workzone_detected"
+      && isWorkzoneReplayKind(pendingAlertReplay.kind)
       && pendingAlertReplay.announcementText === event.announcementText
     ) {
       return { played: true, mode: "pending", deduped: true, event, announcementText: event.announcementText };
@@ -1248,7 +1291,8 @@
     if (result.deduped) return;
     const message = buildWorkzoneDetectedMessage(event.sourceDeviceName, {
       detectionCount: event.detectionCount,
-      classSummary: event.classSummary
+      classSummary: event.classSummary,
+      isSelf: event.isSelf
     });
     if (result.played) {
       setAlertFeedback(message, "warning", 5000);
@@ -1258,13 +1302,42 @@
     setAlertFeedback(`${message} If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
   }
 
+  async function handleWorkzoneOverviewExit(device) {
+    const deviceId = String(device?.device_id || "").trim();
+    const sourceDeviceName = String(device?.device_name || deviceId || "another phone").trim() || "another phone";
+    const isSelf = !!deviceId && deviceId === runConfig.device_id;
+    const updatedAtMs = Number(device?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now());
+    const announcementText = buildWorkzoneExitedAnnouncementText(sourceDeviceName, { isSelf });
+    const key = ["exit", deviceId || sourceDeviceName, updatedAtMs || 0].join("|");
+    const now = Date.now();
+    pruneRecentWorkzoneAnnouncementKeys(now);
+    if (recentWorkzoneAnnouncementKeys.has(key)) return;
+    const result = await playWorkzoneAnnouncement({ announcementText, allowLockedTone: true });
+    if (result.played) {
+      recentWorkzoneAnnouncementKeys.set(key, now);
+      setAlertFeedback(buildWorkzoneExitedMessage(sourceDeviceName, { isSelf }), "success", 4200);
+      return;
+    }
+    queuePendingAlertReplay(sourceDeviceName, "workzone_exited", announcementText);
+    setAlertFeedback(`${buildWorkzoneExitedMessage(sourceDeviceName, { isSelf })} If Safari blocked speech, tap once anywhere on this phone and it will retry the exact phrase.`, "warning", 5600);
+  }
+
   function syncWorkzoneAnnouncementsFromFleetOverview() {
     const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
     const now = Date.now();
     if (!workzoneAlertsEnabled) {
       for (const device of devices) {
         const deviceId = String(device?.device_id || "").trim();
-        if (deviceId) workzoneOverviewStateByDevice.set(deviceId, { detected: !!device?.workzone_found, updatedAtMs: Number(device?.workzone_updated_at_ms || 0) });
+        if (!deviceId) continue;
+        const machineState = normalizeCarViewMachineState(device?.workzone_fused_state, device?.workzone_found ? "detected" : "");
+        workzoneOverviewStateByDevice.set(deviceId, {
+          detected: !!device?.workzone_found,
+          active: !!device?.workzone_active,
+          tracking: !!device?.workzone_tracking,
+          machineState,
+          updatedAtMs: Number(device?.workzone_updated_at_ms || 0),
+          exitAnnouncedAtMs: Number(workzoneOverviewStateByDevice.get(deviceId)?.exitAnnouncedAtMs || 0)
+        });
       }
       workzoneOverviewBaselineReady = true;
       return;
@@ -1275,18 +1348,36 @@
       if (!deviceId) continue;
       seen.add(deviceId);
       const nextDetected = !!device?.workzone_found;
+      const nextActive = !!device?.workzone_active;
+      const nextTracking = !!device?.workzone_tracking;
+      const nextMachineState = normalizeCarViewMachineState(device?.workzone_fused_state, nextDetected ? "detected" : (nextTracking ? "tracking" : ""));
       const nextUpdatedAtMs = Number(device?.workzone_updated_at_ms || 0);
       const prev = workzoneOverviewStateByDevice.get(deviceId) || null;
       const hasFreshTimestamp = nextUpdatedAtMs > 0 && Math.abs(now - nextUpdatedAtMs) <= 12000;
+      const prevMachineState = normalizeCarViewMachineState(prev?.machineState, prev?.detected ? "detected" : "");
+      const prevWasInWorkzone = workzoneMachineStateRank(prevMachineState) > 0;
+      const nextIsOut = nextMachineState === "OUT" && !nextDetected;
+      const exitCooldownReady = !prev?.exitAnnouncedAtMs || (now - Number(prev.exitAnnouncedAtMs || 0)) > 15000;
       const shouldAnnounce = nextDetected && (
         (!workzoneOverviewBaselineReady && deviceId === runConfig.device_id && hasFreshTimestamp)
         || (workzoneOverviewBaselineReady && !prev?.detected && (hasFreshTimestamp || nextUpdatedAtMs <= 0))
       );
+      const shouldAnnounceExit = workzoneOverviewBaselineReady
+        && deviceId === runConfig.device_id
+        && prevWasInWorkzone
+        && nextIsOut
+        && hasFreshTimestamp
+        && exitCooldownReady;
       workzoneOverviewStateByDevice.set(deviceId, {
         detected: nextDetected,
-        updatedAtMs: nextUpdatedAtMs
+        active: nextActive,
+        tracking: nextTracking,
+        machineState: nextMachineState,
+        updatedAtMs: nextUpdatedAtMs,
+        exitAnnouncedAtMs: shouldAnnounceExit ? now : Number(prev?.exitAnnouncedAtMs || 0)
       });
       if (shouldAnnounce) void handleWorkzoneOverviewDetection(device);
+      if (shouldAnnounceExit) void handleWorkzoneOverviewExit(device);
     }
     for (const deviceId of [...workzoneOverviewStateByDevice.keys()]) {
       if (!seen.has(deviceId)) workzoneOverviewStateByDevice.delete(deviceId);
@@ -1325,16 +1416,28 @@
     return `${prefix}${sec.toFixed(1)} s`;
   }
 
+  function workzoneMachineStateRank(value) {
+    const state = normalizeCarViewMachineState(value);
+    if (state === "INSIDE") return 4;
+    if (state === "APPROACHING") return 3;
+    if (state === "EXITING") return 2;
+    return 0;
+  }
+
   function updateLatestWorkzoneVisual(msg, { fromSelf = false } = {}) {
     const workzone = msg?.workzone && typeof msg.workzone === "object" ? msg.workzone : {};
     const latency = workzone?.latency && typeof workzone.latency === "object" ? workzone.latency : {};
     const classSummary = summarizeWorkzoneClassCounts(workzone.class_counts || {});
     const receivedAtMs = Date.now();
+    const sourceName = String(msg?.source_device_name || msg?.source_device_id || "another phone").trim() || "another phone";
     latestWorkzoneVisual = {
       title: String(msg?.title || "Workzone detected").trim() || "Workzone detected",
-      message: String(msg?.message || "").trim() || `Workzone detected by ${String(msg?.source_device_name || msg?.source_device_id || "another phone").trim()}.`,
+      message: fromSelf
+        ? "Workzone detected."
+        : (String(msg?.message || "").trim() || `Workzone detected by ${sourceName}.`),
       state: "detected",
-      sourceDeviceName: String(msg?.source_device_name || msg?.source_device_id || "another phone").trim() || "another phone",
+      fusedState: String(workzone.state || workzone.fused_state || "INSIDE").trim().toUpperCase() || "INSIDE",
+      sourceDeviceName: sourceName,
       fromSelf: !!fromSelf,
       score: Number(workzone.score),
       scoreThreshold: Number(workzone.score_threshold),
@@ -1357,10 +1460,18 @@
   function reconcileLatestWorkzoneVisualFromFleetOverview() {
     const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
     const activeDevices = devices
-      .filter((device) => !!device?.workzone_found || !!device?.workzone_tracking || !!device?.workzone_active)
+      .filter((device) => (
+        !!device?.workzone_found
+        || !!device?.workzone_tracking
+        || !!device?.workzone_active
+        || workzoneMachineStateRank(device?.workzone_fused_state) > 0
+      ))
       .sort((a, b) => {
-        const rankA = (a?.workzone_found ? 2 : (a?.workzone_tracking ? 1 : 0));
-        const rankB = (b?.workzone_found ? 2 : (b?.workzone_tracking ? 1 : 0));
+        const stateRankA = workzoneMachineStateRank(a?.workzone_fused_state);
+        const stateRankB = workzoneMachineStateRank(b?.workzone_fused_state);
+        if (stateRankA !== stateRankB) return stateRankB - stateRankA;
+        const rankA = (a?.workzone_active ? 3 : (a?.workzone_found ? 2 : (a?.workzone_tracking ? 1 : 0)));
+        const rankB = (b?.workzone_active ? 3 : (b?.workzone_found ? 2 : (b?.workzone_tracking ? 1 : 0)));
         if (rankA !== rankB) return rankB - rankA;
         const scoreDiff = Number(b?.workzone_score || 0) - Number(a?.workzone_score || 0);
         if (Math.abs(scoreDiff) > 1e-9) return scoreDiff;
@@ -1375,7 +1486,9 @@
     const best = activeDevices[0];
     const sourceDeviceName = String(best?.device_name || best?.device_id || "another phone").trim() || "another phone";
     const classSummary = String(best?.workzone_class_summary || "").trim();
-    const isDetected = !!best?.workzone_found;
+    const rawDetected = !!best?.workzone_found;
+    const fusedState = String(best?.workzone_fused_state || "").trim().toUpperCase() || (rawDetected ? "INSIDE" : "APPROACHING");
+    const isDetected = rawDetected || fusedState === "INSIDE";
     const state = isDetected ? "detected" : "tracking";
     latestWorkzoneVisual = {
       title: isDetected ? "Workzone detected" : "Workzone tracking",
@@ -1383,6 +1496,7 @@
         ? `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName} (${classSummary}).`
         : `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName}.`,
       state,
+      fusedState,
       sourceDeviceName,
       fromSelf: String(best?.device_id || "").trim() === runConfig.device_id,
       score: Number(best?.workzone_score),
@@ -1636,9 +1750,13 @@
     return true;
   }
 
-  async function playWorkzoneAnnouncement({ interactive = false, announcementText = "Workzone detected" } = {}) {
+  async function playWorkzoneAnnouncement({ interactive = false, announcementText = "Workzone detected", allowLockedTone = false } = {}) {
     syncPhoneAudioSession({ preferAlertPlayback: true });
     if (!interactive && !workzoneSpeechPrimed) {
+      if (allowLockedTone) {
+        const toned = await playWorkzoneTone({ allowThrottle: false, interactive: false });
+        return { played: toned, mode: toned ? "tone_locked" : "voice_locked" };
+      }
       return { played: false, mode: "voice_locked" };
     }
     // Prime the AudioContext and resume all contexts before attempting TTS.
@@ -1683,7 +1801,7 @@
       return;
     }
     let played = false;
-    if (pending.kind === "workzone_detected") {
+    if (isWorkzoneReplayKind(pending.kind)) {
       pending.attempts = Number(pending.attempts || 0) + 1;
       const result = await playWorkzoneAnnouncement({
         interactive: true,
@@ -1892,7 +2010,9 @@
     }
     if (kind === "workzone_detected") {
       const title = String(msg.title || "Workzone detected").trim() || "Workzone detected";
-      const message = String(msg.message || `Workzone detected by ${sourceDeviceName}.`).trim();
+      const message = fromSelf
+        ? "Workzone detected."
+        : String(msg.message || `Workzone detected by ${sourceDeviceName}.`).trim();
       if (fromSelf) {
         if (!played) {
           queuePendingAlertReplay(sourceDeviceName, kind, workzoneAnnouncementText);
@@ -2102,6 +2222,257 @@
     } catch {}
   }
 
+  function getFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  async function requestCarViewFullscreen() {
+    if (!carViewOverlayEl) return false;
+    try {
+      if (typeof carViewOverlayEl.requestFullscreen === "function") {
+        await carViewOverlayEl.requestFullscreen({ navigationUI: "hide" });
+        return true;
+      }
+      if (typeof carViewOverlayEl.webkitRequestFullscreen === "function") {
+        carViewOverlayEl.webkitRequestFullscreen();
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  async function exitCarViewFullscreen() {
+    try {
+      if (!getFullscreenElement()) return;
+      if (typeof document.exitFullscreen === "function") {
+        await document.exitFullscreen();
+        return;
+      }
+      if (typeof document.webkitExitFullscreen === "function") {
+        document.webkitExitFullscreen();
+      }
+    } catch {}
+  }
+
+  async function lockCarViewOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.lock === "function") {
+        await screen.orientation.lock("landscape");
+      }
+    } catch {}
+  }
+
+  function unlockCarViewOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.unlock === "function") {
+        screen.orientation.unlock();
+      }
+    } catch {}
+  }
+
+  function ensureCarViewOverlay() {
+    if (carViewOverlayEl) return carViewOverlayEl;
+    const overlay = document.createElement("div");
+    overlay.className = "phone-car-view";
+    overlay.hidden = true;
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-label", "Car view");
+
+    const stage = document.createElement("div");
+    stage.className = "phone-car-view-stage";
+
+    const video = document.createElement("video");
+    video.className = "phone-car-view-video";
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "true");
+
+    const shade = document.createElement("div");
+    shade.className = "phone-car-view-shade";
+    shade.setAttribute("aria-hidden", "true");
+
+    const hud = document.createElement("div");
+    hud.className = "phone-car-view-hud is-out";
+
+    const hudCopy = document.createElement("div");
+    hudCopy.className = "phone-car-view-hud-copy";
+
+    const state = document.createElement("div");
+    state.className = "phone-car-view-state";
+    state.textContent = "OUTSIDE";
+
+    const detail = document.createElement("div");
+    detail.className = "phone-car-view-detail";
+    detail.textContent = "No active WorkZone detection";
+
+    const meta = document.createElement("div");
+    meta.className = "phone-car-view-meta mono";
+    meta.textContent = "Camera waiting";
+
+    hudCopy.append(state, detail, meta);
+
+    const hudSide = document.createElement("div");
+    hudSide.className = "phone-car-view-side";
+
+    const score = document.createElement("div");
+    score.className = "phone-car-view-score mono";
+    score.textContent = "Score --";
+
+    const exitBtn = document.createElement("button");
+    exitBtn.type = "button";
+    exitBtn.className = "phone-car-view-exit";
+    exitBtn.textContent = "Exit";
+    exitBtn.addEventListener("click", () => { void exitCarView(); });
+
+    hudSide.append(score, exitBtn);
+    hud.append(hudCopy, hudSide);
+
+    const cameraState = document.createElement("div");
+    cameraState.className = "phone-car-view-camera-state";
+    cameraState.textContent = "Camera waiting for dashboard stream";
+
+    stage.append(video, shade, hud, cameraState);
+    overlay.appendChild(stage);
+    document.body.appendChild(overlay);
+
+    carViewOverlayEl = overlay;
+    carViewVideoEl = video;
+    carViewHudEl = hud;
+    carViewStateEl = state;
+    carViewScoreEl = score;
+    carViewMetaEl = meta;
+    carViewDetailEl = detail;
+    carViewCameraStateEl = cameraState;
+    return overlay;
+  }
+
+  function syncCarViewVideo() {
+    if (!carViewVideoEl) return;
+    const nextStream = cameraStream || null;
+    if (carViewVideoEl.srcObject !== nextStream) {
+      carViewVideoEl.srcObject = nextStream;
+    }
+    if (nextStream) {
+      try { void carViewVideoEl.play?.(); } catch {}
+    }
+  }
+
+  async function enterCarView() {
+    if (carViewActive) return;
+    ensureCarViewOverlay();
+    carViewActive = true;
+    if (carViewOverlayEl) carViewOverlayEl.hidden = false;
+    document.body.classList.add("phone-car-view-active");
+    syncCarViewVideo();
+    renderCarViewHud();
+    if (carViewStatusTimer) clearInterval(carViewStatusTimer);
+    carViewStatusTimer = setInterval(renderCarViewHud, 500);
+    renderPrimaryAction();
+    const fullscreenPromise = requestCarViewFullscreen();
+    const fullscreenStarted = await fullscreenPromise;
+    if (fullscreenStarted) await lockCarViewOrientation();
+    try { await requestWakeLock(); } catch {}
+  }
+
+  async function exitCarView({ skipFullscreenExit = false } = {}) {
+    if (!carViewActive && !carViewOverlayEl) return;
+    carViewActive = false;
+    if (carViewStatusTimer) {
+      clearInterval(carViewStatusTimer);
+      carViewStatusTimer = null;
+    }
+    unlockCarViewOrientation();
+    if (!skipFullscreenExit) await exitCarViewFullscreen();
+    if (carViewVideoEl) {
+      try { carViewVideoEl.pause?.(); } catch {}
+      carViewVideoEl.srcObject = null;
+    }
+    if (carViewOverlayEl) carViewOverlayEl.hidden = true;
+    document.body.classList.remove("phone-car-view-active");
+    renderPrimaryAction();
+  }
+
+  function handleCarViewFullscreenChange() {
+    if (!carViewActive || !carViewOverlayEl) return;
+    const activeFullscreen = getFullscreenElement();
+    if (!activeFullscreen) {
+      void exitCarView({ skipFullscreenExit: true });
+    }
+  }
+
+  function normalizeCarViewMachineState(value, fallback = "") {
+    const state = String(value || "").trim().toUpperCase();
+    if (state === "OUT" || state === "APPROACHING" || state === "INSIDE" || state === "EXITING") return state;
+    const fallbackState = String(fallback || "").trim().toLowerCase();
+    if (fallbackState === "detected") return "INSIDE";
+    if (fallbackState === "tracking") return "APPROACHING";
+    return "OUT";
+  }
+
+  function resolveCarViewTone(machineState) {
+    if (machineState === "INSIDE") return "inside";
+    if (machineState === "APPROACHING") return "approaching";
+    if (machineState === "EXITING") return "exiting";
+    return "out";
+  }
+
+  function resolveCarViewStateLabel(machineState) {
+    if (machineState === "INSIDE") return "WORK ZONE";
+    if (machineState === "APPROACHING") return "APPROACHING";
+    if (machineState === "EXITING") return "EXITING";
+    return "OUTSIDE";
+  }
+
+  function resolveCarViewHudState() {
+    const visual = latestWorkzoneVisual;
+    const machineState = normalizeCarViewMachineState(
+      visual?.fusedState || visual?.machineState || visual?.state,
+      visual?.state
+    );
+    const score = Number(visual?.score);
+    const threshold = Number(visual?.scoreThreshold);
+    const scoreLabel = Number.isFinite(score)
+      ? (Number.isFinite(threshold) && threshold > 0 ? `Score ${score.toFixed(2)} / ${threshold.toFixed(2)}` : `Score ${score.toFixed(2)}`)
+      : "Score --";
+    const ageMs = visual ? Date.now() - Number(visual.updatedAtMs || visual.receivedAtMs || Date.now()) : NaN;
+    const ageLabel = visual ? formatRelativeAgeMs(ageMs) : "";
+    const source = visual?.sourceDeviceName
+      ? (visual.fromSelf ? `${visual.sourceDeviceName} (this phone)` : visual.sourceDeviceName)
+      : "";
+    const meta = [
+      source ? `Source ${source}` : "",
+      ageLabel,
+      visual?.classSummary || ""
+    ].filter(Boolean).join(" • ");
+    return {
+      machineState,
+      tone: resolveCarViewTone(machineState),
+      label: resolveCarViewStateLabel(machineState),
+      scoreLabel,
+      detail: visual?.message || "No active WorkZone detection",
+      meta: meta || (cameraStream ? "Camera live" : "Camera waiting")
+    };
+  }
+
+  function renderCarViewHud() {
+    if (!carViewOverlayEl) return;
+    syncCarViewVideo();
+    const state = resolveCarViewHudState();
+    if (carViewHudEl) carViewHudEl.className = `phone-car-view-hud is-${state.tone}`;
+    if (carViewStateEl) carViewStateEl.textContent = state.label;
+    if (carViewDetailEl) carViewDetailEl.textContent = state.detail;
+    if (carViewMetaEl) carViewMetaEl.textContent = state.meta;
+    if (carViewScoreEl) carViewScoreEl.textContent = state.scoreLabel;
+    if (carViewCameraStateEl) {
+      const cameraLive = !!cameraStream && runConfig.streams.camera.mode !== "off";
+      carViewCameraStateEl.hidden = cameraLive;
+      carViewCameraStateEl.textContent = cameraLive
+        ? ""
+        : "Camera waiting for dashboard stream";
+    }
+  }
+
   function renderStatus() {
     maybeClearPermissionRefreshNotice();
     renderDeviceIdentity();
@@ -2112,6 +2483,7 @@
     renderCameraPreviewStatus();
     renderPermissionRefreshModal();
     scheduleFleetOverviewRender();
+    if (carViewActive) renderCarViewHud();
   }
 
   function renderWorkzoneVisual() {
@@ -2409,10 +2781,19 @@
       workzoneAlertsEnabled = !workzoneAlertsEnabled;
       renderStatus();
     });
+    const carViewBtn = document.createElement("button");
+    carViewBtn.type = "button";
+    carViewBtn.className = "btn btn-alt btn-small phone-car-view-btn";
+    carViewBtn.textContent = carViewActive ? "Car View Active" : "Car View";
+    carViewBtn.disabled = carViewActive || !cameraStream;
+    carViewBtn.title = cameraStream
+      ? "Open full-screen dashcam HUD"
+      : "Camera must be live before entering Car View";
+    carViewBtn.addEventListener("click", () => { void enterCarView(); });
     const hint = document.createElement("div");
     hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
     hint.textContent = alertFeedbackText || (connected ? "Alert plays immediately on this phone and all connected phones." : "Reconnect to send alerts.");
-    actions.append(alertBtn, workzoneAlertBtn, workzoneToggleBtn, hint);
+    actions.append(alertBtn, workzoneAlertBtn, workzoneToggleBtn, carViewBtn, hint);
     primaryActionArea.appendChild(actions);
   }
 
@@ -2445,6 +2826,7 @@
     parts.push(`Facing: ${cameraFacingMode === "user" ? "Front" : "Rear"}`);
     cameraPreviewMeta.innerHTML = parts.map((part) => `<span>${part}</span>`).join("<span>•</span>");
     if (cameraFlipBtn) cameraFlipBtn.disabled = !active;
+    if (carViewActive) renderCarViewHud();
   }
 
   function renderJoinValidation() {
@@ -3364,6 +3746,7 @@ function mergeRunConfig(input) {
         workzone_found: !!device?.workzone_found,
         workzone_tracking: !!device?.workzone_tracking,
         workzone_status: String(device?.workzone_status || "").trim(),
+        workzone_fused_state: String(device?.workzone_fused_state || "OUT").trim().toUpperCase() || "OUT",
         workzone_score: Number(device?.workzone_score),
         workzone_score_threshold: Number(device?.workzone_score_threshold),
         workzone_max_confidence: Number(device?.workzone_max_confidence),

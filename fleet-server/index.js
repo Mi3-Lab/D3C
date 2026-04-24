@@ -2129,6 +2129,7 @@ function buildFleetOverviewPayload() {
       workzone_found: !!device.state?.workzone_live?.found,
       workzone_tracking: !!device.state?.workzone_live?.tracking,
       workzone_status: String(device.state?.workzone_live?.status || "disabled"),
+      workzone_fused_state: String(device.state?.workzone_live?.fused_state || "OUT"),
       workzone_score: Number(device.state?.workzone_live?.score || 0),
       workzone_score_threshold: Number(device.state?.workzone_live?.score_threshold || 0),
       workzone_max_confidence: Number(device.state?.workzone_live?.max_confidence || 0),
@@ -3263,6 +3264,7 @@ function sendWorkzoneDetectedAlert({ deviceId, info, payload, statusPath, rawRes
     workzone: {
       device_id: deviceId,
       frame_index: frameIndex,
+      state: typeof info.state === "string" ? info.state : (typeof rawResult?.state === "string" ? rawResult.state : "OUT"),
       frame_filename: typeof info.frame_filename === "string" ? info.frame_filename : "",
       score,
       score_threshold: Number.isFinite(Number(payload?.score_threshold)) ? Number(payload.score_threshold) : WORKZONE_LIVE_SCORE_THRESHOLD,
