@@ -4034,7 +4034,7 @@ function notifyConnectedPhonesPermissionRefresh(modalities) {
   });
   const humanList = joinHumanList(friendly);
   const title = `Dashboard turned on ${humanList}`;
-  const message = `The dashboard just enabled ${humanList}. Tap Enable Now on this phone so Safari can show the permission prompt. If it still gets stuck, use Refresh Page as a fallback.`;
+  const message = `The dashboard just enabled ${humanList}. Please refresh this phone's page so Safari can show the permission prompt.`;
   broadcastFleetAlert({
     kind: "permission_refresh",
     source_device_name: "Dashboard",

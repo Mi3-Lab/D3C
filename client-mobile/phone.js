@@ -205,13 +205,16 @@
     if (!latestWorkzoneVisual) return;
     renderWorkzoneVisual();
   }, 1000);
-  permissionRefreshModalAction?.addEventListener("click", () => {
+  permissionRefreshModalAction?.addEventListener("click", (event) => {
+    event.stopPropagation();
     void handlePermissionRefreshAction();
   });
-  permissionRefreshModalRefresh?.addEventListener("click", () => {
+  permissionRefreshModalRefresh?.addEventListener("click", (event) => {
+    event.stopPropagation();
     window.location.reload();
   });
-  permissionRefreshModalDismiss?.addEventListener("click", () => {
+  permissionRefreshModalDismiss?.addEventListener("click", (event) => {
+    event.stopPropagation();
     clearPermissionRefreshNotice();
   });
   document.addEventListener("pointerdown", () => {
@@ -1792,6 +1795,47 @@
     return { played: toned, mode: toned ? "tone" : "none" };
   }
 
+  async function playPermissionRefreshAnnouncement({
+    announcementText = "Dashboard requested access. Please refresh the page.",
+    interactive = false,
+    allowLockedTone = true
+  } = {}) {
+    const phrase = String(announcementText || "").trim() || "Dashboard requested access. Please refresh the page.";
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    if (interactive) {
+      // Keep the speechSynthesis call directly in the click stack for Safari/iOS.
+      const spokenPromise = speakPhraseNow(phrase, {
+        volume: 1,
+        rate: 0.98,
+        pitch: 1,
+        timeoutMs: 5200
+      });
+      void ensureAlertMediaPlaybackAnchor({ interactive: true });
+      void primeAlertAudioWithOptions({ interactive: true });
+      const spoken = await spokenPromise;
+      if (spoken) {
+        workzoneSpeechPrimed = true;
+        return { played: true, mode: "speech" };
+      }
+      const toned = allowLockedTone
+        ? await playAlertTone({ allowThrottle: false, interactive: true })
+        : false;
+      return { played: toned, mode: toned ? "tone" : "none" };
+    }
+    if (!workzoneSpeechPrimed) {
+      const toned = allowLockedTone
+        ? await playAlertTone({ allowThrottle: false, interactive: false })
+        : false;
+      return { played: toned, mode: toned ? "tone_locked" : "voice_locked" };
+    }
+    await primeAlertAudioWithOptions({ interactive: false });
+    await resumeAudioContext();
+    const spoken = await speakWorkzoneDetectedVoice(phrase);
+    if (spoken) return { played: true, mode: "speech" };
+    const toned = await playAlertTone({ allowThrottle: false, interactive: false });
+    return { played: toned, mode: toned ? "tone" : "none" };
+  }
+
   async function replayPendingAlertIfPossible() {
     if (!pendingAlertReplay) return;
     const pending = pendingAlertReplay;
@@ -1808,6 +1852,14 @@
         announcementText: pending.announcementText || buildWorkzoneAnnouncementText(pending.sourceDeviceName)
       });
       played = result.played;
+    } else if (pending.kind === "permission_refresh") {
+      pending.attempts = Number(pending.attempts || 0) + 1;
+      const result = await playPermissionRefreshAnnouncement({
+        interactive: true,
+        allowLockedTone: false,
+        announcementText: pending.announcementText || buildPermissionRefreshAnnouncementText(permissionRefreshNotice?.modalities)
+      });
+      played = result.mode === "speech";
     } else {
       const ready = await primeAlertAudioWithOptions({ interactive: true });
       if (!ready) return;
@@ -1984,14 +2036,22 @@
         })
       : null;
     const workzoneAnnouncementText = workzoneAnnouncementEvent?.announcementText || buildWorkzoneAnnouncementText(sourceDeviceName);
-    const workzonePlayback = kind === "workzone_detected"
+    const permissionRefreshAnnouncementText = kind === "permission_refresh"
+      ? buildPermissionRefreshAnnouncementText(msg.modalities)
+      : "";
+    const alertPlayback = kind === "workzone_detected"
       ? ((fromSelf && Date.now() < suppressSelfWorkzonePlaybackUntilMs)
         ? { played: true, mode: "suppressed", deduped: false }
         : await playDedupedWorkzoneAnnouncement(workzoneAnnouncementEvent || { sourceDeviceId, sourceDeviceName }))
+      : kind === "permission_refresh"
+        ? await playPermissionRefreshAnnouncement({
+            announcementText: permissionRefreshAnnouncementText,
+            allowLockedTone: true
+          })
       : { played: await playAlertTone(), mode: "tone", deduped: false };
-    const played = !!workzonePlayback.played;
-    if (played && workzonePlayback.mode !== "pending") pendingAlertReplay = null;
-    if (kind === "workzone_detected" && workzonePlayback.mode === "pending") return;
+    const played = !!alertPlayback.played;
+    if (played && alertPlayback.mode !== "pending") pendingAlertReplay = null;
+    if (kind === "workzone_detected" && alertPlayback.mode === "pending") return;
     if (kind === "permission_refresh") {
       const title = String(msg.title || "Enable access").trim() || "Enable access";
       const message = String(msg.message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.").trim();
@@ -2000,9 +2060,9 @@
         message,
         modalities: msg.modalities
       });
-      if (!played) {
-        queuePendingAlertReplay("Dashboard", kind);
-        setAlertFeedback("Dashboard requested a permission refresh. Tap once anywhere on this phone if Safari kept sound blocked.", "warning", 5200);
+      if (alertPlayback.mode !== "speech") {
+        queuePendingAlertReplay("Dashboard", kind, permissionRefreshAnnouncementText);
+        setAlertFeedback("Dashboard requested access on this phone. Please refresh the page; if speech was blocked, this phone will retry the voice cue.", "warning", 5600);
       } else {
         setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
       }
@@ -2653,7 +2713,14 @@
         const btn = document.createElement("button");
         btn.className = "btn btn-alt btn-small";
         btn.textContent = "Retry Location";
-        btn.addEventListener("click", retryGpsAccess);
+        btn.addEventListener("click", () => {
+          void playPermissionRefreshAnnouncement({
+            interactive: true,
+            allowLockedTone: false,
+            announcementText: buildPermissionRefreshAnnouncementText(["location"])
+          });
+          void retryGpsAccess();
+        });
         phonePermissionActions.append(note, btn);
         phonePermissionActions.hidden = false;
       }
@@ -2926,6 +2993,27 @@
       .filter((value) => ["camera", "audio", "location"].includes(value)))];
   }
 
+  function joinPermissionSpeechLabels(labels) {
+    const clean = (Array.isArray(labels) ? labels : []).map((label) => String(label || "").trim()).filter(Boolean);
+    if (!clean.length) return "access";
+    if (clean.length === 1) return clean[0];
+    if (clean.length === 2) return `${clean[0]} and ${clean[1]}`;
+    return `${clean.slice(0, -1).join(", ")}, and ${clean[clean.length - 1]}`;
+  }
+
+  function permissionModalitySpeechLabel(modality) {
+    if (modality === "camera") return "camera";
+    if (modality === "audio") return "microphone";
+    if (modality === "location") return "location";
+    return "access";
+  }
+
+  function buildPermissionRefreshAnnouncementText(modalities) {
+    const labels = normalizePermissionModalities(modalities).map((modality) => permissionModalitySpeechLabel(modality));
+    const subject = joinPermissionSpeechLabels(labels);
+    return `Dashboard requested ${subject} access. Please refresh the page.`;
+  }
+
   function isPermissionModalityReady(modality) {
     if (modality === "camera") {
       return runConfig.streams.camera.mode === "off" || (cameraPermissionState === "granted" && !!cameraStream);
@@ -2992,6 +3080,12 @@
 
   async function handlePermissionRefreshAction() {
     if (!permissionRefreshNotice || permissionRefreshBusy) return;
+    const requestedModalities = normalizePermissionModalities(permissionRefreshNotice.modalities);
+    void playPermissionRefreshAnnouncement({
+      interactive: true,
+      allowLockedTone: false,
+      announcementText: buildPermissionRefreshAnnouncementText(requestedModalities)
+    });
     permissionRefreshBusy = true;
     permissionRefreshStatusText = "Requesting access on this phone...";
     renderPermissionRefreshModal();
