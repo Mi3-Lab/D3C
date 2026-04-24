@@ -1935,6 +1935,7 @@ canvas {
 
 .phone-alert-btn {
   width: 100%;
+  touch-action: manipulation;
 }
 
 .phone-alert-feedback {
@@ -4197,9 +4198,17 @@ body {
   }
 }
 
+.phone-body {
+  --shell-pad: clamp(10px, 2vw, 18px);
+}
+
+.btn.btn-muted {
+  opacity: 0.45;
+}
+
 .phone-stack {
-  gap: 18px;
-  max-width: 760px;
+  gap: 14px;
+  max-width: 100%;
 }
 
 .phone-hero {
@@ -4346,6 +4355,7 @@ body {
 
 .phone-alert-btn {
   min-height: 44px;
+  touch-action: manipulation;
 }
 
 .waiting-state {
