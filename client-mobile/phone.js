@@ -7,10 +7,26 @@
   const joinValidation = document.getElementById("joinValidation");
   const joinStatus = document.getElementById("joinStatus");
   const previewEl = document.getElementById("preview");
+  let carViewOverlayEl = null;
+  let carViewVideoEl = null;
+  let carViewHudEl = null;
+  let carViewStateEl = null;
+  let carViewScoreEl = null;
+  let carViewMetaEl = null;
+  let carViewDetailEl = null;
+  let carViewCameraStateEl = null;
+  let carViewActive = false;
+  let carViewStatusTimer = null;
   const deviceIdentityCard = document.getElementById("deviceIdentityCard");
   const deviceIdentityName = document.getElementById("deviceIdentityName");
   const deviceIdentityType = document.getElementById("deviceIdentityType");
   const primaryActionArea = document.getElementById("primaryActionArea");
+  const phoneWorkzoneCard = document.getElementById("phoneWorkzoneCard");
+  const phoneWorkzoneTitle = document.getElementById("phoneWorkzoneTitle");
+  const phoneWorkzoneBadge = document.getElementById("phoneWorkzoneBadge");
+  const phoneWorkzoneMessage = document.getElementById("phoneWorkzoneMessage");
+  const phoneWorkzoneMeta = document.getElementById("phoneWorkzoneMeta");
+  const phoneWorkzoneMetrics = document.getElementById("phoneWorkzoneMetrics");
   const phoneReadySummary = document.getElementById("phoneReadySummary");
   const phoneReadyMissing = document.getElementById("phoneReadyMissing");
   const phoneReadinessList = document.getElementById("phoneReadinessList");
@@ -81,6 +97,9 @@
   let cameraFacingMode = "environment";
   let reconnectState = "stable";
   let sessionRecordingActive = false;
+  let workzoneAlertsEnabled = true;
+  let latestOwnGps = null;
+  let hasSeenRecordingState = false;
   let joinCodeTouched = false;
   let lastImuEventMs = 0;
   let lastCameraFrameMs = 0;
@@ -121,6 +140,9 @@
   let wakeLock = null;
   const deviceMonoOriginWallMs = Date.now() - performance.now();
   let silentAudio = null;
+  let iosSpeakerPrimerEl = null;
+  let alertMediaAnchorEl = null;
+  let alertMediaAnchorUrl = "";
   let alertAudioCtx = null;
   let alertAudioMasterGain = null;
   let alertAudioCompressor = null;
@@ -133,9 +155,22 @@
   let permissionRefreshBusy = false;
   let permissionRefreshStatusText = "";
   let alertCooldownTimer = null;
-  let lastAlertSentAtMs = 0;
+  let lastGenericAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
+  let lastWorkzoneAlertPlayedAtMs = 0;
   let pendingAlertReplay = null;
+  let pendingAlertReplayTimer = null;
+  let workzoneSpeechPrimed = false;
+  let workzoneSpeechPrimeInFlight = null;
+  let workzoneVoiceWaitInFlight = null;
+  let activeSpeechUtterance = null;
+  let activeSpeechResumeTimer = null;
+  let suppressSelfGenericAlertUntilMs = 0;
+  let latestWorkzoneVisual = null;
+  const recentFleetAlertIds = new Map();
+  const recentWorkzoneAnnouncementKeys = new Map();
+  const workzoneOverviewStateByDevice = new Map();
+  let workzoneOverviewBaselineReady = false;
   const previewPeers = new Map();
   let lastPreviewStatusSent = "";
   let fleetOverview = { devices: [], generated_at_ms: 0 };
@@ -164,22 +199,42 @@
   } else {
     window.addEventListener("resize", scheduleFleetOverviewRender);
   }
-  permissionRefreshModalAction?.addEventListener("click", () => {
+  setInterval(() => {
+    if (!latestWorkzoneVisual) return;
+    renderWorkzoneVisual();
+  }, 1000);
+  permissionRefreshModalAction?.addEventListener("click", (event) => {
+    event.stopPropagation();
     void handlePermissionRefreshAction();
   });
-  permissionRefreshModalRefresh?.addEventListener("click", () => {
+  permissionRefreshModalRefresh?.addEventListener("click", (event) => {
+    event.stopPropagation();
     window.location.reload();
   });
-  permissionRefreshModalDismiss?.addEventListener("click", () => {
+  permissionRefreshModalDismiss?.addEventListener("click", (event) => {
+    event.stopPropagation();
     clearPermissionRefreshNotice();
   });
   document.addEventListener("pointerdown", () => {
-    void replayPendingAlertIfPossible();
+    void primeAlertAudioWithOptions({ interactive: true });
+    try { window.speechSynthesis?.getVoices?.(); } catch {}
   }, { passive: true });
-  document.addEventListener("keydown", (event) => {
-    if (!pendingAlertReplay) return;
-    if (event.key !== "Enter" && event.key !== " ") return;
+  document.addEventListener("click", (event) => {
+    void unlockVoiceAlertsFromGesture();
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest?.(".phone-alert-btn")) return;
     void replayPendingAlertIfPossible();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    void unlockVoiceAlertsFromGesture();
+    if (!pendingAlertReplay) return;
+    void replayPendingAlertIfPossible();
+  });
+  document.addEventListener("fullscreenchange", handleCarViewFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleCarViewFullscreenChange);
+  window.addEventListener("resize", () => {
+    if (carViewActive) renderCarViewHud();
   });
 
   cameraFlipBtn?.addEventListener("click", async () => {
@@ -222,7 +277,9 @@
       setJoinStatus("Enter a device name and join code");
       return;
     }
+    const voiceUnlock = unlockVoiceAlertsFromGesture({ force: true });
     await primeAlertAudio();
+    await voiceUnlock;
     started = true;
     startBtn.disabled = true;
     updateJoinFieldLock();
@@ -300,6 +357,10 @@
         if (msg.type === "auth_required") {
           started = false;
           authState = null;
+          sessionRecordingActive = false;
+          hasSeenRecordingState = false;
+          recentFleetAlertIds.clear();
+          resetWorkzoneAnnouncementTracking({ clearRecent: true });
           updateJoinFieldLock();
           renderStatus();
           setJoinStatus("Join token expired - tap Start again");
@@ -315,14 +376,22 @@
         }
         if (msg.type === "recording_state") {
           const wasRecording = sessionRecordingActive;
-          sessionRecordingActive = !!msg.active;
+          const nextRecording = !!msg.active;
+          const shouldPlayRecordingCue = hasSeenRecordingState && nextRecording !== wasRecording;
+          sessionRecordingActive = nextRecording;
+          hasSeenRecordingState = true;
           if (sessionRecordingActive && !wasRecording) {
             cameraVideoRecorderFallback = false;
           }
-          if (!sessionRecordingActive) flushPcmChunk(audioCtx?.sampleRate || 48000);
+          if (!sessionRecordingActive) {
+            flushPcmChunk(audioCtx?.sampleRate || 48000);
+            recentFleetAlertIds.clear();
+            resetWorkzoneAnnouncementTracking({ clearRecent: true });
+          }
           updateCameraTransport();
           void ensureAudioRunning();
           renderStatus();
+          if (shouldPlayRecordingCue) void playRecordingStateCue({ active: sessionRecordingActive });
           return;
         }
         if (msg.type === "force_disconnect") {
@@ -335,6 +404,9 @@
         }
         if (msg.type === "fleet_overview") {
           fleetOverview = normalizeFleetOverviewPayload(msg);
+          syncWorkzoneAnnouncementsFromFleetOverview();
+          reconcileLatestWorkzoneVisualFromFleetOverview();
+          renderWorkzoneVisual();
           scheduleFleetOverviewRender();
           return;
         }
@@ -744,17 +816,22 @@
     if (!wakeLock) await requestWakeLock();
   }
 
+  function alertCooldownRemainingMs() {
+    return Math.max(0, 1500 - (Date.now() - lastGenericAlertSentAtMs));
+  }
+
   function isAlertCoolingDown() {
-    return Date.now() - lastAlertSentAtMs < 1500;
+    return alertCooldownRemainingMs() > 0;
   }
 
   function scheduleAlertCooldownRefresh() {
     if (alertCooldownTimer) clearTimeout(alertCooldownTimer);
-    if (!isAlertCoolingDown()) return;
+    const nextDelay = alertCooldownRemainingMs();
+    if (nextDelay <= 0) return;
     alertCooldownTimer = setTimeout(() => {
       alertCooldownTimer = null;
       renderPrimaryAction();
-    }, Math.max(0, 1500 - (Date.now() - lastAlertSentAtMs)) + 20);
+    }, nextDelay + 20);
   }
 
   function setAlertFeedback(text, tone = "muted", ttlMs = 2600) {
@@ -808,7 +885,7 @@
       }
       if (!alertAudioMasterGain) {
         alertAudioMasterGain = alertAudioCtx.createGain();
-        alertAudioMasterGain.gain.value = 0.18;
+        alertAudioMasterGain.gain.value = 0.58;
       }
       if (!alertAudioGraphReady) {
         alertAudioMasterGain.connect(alertAudioCompressor);
@@ -847,11 +924,90 @@
     } catch {}
   }
 
+  function getIosSpeakerPrimerEl() {
+    if (!iosSpeakerPrimerEl) {
+      // Minimal valid silent WAV (44 bytes). Playing any <audio> element from a
+      // user gesture tells iOS to switch AVAudioSession to media playback (speaker),
+      // which the AudioContext then inherits — critical when camera is active.
+      const wav = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+      iosSpeakerPrimerEl = new Audio(wav);
+      iosSpeakerPrimerEl.volume = 0.001;
+    }
+    return iosSpeakerPrimerEl;
+  }
+
+  function createSilentWavObjectUrl({ seconds = 1, sampleRate = 8000 } = {}) {
+    const samples = Math.max(1, Math.round(Number(seconds || 1) * Number(sampleRate || 8000)));
+    const dataSize = samples * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    const writeAscii = (offset, text) => {
+      for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, "data");
+    view.setUint32(40, dataSize, true);
+    return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+  }
+
+  async function ensureAlertMediaPlaybackAnchor({ interactive = false } = {}) {
+    try {
+      if (!alertMediaAnchorEl) {
+        alertMediaAnchorUrl = createSilentWavObjectUrl();
+        alertMediaAnchorEl = new Audio(alertMediaAnchorUrl);
+        alertMediaAnchorEl.loop = true;
+        alertMediaAnchorEl.volume = 0.001;
+        alertMediaAnchorEl.preload = "auto";
+        alertMediaAnchorEl.setAttribute("playsinline", "true");
+      }
+      syncPhoneAudioSession({ preferAlertPlayback: true });
+      if (navigator.mediaSession) {
+        try {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: "D3C Safety Alerts",
+            artist: "D3C",
+            album: "Live Session"
+          });
+          navigator.mediaSession.playbackState = "playing";
+        } catch {}
+      }
+      if (interactive || alertMediaAnchorEl.paused) {
+        try { alertMediaAnchorEl.currentTime = 0; } catch {}
+        await alertMediaAnchorEl.play();
+      }
+      return !alertMediaAnchorEl.paused;
+    } catch {
+      return false;
+    }
+  }
+
   async function primeAlertAudioWithOptions({ interactive = false } = {}) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return false;
     syncPhoneAudioSession({ preferAlertPlayback: true });
     try {
+      await ensureAlertMediaPlaybackAnchor({ interactive });
+      // iOS suspends AudioContexts when getUserMedia(video) starts and routes them
+      // through the camera's audio session (earpiece). Close and recreate so the
+      // new context is initialized with the "playback" session we just set.
+      if (cameraStream && alertAudioCtx && alertAudioCtx.state === "suspended") {
+        try { await alertAudioCtx.close(); } catch {}
+        alertAudioCtx = null;
+        alertAudioMasterGain = null;
+        alertAudioCompressor = null;
+        alertAudioGraphReady = false;
+        alertAudioWarmup = null;
+      }
       if (!alertAudioCtx || alertAudioCtx.state === "closed") {
         alertAudioCtx = new Ctx();
         alertAudioMasterGain = null;
@@ -861,6 +1017,15 @@
       }
       if (alertAudioCtx.state === "suspended") {
         await alertAudioCtx.resume();
+      }
+      // Playing a silent <audio> element on interactive calls further nudges iOS
+      // to route audio output to the speaker regardless of camera state.
+      if (interactive) {
+        try {
+          const primer = getIosSpeakerPrimerEl();
+          primer.currentTime = 0;
+          await primer.play();
+        } catch {}
       }
       if (!ensureAlertAudioGraph()) return false;
       if (interactive) warmAlertAudioOutput();
@@ -877,28 +1042,835 @@
     return false;
   }
 
-  function queuePendingAlertReplay(sourceDeviceName, kind = "") {
+  function queuePendingAlertReplay(sourceDeviceName, kind = "", announcementText = "") {
     pendingAlertReplay = {
       sourceDeviceName: String(sourceDeviceName || "another phone").trim() || "another phone",
       kind: String(kind || "").trim(),
-      queuedAtMs: Date.now()
+      announcementText: String(announcementText || "").trim(),
+      queuedAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60000,
+      attempts: 0
     };
+    schedulePendingAlertReplay();
+  }
+
+  function isWorkzoneReplayKind(kind = "") {
+    return String(kind || "").trim().startsWith("workzone_");
+  }
+
+  function pruneRecentFleetAlertIds(now = Date.now()) {
+    for (const [alertId, ts] of recentFleetAlertIds.entries()) {
+      if ((now - Number(ts || 0)) > 60000) recentFleetAlertIds.delete(alertId);
+    }
+  }
+
+  function acknowledgeFleetAlert(alertId = "") {
+    const cleanAlertId = String(alertId || "").trim();
+    if (!cleanAlertId || !ws || ws.readyState !== WebSocket.OPEN) return;
+    queueJson({
+      type: "fleet_alert_received",
+      alert_id: cleanAlertId,
+      device_id: runConfig.device_id,
+      t_device_ms: getDeviceMonoMs()
+    });
+  }
+
+  function rememberFleetAlert(alertId = "") {
+    const cleanAlertId = String(alertId || "").trim();
+    if (!cleanAlertId) return true;
+    const now = Date.now();
+    pruneRecentFleetAlertIds(now);
+    const isFirstDelivery = !recentFleetAlertIds.has(cleanAlertId);
+    recentFleetAlertIds.set(cleanAlertId, now);
+    return isFirstDelivery;
+  }
+
+  function clearPendingAlertReplaySchedule() {
+    if (!pendingAlertReplayTimer) return;
+    clearTimeout(pendingAlertReplayTimer);
+    pendingAlertReplayTimer = null;
+  }
+
+  function schedulePendingAlertReplay() {
+    clearPendingAlertReplaySchedule();
+    if (!pendingAlertReplay) return;
+    pendingAlertReplayTimer = setTimeout(() => {
+      pendingAlertReplayTimer = null;
+      void replayPendingAlertIfPossible();
+    }, 1400);
+  }
+
+  function gpsDistanceMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180, Δλ = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  function gpsBearingDeg(lat1, lon1, lat2, lon2) {
+    const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function workzoneRelativeDirection(bearingDeg, headingDeg) {
+    if (!Number.isFinite(headingDeg) || headingDeg < 0) {
+      const cardinals = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"];
+      return "to your " + cardinals[Math.round(bearingDeg / 45) % 8];
+    }
+    const rel = ((bearingDeg - headingDeg) % 360 + 360) % 360;
+    if (rel < 22.5 || rel >= 337.5) return "ahead";
+    if (rel < 67.5) return "ahead and to your right";
+    if (rel < 112.5) return "to your right";
+    if (rel < 157.5) return "behind and to your right";
+    if (rel < 202.5) return "behind you";
+    if (rel < 247.5) return "behind and to your left";
+    if (rel < 292.5) return "to your left";
+    return "ahead and to your left";
+  }
+
+  function buildWorkzoneDirectionPhrase(sourceGps) {
+    if (!sourceGps || !latestOwnGps) return null;
+    const now = Date.now();
+    if ((now - Number(sourceGps.t_recv_ms || 0)) > 30000) return null;
+    if ((now - Number(latestOwnGps.t_ms || 0)) > 30000) return null;
+    const srcLat = Number(sourceGps.lat), srcLon = Number(sourceGps.lon);
+    const ownLat = Number(latestOwnGps.lat), ownLon = Number(latestOwnGps.lon);
+    if (!Number.isFinite(srcLat) || !Number.isFinite(srcLon) || Math.abs(srcLat) > 90 || Math.abs(srcLon) > 180) return null;
+    if (Math.abs(srcLat) < 0.0001 && Math.abs(srcLon) < 0.0001) return null;
+    const dist = gpsDistanceMeters(ownLat, ownLon, srcLat, srcLon);
+    const bearing = gpsBearingDeg(ownLat, ownLon, srcLat, srcLon);
+    const heading = Number(latestOwnGps.heading_deg ?? -1);
+    const feet = dist * 3.281;
+    if (feet < 200) return "just ahead of you";
+    const dir = workzoneRelativeDirection(bearing, heading);
+    if (feet < 1500) {
+      const rounded = Math.round(feet / 50) * 50;
+      return `about ${rounded} feet ${dir}`;
+    }
+    const miles = dist / 1609.34;
+    let distLabel;
+    if (miles < 0.35) distLabel = "about a quarter mile";
+    else if (miles < 0.65) distLabel = "about half a mile";
+    else if (miles < 0.9) distLabel = "less than a mile";
+    else if (miles < 1.3) distLabel = "about a mile";
+    else distLabel = `about ${miles.toFixed(1)} miles`;
+    return `${distLabel} ${dir}`;
+  }
+
+  function buildWorkzoneAnnouncementText(sourceDeviceName = "", { sourceGps = null, isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf) return "Workzone detected.";
+    if (!isSelf) {
+      const direction = buildWorkzoneDirectionPhrase(sourceGps);
+      if (direction && cleanName) return `Workzone is ${direction}, detected by ${cleanName}.`;
+      if (direction) return `Workzone is ${direction}.`;
+    }
+    if (!cleanName) return "Workzone detected";
+    return `Workzone detected by ${cleanName}`;
+  }
+
+  function buildWorkzoneDetectedMessage(sourceDeviceName = "", { detectionCount = 0, classSummary = "", isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim() || "another phone";
+    const totalDetections = Math.max(0, Number(detectionCount || 0));
+    const summary = String(classSummary || "").trim();
+    if (isSelf) {
+      if (summary && totalDetections > 0) {
+        return `Workzone detected with ${totalDetections} detection${totalDetections === 1 ? "" : "s"} (${summary}).`;
+      }
+      if (totalDetections > 0) {
+        return `Workzone detected with ${totalDetections} detection${totalDetections === 1 ? "" : "s"}.`;
+      }
+      if (summary) return `Workzone detected (${summary}).`;
+      return "Workzone detected.";
+    }
+    if (summary && totalDetections > 0) {
+      return `Workzone detected by ${cleanName} with ${totalDetections} detection${totalDetections === 1 ? "" : "s"} (${summary}).`;
+    }
+    if (totalDetections > 0) {
+      return `Workzone detected by ${cleanName} with ${totalDetections} detection${totalDetections === 1 ? "" : "s"}.`;
+    }
+    if (summary) {
+      return `Workzone detected by ${cleanName} (${summary}).`;
+    }
+    return `Workzone detected by ${cleanName}.`;
+  }
+
+  function buildWorkzoneExitedAnnouncementText(sourceDeviceName = "", { isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf || !cleanName) return "Exited workzone.";
+    return `Exited workzone, reported by ${cleanName}.`;
+  }
+
+  function buildWorkzoneExitedMessage(sourceDeviceName = "", { isSelf = false } = {}) {
+    const cleanName = String(sourceDeviceName || "").trim();
+    if (isSelf || !cleanName) return "Exited workzone.";
+    return `Exited workzone reported by ${cleanName}.`;
+  }
+
+  function pruneRecentWorkzoneAnnouncementKeys(now = Date.now()) {
+    for (const [key, ts] of recentWorkzoneAnnouncementKeys.entries()) {
+      if ((now - Number(ts || 0)) > 20000) recentWorkzoneAnnouncementKeys.delete(key);
+    }
+  }
+
+  function resetWorkzoneAnnouncementTracking({ clearRecent = false } = {}) {
+    workzoneOverviewStateByDevice.clear();
+    workzoneOverviewBaselineReady = false;
+    if (clearRecent) recentWorkzoneAnnouncementKeys.clear();
+  }
+
+  function buildWorkzoneAnnouncementEvent({
+    sourceDeviceId = "",
+    sourceDeviceName = "",
+    updatedAtMs = 0,
+    detectionCount = 0,
+    score = 0,
+    classSummary = "",
+    sourceGps = null
+  } = {}) {
+    const cleanDeviceId = String(sourceDeviceId || "").trim();
+    const cleanDeviceName = String(sourceDeviceName || cleanDeviceId || "another phone").trim() || "another phone";
+    const cleanUpdatedAtMs = Number.isFinite(Number(updatedAtMs)) && Number(updatedAtMs) > 0 ? Number(updatedAtMs) : 0;
+    const cleanDetectionCount = Math.max(0, Number(detectionCount || 0));
+    const cleanScore = Number.isFinite(Number(score)) ? Number(score) : 0;
+    const isSelf = !!cleanDeviceId && cleanDeviceId === runConfig.device_id;
+    return {
+      sourceDeviceId: cleanDeviceId,
+      sourceDeviceName: cleanDeviceName,
+      updatedAtMs: cleanUpdatedAtMs,
+      detectionCount: cleanDetectionCount,
+      score: cleanScore,
+      classSummary: String(classSummary || "").trim(),
+      sourceGps: sourceGps || null,
+      isSelf,
+      announcementText: buildWorkzoneAnnouncementText(cleanDeviceName, { sourceGps, isSelf }),
+      key: [cleanDeviceId || cleanDeviceName, cleanUpdatedAtMs || 0, cleanDetectionCount, cleanScore.toFixed(3)].join("|")
+    };
+  }
+
+  async function playDedupedWorkzoneAnnouncement(eventInput = {}) {
+    const event = buildWorkzoneAnnouncementEvent(eventInput);
+    const now = Date.now();
+    pruneRecentWorkzoneAnnouncementKeys(now);
+    if (event.key && recentWorkzoneAnnouncementKeys.has(event.key)) {
+      return { played: true, mode: "deduped", deduped: true, event, announcementText: event.announcementText };
+    }
+    if (
+      pendingAlertReplay
+      && isWorkzoneReplayKind(pendingAlertReplay.kind)
+      && pendingAlertReplay.announcementText === event.announcementText
+    ) {
+      return { played: true, mode: "pending", deduped: true, event, announcementText: event.announcementText };
+    }
+    const result = await playWorkzoneAnnouncement({ announcementText: event.announcementText });
+    if (result.played && event.key) recentWorkzoneAnnouncementKeys.set(event.key, now);
+    return { ...result, deduped: false, event, announcementText: event.announcementText };
+  }
+
+  async function handleWorkzoneOverviewDetection(device) {
+    const devGps = device?.gps_latest;
+    const event = buildWorkzoneAnnouncementEvent({
+      sourceDeviceId: device?.device_id,
+      sourceDeviceName: device?.device_name || device?.device_id,
+      updatedAtMs: Number(device?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now()),
+      detectionCount: Number(device?.workzone_detection_count || 0),
+      score: Number(device?.workzone_score),
+      classSummary: String(device?.workzone_class_summary || "").trim(),
+      sourceGps: (devGps && Number.isFinite(Number(devGps.lat)) && Number.isFinite(Number(devGps.lon)))
+        ? { lat: Number(devGps.lat), lon: Number(devGps.lon), t_recv_ms: Number(devGps.t_recv_ms || 0) }
+        : null
+    });
+    const result = await playDedupedWorkzoneAnnouncement(event);
+    if (result.deduped) return;
+    const message = buildWorkzoneDetectedMessage(event.sourceDeviceName, {
+      detectionCount: event.detectionCount,
+      classSummary: event.classSummary,
+      isSelf: event.isSelf
+    });
+    if (result.played) {
+      setAlertFeedback(message, "warning", 5000);
+      return;
+    }
+    queuePendingAlertReplay(event.sourceDeviceName, "workzone_detected", event.announcementText);
+    setAlertFeedback(`${message} If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
+  }
+
+  async function handleWorkzoneOverviewExit(device) {
+    const deviceId = String(device?.device_id || "").trim();
+    const sourceDeviceName = String(device?.device_name || deviceId || "another phone").trim() || "another phone";
+    const isSelf = !!deviceId && deviceId === runConfig.device_id;
+    const updatedAtMs = Number(device?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now());
+    const announcementText = buildWorkzoneExitedAnnouncementText(sourceDeviceName, { isSelf });
+    const key = ["exit", deviceId || sourceDeviceName, updatedAtMs || 0].join("|");
+    const now = Date.now();
+    pruneRecentWorkzoneAnnouncementKeys(now);
+    if (recentWorkzoneAnnouncementKeys.has(key)) return;
+    const result = await playWorkzoneAnnouncement({ announcementText, allowLockedTone: true });
+    if (result.played) {
+      recentWorkzoneAnnouncementKeys.set(key, now);
+      setAlertFeedback(buildWorkzoneExitedMessage(sourceDeviceName, { isSelf }), "success", 4200);
+      return;
+    }
+    queuePendingAlertReplay(sourceDeviceName, "workzone_exited", announcementText);
+    setAlertFeedback(`${buildWorkzoneExitedMessage(sourceDeviceName, { isSelf })} If Safari blocked speech, tap once anywhere on this phone and it will retry the exact phrase.`, "warning", 5600);
+  }
+
+  function syncWorkzoneAnnouncementsFromFleetOverview() {
+    const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
+    const now = Date.now();
+    if (!workzoneAlertsEnabled) {
+      for (const device of devices) {
+        const deviceId = String(device?.device_id || "").trim();
+        if (!deviceId) continue;
+        const machineState = normalizeCarViewMachineState(device?.workzone_fused_state, device?.workzone_found ? "detected" : "");
+        workzoneOverviewStateByDevice.set(deviceId, {
+          detected: !!device?.workzone_found,
+          active: !!device?.workzone_active,
+          tracking: !!device?.workzone_tracking,
+          machineState,
+          updatedAtMs: Number(device?.workzone_updated_at_ms || 0),
+          exitAnnouncedAtMs: Number(workzoneOverviewStateByDevice.get(deviceId)?.exitAnnouncedAtMs || 0)
+        });
+      }
+      workzoneOverviewBaselineReady = true;
+      return;
+    }
+    const seen = new Set();
+    for (const device of devices) {
+      const deviceId = String(device?.device_id || "").trim();
+      if (!deviceId) continue;
+      seen.add(deviceId);
+      const nextDetected = !!device?.workzone_found;
+      const nextActive = !!device?.workzone_active;
+      const nextTracking = !!device?.workzone_tracking;
+      const nextMachineState = normalizeCarViewMachineState(device?.workzone_fused_state, nextDetected ? "detected" : (nextTracking ? "tracking" : ""));
+      const nextUpdatedAtMs = Number(device?.workzone_updated_at_ms || 0);
+      const prev = workzoneOverviewStateByDevice.get(deviceId) || null;
+      const hasFreshTimestamp = nextUpdatedAtMs > 0 && Math.abs(now - nextUpdatedAtMs) <= 12000;
+      const prevMachineState = normalizeCarViewMachineState(prev?.machineState, prev?.detected ? "detected" : "");
+      const prevWasInWorkzone = workzoneMachineStateRank(prevMachineState) > 0;
+      const nextIsOut = nextMachineState === "OUT" && !nextDetected;
+      const exitCooldownReady = !prev?.exitAnnouncedAtMs || (now - Number(prev.exitAnnouncedAtMs || 0)) > 15000;
+      const shouldAnnounce = nextDetected && (
+        (!workzoneOverviewBaselineReady && deviceId === runConfig.device_id && hasFreshTimestamp)
+        || (workzoneOverviewBaselineReady && !prev?.detected && (hasFreshTimestamp || nextUpdatedAtMs <= 0))
+      );
+      const shouldAnnounceExit = workzoneOverviewBaselineReady
+        && deviceId === runConfig.device_id
+        && prevWasInWorkzone
+        && nextIsOut
+        && hasFreshTimestamp
+        && exitCooldownReady;
+      workzoneOverviewStateByDevice.set(deviceId, {
+        detected: nextDetected,
+        active: nextActive,
+        tracking: nextTracking,
+        machineState: nextMachineState,
+        updatedAtMs: nextUpdatedAtMs,
+        exitAnnouncedAtMs: shouldAnnounceExit ? now : Number(prev?.exitAnnouncedAtMs || 0)
+      });
+      if (shouldAnnounce) void handleWorkzoneOverviewDetection(device);
+      if (shouldAnnounceExit) void handleWorkzoneOverviewExit(device);
+    }
+    for (const deviceId of [...workzoneOverviewStateByDevice.keys()]) {
+      if (!seen.has(deviceId)) workzoneOverviewStateByDevice.delete(deviceId);
+    }
+    workzoneOverviewBaselineReady = true;
+  }
+
+  function summarizeWorkzoneClassCounts(classCounts) {
+    return Object.entries(classCounts || {})
+      .filter(([, count]) => Number(count) > 0)
+      .sort((a, b) => Number(b[1]) - Number(a[1]) || String(a[0]).localeCompare(String(b[0])))
+      .slice(0, 3)
+      .map(([label, count]) => `${String(label)} x${Number(count)}`)
+      .join(" • ");
+  }
+
+  function formatRelativeAgeMs(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    if (ms < 1000) return `${Math.round(ms)} ms ago`;
+    const sec = ms / 1000;
+    if (sec < 10) return `${sec.toFixed(1)} s ago`;
+    if (sec < 60) return `${Math.round(sec)} s ago`;
+    const min = sec / 60;
+    if (min < 10) return `${min.toFixed(1)} m ago`;
+    return `${Math.round(min)} m ago`;
+  }
+
+  function formatLatencyMs(value, { approximate = false } = {}) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    const prefix = approximate ? "~" : "";
+    if (ms < 1000) return `${prefix}${Math.round(ms)} ms`;
+    const sec = ms / 1000;
+    if (sec < 10) return `${prefix}${sec.toFixed(2)} s`;
+    return `${prefix}${sec.toFixed(1)} s`;
+  }
+
+  function workzoneMachineStateRank(value) {
+    const state = normalizeCarViewMachineState(value);
+    if (state === "INSIDE") return 4;
+    if (state === "APPROACHING") return 3;
+    if (state === "EXITING") return 2;
+    return 0;
+  }
+
+  function updateLatestWorkzoneVisual(msg, { fromSelf = false } = {}) {
+    const workzone = msg?.workzone && typeof msg.workzone === "object" ? msg.workzone : {};
+    const latency = workzone?.latency && typeof workzone.latency === "object" ? workzone.latency : {};
+    const classSummary = summarizeWorkzoneClassCounts(workzone.class_counts || {});
+    const receivedAtMs = Date.now();
+    const sourceName = String(msg?.source_device_name || msg?.source_device_id || "another phone").trim() || "another phone";
+    latestWorkzoneVisual = {
+      title: String(msg?.title || "Workzone detected").trim() || "Workzone detected",
+      message: fromSelf
+        ? "Workzone detected."
+        : (String(msg?.message || "").trim() || `Workzone detected by ${sourceName}.`),
+      state: "detected",
+      fusedState: String(workzone.state || workzone.fused_state || "INSIDE").trim().toUpperCase() || "INSIDE",
+      sourceDeviceName: sourceName,
+      fromSelf: !!fromSelf,
+      score: Number(workzone.score),
+      scoreThreshold: Number(workzone.score_threshold),
+      maxConfidence: Number(workzone.max_confidence),
+      detectionCount: Math.max(0, Number(workzone.detection_count || 0)),
+      classSummary,
+      frameToAlertMs: Number(latency.frame_to_alert_ms),
+      frameToResultMs: Number(latency.frame_to_result_ms),
+      queueWaitMs: Number(latency.queue_wait_ms),
+      dispatchToResultMs: Number(latency.dispatch_to_result_ms),
+      resultToAlertMs: Number(latency.result_to_alert_ms),
+      inferenceMs: Number(latency.inference_ms ?? workzone.inference_ms),
+      sourceRttMs: Number(latency.source_rtt_ms),
+      approxPhoneReceiveMs: Number(msg?.t_server_ms) > 0 ? Math.max(0, receivedAtMs - Number(msg.t_server_ms)) : NaN,
+      updatedAtMs: Date.parse(String(workzone.updated_at || "")) || Date.now(),
+      receivedAtMs
+    };
+  }
+
+  function reconcileLatestWorkzoneVisualFromFleetOverview() {
+    const devices = Array.isArray(fleetOverview?.devices) ? fleetOverview.devices : [];
+    const activeDevices = devices
+      .filter((device) => (
+        !!device?.workzone_found
+        || !!device?.workzone_tracking
+        || !!device?.workzone_active
+        || workzoneMachineStateRank(device?.workzone_fused_state) > 0
+      ))
+      .sort((a, b) => {
+        const stateRankA = workzoneMachineStateRank(a?.workzone_fused_state);
+        const stateRankB = workzoneMachineStateRank(b?.workzone_fused_state);
+        if (stateRankA !== stateRankB) return stateRankB - stateRankA;
+        const rankA = (a?.workzone_active ? 3 : (a?.workzone_found ? 2 : (a?.workzone_tracking ? 1 : 0)));
+        const rankB = (b?.workzone_active ? 3 : (b?.workzone_found ? 2 : (b?.workzone_tracking ? 1 : 0)));
+        if (rankA !== rankB) return rankB - rankA;
+        const scoreDiff = Number(b?.workzone_score || 0) - Number(a?.workzone_score || 0);
+        if (Math.abs(scoreDiff) > 1e-9) return scoreDiff;
+        return String(a?.device_id || "").localeCompare(String(b?.device_id || ""));
+      });
+
+    if (!activeDevices.length) {
+      latestWorkzoneVisual = null;
+      return;
+    }
+
+    const best = activeDevices[0];
+    const sourceDeviceName = String(best?.device_name || best?.device_id || "another phone").trim() || "another phone";
+    const classSummary = String(best?.workzone_class_summary || "").trim();
+    const rawDetected = !!best?.workzone_found;
+    const fusedState = String(best?.workzone_fused_state || "").trim().toUpperCase() || (rawDetected ? "INSIDE" : "APPROACHING");
+    const isDetected = rawDetected || fusedState === "INSIDE";
+    const state = isDetected ? "detected" : "tracking";
+    latestWorkzoneVisual = {
+      title: isDetected ? "Workzone detected" : "Workzone tracking",
+      message: classSummary
+        ? `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName} (${classSummary}).`
+        : `${isDetected ? "Workzone detected by" : "Tracking workzone from"} ${sourceDeviceName}.`,
+      state,
+      fusedState,
+      sourceDeviceName,
+      fromSelf: String(best?.device_id || "").trim() === runConfig.device_id,
+      score: Number(best?.workzone_score),
+      scoreThreshold: Number(best?.workzone_score_threshold),
+      maxConfidence: Number(best?.workzone_max_confidence),
+      detectionCount: Math.max(0, Number(best?.workzone_detection_count || 0)),
+      classSummary,
+      frameToAlertMs: Number(best?.workzone_alert_latency_ms),
+      frameToResultMs: Number(best?.workzone_pipeline_latency_ms),
+      queueWaitMs: Number(best?.workzone_queue_wait_ms),
+      dispatchToResultMs: Number(best?.workzone_dispatch_latency_ms),
+      inferenceMs: Number(best?.workzone_inference_ms),
+      sourceRttMs: Number(best?.rtt_ms),
+      approxPhoneReceiveMs: NaN,
+      updatedAtMs: Number(best?.workzone_updated_at_ms || fleetOverview?.generated_at_ms || Date.now()),
+      receivedAtMs: Date.now()
+    };
+  }
+
+  function pickWorkzoneAlertVoice(voices) {
+    const list = Array.isArray(voices) ? voices : [];
+    if (!list.length) return null;
+    const preferredNames = ["Samantha", "Ava", "Allison", "Serena", "Victoria", "Karen", "Moira", "Fiona"];
+    for (const name of preferredNames) {
+      const preferred = list.find((voice) => String(voice?.name || "").toLowerCase() === name.toLowerCase());
+      if (preferred) return preferred;
+    }
+    const localEnglish = list.find((voice) => {
+      const lang = String(voice?.lang || "").toLowerCase();
+      return voice?.localService && lang.startsWith("en");
+    });
+    if (localEnglish) return localEnglish;
+    const anyEnglish = list.find((voice) => String(voice?.lang || "").toLowerCase().startsWith("en"));
+    return anyEnglish || list[0] || null;
+  }
+
+  async function waitForWorkzoneVoices(timeoutMs = 2200) {
+    const synth = window.speechSynthesis;
+    if (!synth || typeof synth.getVoices !== "function") return [];
+    const existing = synth.getVoices() || [];
+    if (existing.length) return existing;
+    if (workzoneVoiceWaitInFlight) return workzoneVoiceWaitInFlight;
+
+    workzoneVoiceWaitInFlight = new Promise((resolve) => {
+      let settled = false;
+      const finish = (voices) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        try { synth.removeEventListener?.("voiceschanged", handleVoicesChanged); } catch {}
+        resolve(Array.isArray(voices) ? voices : []);
+      };
+      const handleVoicesChanged = () => {
+        const next = synth.getVoices() || [];
+        if (next.length) finish(next);
+      };
+      const timeoutId = setTimeout(() => finish(synth.getVoices() || []), Math.max(300, Number(timeoutMs) || 2200));
+      try { synth.addEventListener?.("voiceschanged", handleVoicesChanged); } catch {}
+      handleVoicesChanged();
+    }).finally(() => {
+      workzoneVoiceWaitInFlight = null;
+    });
+
+    return workzoneVoiceWaitInFlight;
+  }
+
+  function clearSpeechResumeTimer(utterance = null) {
+    if (utterance && activeSpeechUtterance !== utterance) return;
+    if (activeSpeechResumeTimer) {
+      clearInterval(activeSpeechResumeTimer);
+      activeSpeechResumeTimer = null;
+    }
+  }
+
+  function retainSpeechUtterance(utterance, synth) {
+    activeSpeechUtterance = utterance;
+    clearSpeechResumeTimer();
+    activeSpeechResumeTimer = setInterval(() => {
+      try { synth?.resume?.(); } catch {}
+    }, 250);
+  }
+
+  function releaseSpeechUtterance(utterance) {
+    if (activeSpeechUtterance !== utterance) return;
+    activeSpeechUtterance = null;
+    clearSpeechResumeTimer();
+  }
+
+  function speakPhraseNow(
+    text = "Workzone detected",
+    { volume = 1, rate = 0.96, pitch = 1.02, timeoutMs = 5200, cancel = true } = {}
+  ) {
+    const synth = window.speechSynthesis;
+    const Utterance = window.SpeechSynthesisUtterance;
+    if (!synth || typeof Utterance !== "function") return Promise.resolve(false);
+
+    const phrase = String(text || "Workzone detected").trim() || "Workzone detected";
+    const utterance = new Utterance(phrase);
+    utterance.lang = "en-US";
+    utterance.rate = rate;
+    utterance.pitch = pitch;
+    utterance.volume = volume;
+    const voice = pickWorkzoneAlertVoice(synth.getVoices?.() || []);
+    if (voice) utterance.voice = voice;
+
+    if (cancel) {
+      try { synth.cancel(); } catch {}
+    }
+    retainSpeechUtterance(utterance, synth);
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      const resolveOnce = (value) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeoutId);
+        resolve(value);
+      };
+      const timeoutId = setTimeout(() => {
+        releaseSpeechUtterance(utterance);
+        resolveOnce(false);
+      }, Math.max(800, Number(timeoutMs || 5200)));
+      utterance.onstart = () => resolveOnce(true);
+      utterance.onboundary = () => resolveOnce(true);
+      utterance.onend = () => {
+        releaseSpeechUtterance(utterance);
+        resolveOnce(true);
+      };
+      utterance.onerror = () => {
+        releaseSpeechUtterance(utterance);
+        resolveOnce(false);
+      };
+      try {
+        synth.speak(utterance);
+        synth.resume?.();
+      } catch {
+        releaseSpeechUtterance(utterance);
+        resolveOnce(false);
+      }
+    });
+  }
+
+  function unlockVoiceAlertsFromGesture({ phrase = "Voice alerts ready", force = false } = {}) {
+    if (workzoneSpeechPrimed && !force) return Promise.resolve(true);
+    if (workzoneSpeechPrimeInFlight && !force) return workzoneSpeechPrimeInFlight;
+    const spoken = speakPhraseNow(phrase, {
+      volume: 0.55,
+      rate: 1,
+      pitch: 1,
+      timeoutMs: 4200
+    });
+    void ensureAlertMediaPlaybackAnchor({ interactive: true });
+    void primeAlertAudioWithOptions({ interactive: true });
+    workzoneSpeechPrimeInFlight = spoken.then((primed) => {
+      if (primed) workzoneSpeechPrimed = true;
+      return primed;
+    }).finally(() => {
+      workzoneSpeechPrimeInFlight = null;
+    });
+    return workzoneSpeechPrimeInFlight;
+  }
+
+  async function primeWorkzoneSpeechSynthesis({ interactive = false } = {}) {
+    if (workzoneSpeechPrimed) return true;
+    if (workzoneSpeechPrimeInFlight) return workzoneSpeechPrimeInFlight;
+    const synth = window.speechSynthesis;
+    const Utterance = window.SpeechSynthesisUtterance;
+    if (!synth || typeof Utterance !== "function") return false;
+
+    if (interactive) {
+      return unlockVoiceAlertsFromGesture();
+    }
+
+    workzoneSpeechPrimeInFlight = (async () => {
+      syncPhoneAudioSession({ preferAlertPlayback: true });
+      try {
+        await waitForWorkzoneVoices(900);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        workzoneSpeechPrimeInFlight = null;
+      }
+    })();
+
+    return workzoneSpeechPrimeInFlight;
+  }
+
+  async function speakWorkzoneDetectedVoice(text = "Workzone detected") {
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    await ensureAlertMediaPlaybackAnchor({});
+    await resumeAudioContext();
+    const synth = window.speechSynthesis;
+    const Utterance = window.SpeechSynthesisUtterance;
+    if (!synth || typeof Utterance !== "function") return false;
+    await waitForWorkzoneVoices(900);
+
+    try {
+      const first = await speakPhraseNow(text, { volume: 1, rate: 0.96, pitch: 1.02, timeoutMs: 5200 });
+      if (first) {
+        workzoneSpeechPrimed = true;
+        return true;
+      }
+      try { synth.cancel(); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      const second = await speakPhraseNow(text, { volume: 1, rate: 0.96, pitch: 1.02, timeoutMs: 5200 });
+      if (second) workzoneSpeechPrimed = true;
+      return second;
+    } catch {}
+    return false;
+  }
+
+  async function playWorkzoneTone({ allowThrottle = true, interactive = false } = {}) {
+    const nowMs = Date.now();
+    if (allowThrottle && nowMs - lastWorkzoneAlertPlayedAtMs < 800) return true;
+    const ready = await primeAlertAudioWithOptions({ interactive });
+    if (!ready || !alertAudioCtx) return false;
+    lastWorkzoneAlertPlayedAtMs = nowMs;
+    const pattern = [
+      { delay: 0, duration: 0.18, freq: 659, accentFreq: 988, gain: 0.08 },
+      { delay: 0.24, duration: 0.2, freq: 784, accentFreq: 1174, gain: 0.09 },
+      { delay: 0.5, duration: 0.28, freq: 1046, accentFreq: 1568, gain: 0.11 }
+    ];
+    const startedAt = alertAudioCtx.currentTime + 0.02;
+    for (const step of pattern) {
+      const osc = alertAudioCtx.createOscillator();
+      const accentOsc = alertAudioCtx.createOscillator();
+      const gain = alertAudioCtx.createGain();
+      const t0 = startedAt + step.delay;
+      const t1 = t0 + step.duration;
+      osc.type = "sine";
+      accentOsc.type = "triangle";
+      osc.frequency.setValueAtTime(step.freq, t0);
+      accentOsc.frequency.setValueAtTime(step.accentFreq, t0);
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(step.gain, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t1);
+      osc.connect(gain);
+      accentOsc.connect(gain);
+      gain.connect(alertAudioMasterGain || alertAudioCtx.destination);
+      osc.start(t0);
+      accentOsc.start(t0);
+      osc.stop(t1 + 0.03);
+      accentOsc.stop(t1 + 0.03);
+      osc.onended = () => {
+        try { osc.disconnect(); } catch {}
+        try { accentOsc.disconnect(); } catch {}
+        try { gain.disconnect(); } catch {}
+      };
+    }
+    return true;
+  }
+
+  async function playWorkzoneAnnouncement({ interactive = false, announcementText = "Workzone detected", allowLockedTone = false } = {}) {
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    if (!interactive && !workzoneSpeechPrimed) {
+      if (allowLockedTone) {
+        const toned = await playWorkzoneTone({ allowThrottle: false, interactive: false });
+        return { played: toned, mode: toned ? "tone_locked" : "voice_locked" };
+      }
+      return { played: false, mode: "voice_locked" };
+    }
+    // Prime the AudioContext and resume all contexts before attempting TTS.
+    // On iOS, SpeechSynthesis routes to speaker only when an active AudioContext
+    // has already established speaker routing — this is especially critical when
+    // the camera is active, which can suspend audio contexts or force earpiece routing.
+    await primeAlertAudioWithOptions({ interactive });
+    await resumeAudioContext();
+    const spoken = await speakWorkzoneDetectedVoice(announcementText);
+    if (spoken) return { played: true, mode: "speech" };
+    const toned = await playWorkzoneTone({ allowThrottle: false, interactive });
+    return { played: toned, mode: toned ? "tone" : "none" };
+  }
+
+  async function playWorkzoneAnnouncementFromGesture(announcementText = "Workzone detected") {
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    // This must call speechSynthesis.speak() before any await. Safari treats
+    // delayed TTS differently from a direct user-gesture media action.
+    const spokenPromise = speakPhraseNow(announcementText, {
+      volume: 1,
+      rate: 0.96,
+      pitch: 1.02,
+      timeoutMs: 5200
+    });
+    void ensureAlertMediaPlaybackAnchor({ interactive: true });
+    void primeAlertAudioWithOptions({ interactive: true });
+    const spoken = await spokenPromise;
+    if (spoken) {
+      workzoneSpeechPrimed = true;
+      return { played: true, mode: "speech" };
+    }
+    const toned = await playWorkzoneTone({ allowThrottle: false, interactive: true });
+    return { played: toned, mode: toned ? "tone" : "none" };
+  }
+
+  async function playPermissionRefreshAnnouncement({
+    announcementText = "Dashboard requested access. Please refresh the page.",
+    interactive = false,
+    allowLockedTone = true
+  } = {}) {
+    const phrase = String(announcementText || "").trim() || "Dashboard requested access. Please refresh the page.";
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    if (interactive) {
+      // Keep the speechSynthesis call directly in the click stack for Safari/iOS.
+      const spokenPromise = speakPhraseNow(phrase, {
+        volume: 1,
+        rate: 0.98,
+        pitch: 1,
+        timeoutMs: 5200
+      });
+      void ensureAlertMediaPlaybackAnchor({ interactive: true });
+      void primeAlertAudioWithOptions({ interactive: true });
+      const spoken = await spokenPromise;
+      if (spoken) {
+        workzoneSpeechPrimed = true;
+        return { played: true, mode: "speech" };
+      }
+      const toned = allowLockedTone
+        ? await playAlertTone({ allowThrottle: false, interactive: true })
+        : false;
+      return { played: toned, mode: toned ? "tone" : "none" };
+    }
+    if (!workzoneSpeechPrimed) {
+      const toned = allowLockedTone
+        ? await playAlertTone({ allowThrottle: false, interactive: false })
+        : false;
+      return { played: toned, mode: toned ? "tone_locked" : "voice_locked" };
+    }
+    await primeAlertAudioWithOptions({ interactive: false });
+    await resumeAudioContext();
+    const spoken = await speakWorkzoneDetectedVoice(phrase);
+    if (spoken) return { played: true, mode: "speech" };
+    const toned = await playAlertTone({ allowThrottle: false, interactive: false });
+    return { played: toned, mode: toned ? "tone" : "none" };
   }
 
   async function replayPendingAlertIfPossible() {
     if (!pendingAlertReplay) return;
     const pending = pendingAlertReplay;
-    if (Date.now() - pending.queuedAtMs > 15000) {
+    if (Date.now() > Number(pending.expiresAtMs || 0)) {
       pendingAlertReplay = null;
+      clearPendingAlertReplaySchedule();
       return;
     }
-    const ready = await primeAlertAudioWithOptions({ interactive: true });
-    if (!ready) return;
-    const played = await playAlertTone({ allowThrottle: false, interactive: true });
-    if (!played) return;
+    let played = false;
+    if (isWorkzoneReplayKind(pending.kind)) {
+      pending.attempts = Number(pending.attempts || 0) + 1;
+      const result = await playWorkzoneAnnouncement({
+        interactive: true,
+        announcementText: pending.announcementText || buildWorkzoneAnnouncementText(pending.sourceDeviceName)
+      });
+      played = result.played;
+    } else if (pending.kind === "permission_refresh") {
+      pending.attempts = Number(pending.attempts || 0) + 1;
+      const result = await playPermissionRefreshAnnouncement({
+        interactive: true,
+        allowLockedTone: false,
+        announcementText: pending.announcementText || buildPermissionRefreshAnnouncementText(permissionRefreshNotice?.modalities)
+      });
+      played = result.mode === "speech";
+    } else {
+      const ready = await primeAlertAudioWithOptions({ interactive: true });
+      if (!ready) return;
+      played = await playAlertTone({ allowThrottle: false, interactive: true });
+    }
+    if (!played) {
+      schedulePendingAlertReplay();
+      return;
+    }
     pendingAlertReplay = null;
+    clearPendingAlertReplaySchedule();
     if (pending.kind === "permission_refresh") {
       setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
+      return;
+    }
+    if (pending.kind === "workzone_detected") {
+      setAlertFeedback("Workzone detected.", "warning", 5000);
       return;
     }
     setAlertFeedback(`Alert from ${pending.sourceDeviceName}.`, "muted");
@@ -945,31 +1917,102 @@
     return true;
   }
 
-  async function triggerFleetAlert() {
+  async function playRecordingStateCue({ active = false } = {}) {
+    const phrase = active ? "Started Recording" : "Stopped Recording";
+    syncPhoneAudioSession({ preferAlertPlayback: true });
+    await primeAlertAudioWithOptions({});
+    await resumeAudioContext();
+    const spoken = await speakWorkzoneDetectedVoice(phrase);
+    if (spoken) {
+      setAlertFeedback(phrase, active ? "success" : "muted", 2200);
+      return;
+    }
+    const played = await playAlertTone({ allowThrottle: false });
+    if (played) {
+      setAlertFeedback(phrase, active ? "success" : "muted", 2200);
+      return;
+    }
+    setAlertFeedback(
+      active ? "Recording started. Sound may be blocked on this phone." : "Recording stopped. Sound may be blocked on this phone.",
+      "warning",
+      4200
+    );
+  }
+
+  async function triggerFleetAlert({ kind = "", title = "", message = "", feedbackText = "Sending alert..." } = {}) {
     if (!started || !authState?.joinToken || !ws || ws.readyState !== WebSocket.OPEN) {
       setAlertFeedback("Reconnect to send alerts.", "warning");
       return;
     }
     if (isAlertCoolingDown()) return;
-    lastAlertSentAtMs = Date.now();
+    lastGenericAlertSentAtMs = Date.now();
+    suppressSelfGenericAlertUntilMs = lastGenericAlertSentAtMs + 4000;
     scheduleAlertCooldownRefresh();
-    await primeAlertAudioWithOptions({ interactive: true });
-    setAlertFeedback("Sending alert...", "muted", 1200);
-    queueJson({
+    setAlertFeedback(String(feedbackText || "Sending alert..."), "muted", 1200);
+    playAlertHaptics();
+    void playAlertTone({ allowThrottle: false, interactive: true }).then((played) => {
+      if (played) {
+        suppressSelfGenericAlertUntilMs = Date.now() + 4000;
+        return;
+      }
+      suppressSelfGenericAlertUntilMs = 0;
+      setAlertFeedback("Alert sent. Sound may be blocked on this phone; tap once anywhere to unlock audio.", "warning", 5200);
+    });
+    const payload = {
       type: "fleet_alert",
       device_id: runConfig.device_id
-    });
+    };
+    if (kind) payload.kind = String(kind).trim();
+    if (title) payload.title = String(title).trim();
+    if (message) payload.message = String(message).trim();
+    queueJson(payload);
   }
 
   async function handleFleetAlert(msg) {
+    const alertId = String(msg.alert_id || "").trim();
     const kind = String(msg.kind || "").trim();
     const sourceDeviceId = String(msg.source_device_id || "").trim();
     const sourceDeviceName = String(msg.source_device_name || sourceDeviceId || "another phone").trim();
     const targetCount = Math.max(1, Number(msg.target_count || 0) || 1);
     const fromSelf = !!sourceDeviceId && sourceDeviceId === runConfig.device_id;
-    if (!fromSelf || kind === "permission_refresh") playAlertHaptics();
-    const played = await playAlertTone();
-    if (played) pendingAlertReplay = null;
+    if (alertId) acknowledgeFleetAlert(alertId);
+    if (kind === "workzone_detected") {
+      updateLatestWorkzoneVisual(msg, { fromSelf });
+      renderStatus();
+    }
+    if (!rememberFleetAlert(alertId)) return;
+    if (fromSelf && !kind && Date.now() < suppressSelfGenericAlertUntilMs) {
+      setAlertFeedback(`Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
+      return;
+    }
+    const shouldPlayHaptics = kind === "permission_refresh" || !fromSelf;
+    if (shouldPlayHaptics) playAlertHaptics();
+    const workzoneAnnouncementEvent = kind === "workzone_detected"
+      ? buildWorkzoneAnnouncementEvent({
+          sourceDeviceId,
+          sourceDeviceName,
+          updatedAtMs: Date.parse(String(msg?.workzone?.updated_at || "")) || Number(msg?.t_server_ms || 0) || Date.now(),
+          detectionCount: Number(msg?.workzone?.detection_count || 0),
+          score: Number(msg?.workzone?.score),
+          classSummary: summarizeWorkzoneClassCounts(msg?.workzone?.class_counts || {}) || String(msg?.workzone?.class_summary || "").trim(),
+          sourceGps: msg?.workzone?.source_gps || null
+        })
+      : null;
+    const workzoneAnnouncementText = workzoneAnnouncementEvent?.announcementText || buildWorkzoneAnnouncementText(sourceDeviceName);
+    const permissionRefreshAnnouncementText = kind === "permission_refresh"
+      ? buildPermissionRefreshAnnouncementText(msg.modalities)
+      : "";
+    const alertPlayback = kind === "workzone_detected"
+      ? await playDedupedWorkzoneAnnouncement(workzoneAnnouncementEvent || { sourceDeviceId, sourceDeviceName })
+      : kind === "permission_refresh"
+        ? await playPermissionRefreshAnnouncement({
+            announcementText: permissionRefreshAnnouncementText,
+            allowLockedTone: true
+          })
+      : { played: await playAlertTone(), mode: "tone", deduped: false };
+    const played = !!alertPlayback.played;
+    if (played && alertPlayback.mode !== "pending") pendingAlertReplay = null;
+    if (kind === "workzone_detected" && alertPlayback.mode === "pending") return;
     if (kind === "permission_refresh") {
       const title = String(msg.title || "Enable access").trim() || "Enable access";
       const message = String(msg.message || "The dashboard enabled a new permission. Tap Enable Now so Safari can prompt on this phone.").trim();
@@ -978,12 +2021,34 @@
         message,
         modalities: msg.modalities
       });
-      if (!played) {
-        queuePendingAlertReplay("Dashboard", kind);
-        setAlertFeedback("Dashboard requested a permission refresh. Tap once anywhere on this phone if Safari kept sound blocked.", "warning", 5200);
+      if (alertPlayback.mode !== "speech") {
+        queuePendingAlertReplay("Dashboard", kind, permissionRefreshAnnouncementText);
+        setAlertFeedback("Dashboard requested access on this phone. Please refresh the page; if speech was blocked, this phone will retry the voice cue.", "warning", 5600);
       } else {
         setAlertFeedback("Dashboard requested access on this phone.", "warning", 4000);
       }
+      return;
+    }
+    if (kind === "workzone_detected") {
+      const title = String(msg.title || "Workzone detected").trim() || "Workzone detected";
+      const message = fromSelf
+        ? "Workzone detected."
+        : String(msg.message || `Workzone detected by ${sourceDeviceName}.`).trim();
+      if (fromSelf) {
+        if (!played) {
+          queuePendingAlertReplay(sourceDeviceName, kind, workzoneAnnouncementText);
+          setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}. If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
+          return;
+        }
+        setAlertFeedback(`${title}. Alert sent to ${targetCount} phone${targetCount === 1 ? "" : "s"}.`, "success", 5000);
+        return;
+      }
+      if (played) {
+        setAlertFeedback(message, "warning", 5000);
+        return;
+      }
+      queuePendingAlertReplay(sourceDeviceName, kind, workzoneAnnouncementText);
+      setAlertFeedback(`${message} If Safari blocked speech, tap once anywhere on this phone and it will keep retrying the exact phrase.`, "warning", 5600);
       return;
     }
     if (fromSelf) {
@@ -1100,15 +2165,21 @@
     if (rateLimit && now - lastGpsSent < 1000 / hz) return;
     lastGpsSent = now;
     lastGpsEventMs = Date.now();
+    const lat = Number(pos.coords?.latitude || 0);
+    const lon = Number(pos.coords?.longitude || 0);
+    const heading_deg = Number(pos.coords?.heading ?? -1);
+    if (Number.isFinite(lat) && Number.isFinite(lon) && (Math.abs(lat) > 0.0001 || Math.abs(lon) > 0.0001)) {
+      latestOwnGps = { lat, lon, heading_deg, t_ms: Date.now() };
+    }
     queueJson({
       type: "gps",
       device_id: runConfig.device_id,
       t_device_ms: now,
-      lat: Number(pos.coords?.latitude || 0),
-      lon: Number(pos.coords?.longitude || 0),
+      lat,
+      lon,
       accuracy_m: Number(pos.coords?.accuracy ?? -1),
       speed_mps: Number(pos.coords?.speed ?? -1),
-      heading_deg: Number(pos.coords?.heading ?? -1),
+      heading_deg,
       altitude_m: Number(pos.coords?.altitude ?? -1)
     });
   }
@@ -1172,15 +2243,334 @@
     } catch {}
   }
 
+  function getFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  async function requestCarViewFullscreen() {
+    if (!carViewOverlayEl) return false;
+    try {
+      if (typeof carViewOverlayEl.requestFullscreen === "function") {
+        await carViewOverlayEl.requestFullscreen({ navigationUI: "hide" });
+        return true;
+      }
+      if (typeof carViewOverlayEl.webkitRequestFullscreen === "function") {
+        carViewOverlayEl.webkitRequestFullscreen();
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  async function exitCarViewFullscreen() {
+    try {
+      if (!getFullscreenElement()) return;
+      if (typeof document.exitFullscreen === "function") {
+        await document.exitFullscreen();
+        return;
+      }
+      if (typeof document.webkitExitFullscreen === "function") {
+        document.webkitExitFullscreen();
+      }
+    } catch {}
+  }
+
+  async function lockCarViewOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.lock === "function") {
+        await screen.orientation.lock("landscape");
+      }
+    } catch {}
+  }
+
+  function unlockCarViewOrientation() {
+    try {
+      if (screen.orientation && typeof screen.orientation.unlock === "function") {
+        screen.orientation.unlock();
+      }
+    } catch {}
+  }
+
+  function ensureCarViewOverlay() {
+    if (carViewOverlayEl) return carViewOverlayEl;
+    const overlay = document.createElement("div");
+    overlay.className = "phone-car-view";
+    overlay.hidden = true;
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-label", "Car view");
+
+    const stage = document.createElement("div");
+    stage.className = "phone-car-view-stage";
+
+    const video = document.createElement("video");
+    video.className = "phone-car-view-video";
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "true");
+
+    const shade = document.createElement("div");
+    shade.className = "phone-car-view-shade";
+    shade.setAttribute("aria-hidden", "true");
+
+    const hud = document.createElement("div");
+    hud.className = "phone-car-view-hud is-out";
+
+    const hudCopy = document.createElement("div");
+    hudCopy.className = "phone-car-view-hud-copy";
+
+    const state = document.createElement("div");
+    state.className = "phone-car-view-state";
+    state.textContent = "OUTSIDE";
+
+    const detail = document.createElement("div");
+    detail.className = "phone-car-view-detail";
+    detail.textContent = "No active WorkZone detection";
+
+    const meta = document.createElement("div");
+    meta.className = "phone-car-view-meta mono";
+    meta.textContent = "Camera waiting";
+
+    hudCopy.append(state, detail, meta);
+
+    const hudSide = document.createElement("div");
+    hudSide.className = "phone-car-view-side";
+
+    const score = document.createElement("div");
+    score.className = "phone-car-view-score mono";
+    score.textContent = "Score --";
+
+    const exitBtn = document.createElement("button");
+    exitBtn.type = "button";
+    exitBtn.className = "phone-car-view-exit";
+    exitBtn.textContent = "Exit";
+    exitBtn.addEventListener("click", () => { void exitCarView(); });
+
+    hudSide.append(score, exitBtn);
+    hud.append(hudCopy, hudSide);
+
+    const cameraState = document.createElement("div");
+    cameraState.className = "phone-car-view-camera-state";
+    cameraState.textContent = "Camera waiting for dashboard stream";
+
+    stage.append(video, shade, hud, cameraState);
+    overlay.appendChild(stage);
+    document.body.appendChild(overlay);
+
+    carViewOverlayEl = overlay;
+    carViewVideoEl = video;
+    carViewHudEl = hud;
+    carViewStateEl = state;
+    carViewScoreEl = score;
+    carViewMetaEl = meta;
+    carViewDetailEl = detail;
+    carViewCameraStateEl = cameraState;
+    return overlay;
+  }
+
+  function syncCarViewVideo() {
+    if (!carViewVideoEl) return;
+    const nextStream = cameraStream || null;
+    if (carViewVideoEl.srcObject !== nextStream) {
+      carViewVideoEl.srcObject = nextStream;
+    }
+    if (nextStream) {
+      try { void carViewVideoEl.play?.(); } catch {}
+    }
+  }
+
+  async function enterCarView() {
+    if (carViewActive) return;
+    ensureCarViewOverlay();
+    carViewActive = true;
+    if (carViewOverlayEl) carViewOverlayEl.hidden = false;
+    document.body.classList.add("phone-car-view-active");
+    syncCarViewVideo();
+    renderCarViewHud();
+    if (carViewStatusTimer) clearInterval(carViewStatusTimer);
+    carViewStatusTimer = setInterval(renderCarViewHud, 500);
+    renderPrimaryAction();
+    const fullscreenPromise = requestCarViewFullscreen();
+    const fullscreenStarted = await fullscreenPromise;
+    if (fullscreenStarted) await lockCarViewOrientation();
+    try { await requestWakeLock(); } catch {}
+  }
+
+  async function exitCarView({ skipFullscreenExit = false } = {}) {
+    if (!carViewActive && !carViewOverlayEl) return;
+    carViewActive = false;
+    if (carViewStatusTimer) {
+      clearInterval(carViewStatusTimer);
+      carViewStatusTimer = null;
+    }
+    unlockCarViewOrientation();
+    if (!skipFullscreenExit) await exitCarViewFullscreen();
+    if (carViewVideoEl) {
+      try { carViewVideoEl.pause?.(); } catch {}
+      carViewVideoEl.srcObject = null;
+    }
+    if (carViewOverlayEl) carViewOverlayEl.hidden = true;
+    document.body.classList.remove("phone-car-view-active");
+    renderPrimaryAction();
+  }
+
+  function handleCarViewFullscreenChange() {
+    if (!carViewActive || !carViewOverlayEl) return;
+    const activeFullscreen = getFullscreenElement();
+    if (!activeFullscreen) {
+      void exitCarView({ skipFullscreenExit: true });
+    }
+  }
+
+  function normalizeCarViewMachineState(value, fallback = "") {
+    const state = String(value || "").trim().toUpperCase();
+    if (state === "OUT" || state === "APPROACHING" || state === "INSIDE" || state === "EXITING") return state;
+    const fallbackState = String(fallback || "").trim().toLowerCase();
+    if (fallbackState === "detected") return "INSIDE";
+    if (fallbackState === "tracking") return "APPROACHING";
+    return "OUT";
+  }
+
+  function resolveCarViewTone(machineState) {
+    if (machineState === "INSIDE") return "inside";
+    if (machineState === "APPROACHING") return "approaching";
+    if (machineState === "EXITING") return "exiting";
+    return "out";
+  }
+
+  function resolveCarViewStateLabel(machineState) {
+    if (machineState === "INSIDE") return "WORK ZONE";
+    if (machineState === "APPROACHING") return "APPROACHING";
+    if (machineState === "EXITING") return "EXITING";
+    return "OUTSIDE";
+  }
+
+  function resolveCarViewHudState() {
+    const visual = latestWorkzoneVisual;
+    const machineState = normalizeCarViewMachineState(
+      visual?.fusedState || visual?.machineState || visual?.state,
+      visual?.state
+    );
+    const score = Number(visual?.score);
+    const threshold = Number(visual?.scoreThreshold);
+    const scoreLabel = Number.isFinite(score)
+      ? (Number.isFinite(threshold) && threshold > 0 ? `Score ${score.toFixed(2)} / ${threshold.toFixed(2)}` : `Score ${score.toFixed(2)}`)
+      : "Score --";
+    const ageMs = visual ? Date.now() - Number(visual.updatedAtMs || visual.receivedAtMs || Date.now()) : NaN;
+    const ageLabel = visual ? formatRelativeAgeMs(ageMs) : "";
+    const source = visual?.sourceDeviceName
+      ? (visual.fromSelf ? `${visual.sourceDeviceName} (this phone)` : visual.sourceDeviceName)
+      : "";
+    const meta = [
+      source ? `Source ${source}` : "",
+      ageLabel,
+      visual?.classSummary || ""
+    ].filter(Boolean).join(" • ");
+    return {
+      machineState,
+      tone: resolveCarViewTone(machineState),
+      label: resolveCarViewStateLabel(machineState),
+      scoreLabel,
+      detail: visual?.message || "No active WorkZone detection",
+      meta: meta || (cameraStream ? "Camera live" : "Camera waiting")
+    };
+  }
+
+  function renderCarViewHud() {
+    if (!carViewOverlayEl) return;
+    syncCarViewVideo();
+    const state = resolveCarViewHudState();
+    if (carViewHudEl) carViewHudEl.className = `phone-car-view-hud is-${state.tone}`;
+    if (carViewStateEl) carViewStateEl.textContent = state.label;
+    if (carViewDetailEl) carViewDetailEl.textContent = state.detail;
+    if (carViewMetaEl) carViewMetaEl.textContent = state.meta;
+    if (carViewScoreEl) carViewScoreEl.textContent = state.scoreLabel;
+    if (carViewCameraStateEl) {
+      const cameraLive = !!cameraStream && runConfig.streams.camera.mode !== "off";
+      carViewCameraStateEl.hidden = cameraLive;
+      carViewCameraStateEl.textContent = cameraLive
+        ? ""
+        : "Camera waiting for dashboard stream";
+    }
+  }
+
   function renderStatus() {
     maybeClearPermissionRefreshNotice();
     renderDeviceIdentity();
     renderJoinValidation();
     renderReadiness();
     renderPrimaryAction();
+    renderWorkzoneVisual();
     renderCameraPreviewStatus();
     renderPermissionRefreshModal();
     scheduleFleetOverviewRender();
+    if (carViewActive) renderCarViewHud();
+  }
+
+  function renderWorkzoneVisual() {
+    if (!phoneWorkzoneCard || !phoneWorkzoneTitle || !phoneWorkzoneBadge || !phoneWorkzoneMessage || !phoneWorkzoneMeta || !phoneWorkzoneMetrics) return;
+    if (!latestWorkzoneVisual) {
+      phoneWorkzoneCard.hidden = true;
+      return;
+    }
+    const ageLabel = formatRelativeAgeMs(Date.now() - Number(latestWorkzoneVisual.updatedAtMs || latestWorkzoneVisual.receivedAtMs || Date.now()));
+    const score = Number(latestWorkzoneVisual.score);
+    const scoreThreshold = Number(latestWorkzoneVisual.scoreThreshold);
+    const maxConfidence = Number(latestWorkzoneVisual.maxConfidence);
+    const detectionCount = Number(latestWorkzoneVisual.detectionCount);
+    const frameToAlertMs = Number(latestWorkzoneVisual.frameToAlertMs);
+    const queueWaitMs = Number(latestWorkzoneVisual.queueWaitMs);
+    const inferenceMs = Number(latestWorkzoneVisual.inferenceMs);
+    const approxPhoneReceiveMs = Number(latestWorkzoneVisual.approxPhoneReceiveMs);
+    const sourceRttMs = Number(latestWorkzoneVisual.sourceRttMs);
+    const state = String(latestWorkzoneVisual.state || "detected").toLowerCase();
+    const tone = state === "tracking" ? "tracking" : "detected";
+    phoneWorkzoneCard.hidden = false;
+    phoneWorkzoneCard.className = `card phone-workzone-card is-${tone}`;
+    phoneWorkzoneTitle.textContent = latestWorkzoneVisual.title;
+    phoneWorkzoneBadge.className = `phone-workzone-badge ${tone}`;
+    phoneWorkzoneBadge.textContent = state === "tracking" ? "Tracking" : "Detected";
+    phoneWorkzoneMessage.textContent = latestWorkzoneVisual.message;
+    phoneWorkzoneMeta.textContent = [
+      latestWorkzoneVisual.fromSelf
+        ? `Source ${latestWorkzoneVisual.sourceDeviceName} (this phone)`
+        : `Source ${latestWorkzoneVisual.sourceDeviceName}`,
+      ageLabel || "",
+      latestWorkzoneVisual.classSummary || ""
+    ].filter(Boolean).join(" • ");
+    const metrics = [];
+    if (Number.isFinite(score)) {
+      metrics.push({ label: "Score", value: Number.isFinite(scoreThreshold) && scoreThreshold > 0 ? `${score.toFixed(2)} / ${scoreThreshold.toFixed(2)}` : score.toFixed(2) });
+    }
+    if (Number.isFinite(maxConfidence)) {
+      metrics.push({ label: "Model Conf", value: maxConfidence.toFixed(2) });
+    }
+    if (Number.isFinite(detectionCount)) {
+      metrics.push({ label: "Detections", value: String(Math.max(0, detectionCount)) });
+    }
+    if (Number.isFinite(frameToAlertMs)) {
+      metrics.push({ label: "Frame->Alert", value: formatLatencyMs(frameToAlertMs) });
+    }
+    if (Number.isFinite(queueWaitMs)) {
+      metrics.push({ label: "Queue", value: formatLatencyMs(queueWaitMs) });
+    }
+    if (Number.isFinite(inferenceMs)) {
+      metrics.push({ label: "Infer", value: formatLatencyMs(inferenceMs) });
+    }
+    if (Number.isFinite(approxPhoneReceiveMs)) {
+      metrics.push({ label: "Phone RX", value: formatLatencyMs(approxPhoneReceiveMs, { approximate: true }) });
+    }
+    if (Number.isFinite(sourceRttMs)) {
+      metrics.push({ label: "RTT", value: formatLatencyMs(sourceRttMs) });
+    }
+    phoneWorkzoneMetrics.innerHTML = metrics
+      .map((metric) => `
+        <div class="phone-workzone-metric">
+          <span>${metric.label}</span>
+          <strong>${metric.value}</strong>
+        </div>
+      `)
+      .join("");
   }
 
   function renderReadiness() {
@@ -1284,7 +2674,14 @@
         const btn = document.createElement("button");
         btn.className = "btn btn-alt btn-small";
         btn.textContent = "Retry Location";
-        btn.addEventListener("click", retryGpsAccess);
+        btn.addEventListener("click", () => {
+          void playPermissionRefreshAnnouncement({
+            interactive: true,
+            allowLockedTone: false,
+            announcementText: buildPermissionRefreshAnnouncementText(["location"])
+          });
+          void retryGpsAccess();
+        });
         phonePermissionActions.append(note, btn);
         phonePermissionActions.hidden = false;
       }
@@ -1392,15 +2789,32 @@
     const alertBtn = document.createElement("button");
     alertBtn.type = "button";
     alertBtn.className = "btn btn-alt btn-small phone-alert-btn";
-    alertBtn.textContent = isAlertCoolingDown() ? "Alerting..." : "Alert";
-    alertBtn.disabled = !connected || isAlertCoolingDown();
+    const genericAlertCoolingDown = isAlertCoolingDown();
+    alertBtn.textContent = genericAlertCoolingDown ? "Alerting..." : "Alert";
+    alertBtn.disabled = !connected || genericAlertCoolingDown;
     alertBtn.addEventListener("click", () => { void triggerFleetAlert(); });
+    const workzoneToggleBtn = document.createElement("button");
+    workzoneToggleBtn.type = "button";
+    workzoneToggleBtn.className = `btn btn-small phone-alert-btn${workzoneAlertsEnabled ? "" : " btn-muted"}`;
+    workzoneToggleBtn.textContent = workzoneAlertsEnabled ? "Workzone On" : "Workzone Off";
+    workzoneToggleBtn.title = workzoneAlertsEnabled ? "Tap to mute workzone alerts" : "Tap to enable workzone alerts";
+    workzoneToggleBtn.addEventListener("click", () => {
+      workzoneAlertsEnabled = !workzoneAlertsEnabled;
+      renderStatus();
+    });
+    const carViewBtn = document.createElement("button");
+    carViewBtn.type = "button";
+    carViewBtn.className = "btn btn-alt btn-small phone-car-view-btn";
+    carViewBtn.textContent = carViewActive ? "Car View Active" : "Car View";
+    carViewBtn.disabled = carViewActive || !cameraStream;
+    carViewBtn.title = cameraStream
+      ? "Open full-screen dashcam HUD"
+      : "Camera must be live before entering Car View";
+    carViewBtn.addEventListener("click", () => { void enterCarView(); });
     const hint = document.createElement("div");
     hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
-    hint.textContent = alertFeedbackText || (connected
-      ? "Plays a short tone on every connected phone."
-      : "Reconnect to send alerts.");
-    actions.append(alertBtn, hint);
+    hint.textContent = alertFeedbackText || (connected ? "Alert plays immediately on this phone and all connected phones." : "Reconnect to send alerts.");
+    actions.append(alertBtn, workzoneToggleBtn, carViewBtn, hint);
     primaryActionArea.appendChild(actions);
   }
 
@@ -1433,6 +2847,7 @@
     parts.push(`Facing: ${cameraFacingMode === "user" ? "Front" : "Rear"}`);
     cameraPreviewMeta.innerHTML = parts.map((part) => `<span>${part}</span>`).join("<span>•</span>");
     if (cameraFlipBtn) cameraFlipBtn.disabled = !active;
+    if (carViewActive) renderCarViewHud();
   }
 
   function renderJoinValidation() {
@@ -1532,6 +2947,27 @@
       .filter((value) => ["camera", "audio", "location"].includes(value)))];
   }
 
+  function joinPermissionSpeechLabels(labels) {
+    const clean = (Array.isArray(labels) ? labels : []).map((label) => String(label || "").trim()).filter(Boolean);
+    if (!clean.length) return "access";
+    if (clean.length === 1) return clean[0];
+    if (clean.length === 2) return `${clean[0]} and ${clean[1]}`;
+    return `${clean.slice(0, -1).join(", ")}, and ${clean[clean.length - 1]}`;
+  }
+
+  function permissionModalitySpeechLabel(modality) {
+    if (modality === "camera") return "camera";
+    if (modality === "audio") return "microphone";
+    if (modality === "location") return "location";
+    return "access";
+  }
+
+  function buildPermissionRefreshAnnouncementText(modalities) {
+    const labels = normalizePermissionModalities(modalities).map((modality) => permissionModalitySpeechLabel(modality));
+    const subject = joinPermissionSpeechLabels(labels);
+    return `Dashboard requested ${subject} access. Please refresh the page.`;
+  }
+
   function isPermissionModalityReady(modality) {
     if (modality === "camera") {
       return runConfig.streams.camera.mode === "off" || (cameraPermissionState === "granted" && !!cameraStream);
@@ -1598,6 +3034,12 @@
 
   async function handlePermissionRefreshAction() {
     if (!permissionRefreshNotice || permissionRefreshBusy) return;
+    const requestedModalities = normalizePermissionModalities(permissionRefreshNotice.modalities);
+    void playPermissionRefreshAnnouncement({
+      interactive: true,
+      allowLockedTone: false,
+      announcementText: buildPermissionRefreshAnnouncementText(requestedModalities)
+    });
     permissionRefreshBusy = true;
     permissionRefreshStatusText = "Requesting access on this phone...";
     renderPermissionRefreshModal();
@@ -1663,6 +3105,7 @@
     started = false;
     authState = null;
     sessionRecordingActive = false;
+    hasSeenRecordingState = false;
     runConfig = mergeRunConfig({ device_id: runConfig.device_id });
     closeAllPreviewPeers("removed_by_dashboard");
     lastPreviewStatusSent = "";
@@ -2347,6 +3790,23 @@ function mergeRunConfig(input) {
         recording: !!device?.recording,
         motion_state: String(device?.motion_state || "").trim(),
         camera_preview_live: !!device?.camera_preview_live,
+        workzone_active: !!device?.workzone_active,
+        workzone_found: !!device?.workzone_found,
+        workzone_tracking: !!device?.workzone_tracking,
+        workzone_status: String(device?.workzone_status || "").trim(),
+        workzone_fused_state: String(device?.workzone_fused_state || "OUT").trim().toUpperCase() || "OUT",
+        workzone_score: Number(device?.workzone_score),
+        workzone_score_threshold: Number(device?.workzone_score_threshold),
+        workzone_max_confidence: Number(device?.workzone_max_confidence),
+        workzone_detection_count: Math.max(0, Number(device?.workzone_detection_count || 0)),
+        workzone_class_summary: String(device?.workzone_class_summary || "").trim(),
+        workzone_updated_at_ms: Number(device?.workzone_updated_at_ms || 0),
+        workzone_alert_latency_ms: Number(device?.workzone_alert_latency_ms),
+        workzone_queue_wait_ms: Number(device?.workzone_queue_wait_ms),
+        workzone_dispatch_latency_ms: Number(device?.workzone_dispatch_latency_ms),
+        workzone_pipeline_latency_ms: Number(device?.workzone_pipeline_latency_ms),
+        workzone_inference_ms: Number(device?.workzone_inference_ms),
+        rtt_ms: Number(device?.rtt_ms),
         gps_latest: device?.gps_latest && typeof device.gps_latest === "object"
           ? {
               t_recv_ms: Number(device.gps_latest.t_recv_ms || 0),

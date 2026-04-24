@@ -28,6 +28,424 @@ function resolveDeviceReadiness(summary, rec) {
   return { label: "armed", className: "armed", phase: "idle" };
 }
 
+function formatRelativeAgeMs(value, empty = "-") {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return empty;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const sec = ms / 1000;
+  if (sec < 10) return `${sec.toFixed(1)} s`;
+  if (sec < 60) return `${Math.round(sec)} s`;
+  const min = sec / 60;
+  if (min < 10) return `${min.toFixed(1)} m`;
+  return `${Math.round(min)} m`;
+}
+
+function formatDurationCompactMs(value, empty = "--") {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return empty;
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = ms / 1000;
+  if (sec < 10) return `${sec.toFixed(1)}s`;
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const min = sec / 60;
+  if (min < 10) return `${min.toFixed(1)}m`;
+  return `${Math.round(min)}m`;
+}
+
+function humanizeWorkzoneStatus(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "detected": return "Detected";
+    case "tracking": return "Tracking";
+    case "checking": return "Busy";
+    case "queued": return "Queue";
+    case "waiting": return "Waiting";
+    case "stale": return "Stale";
+    case "starting": return "Starting";
+    case "restarting": return "Restarting";
+    case "offline": return "Offline";
+    case "stalled": return "Stalled";
+    case "error": return "Error";
+    case "idle": return "Idle";
+    case "disabled": return "Off";
+    case "ready": return "Live";
+    case "file": return "File";
+    default: return "Unknown";
+  }
+}
+
+function workzoneToneClass(status) {
+  switch (String(status || "").toLowerCase()) {
+    case "detected": return "detected";
+    case "tracking": return "tracking";
+    case "checking":
+    case "queued":
+    case "waiting":
+    case "starting":
+    case "restarting":
+    case "ready":
+    case "file":
+      return "watching";
+    case "stale":
+    case "offline":
+    case "stalled":
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+function formatWorkzoneScore(workzone) {
+  const score = Number(workzone?.score);
+  const threshold = Number(workzone?.score_threshold);
+  if (!Number.isFinite(score)) return "-";
+  if (!Number.isFinite(threshold) || threshold <= 0) return score.toFixed(2);
+  return `${score.toFixed(2)} / ${threshold.toFixed(2)}`;
+}
+
+function formatWorkzoneSmoothedScore(workzone) {
+  const smooth = Number(workzone?.smoothed_score);
+  if (!Number.isFinite(smooth)) return "-";
+  return smooth.toFixed(2);
+}
+
+function formatWorkzoneClassSummary(workzone) {
+  const summary = String(workzone?.class_summary || "").trim();
+  if (summary) return summary;
+  const top = Array.isArray(workzone?.top_detections) ? workzone.top_detections : [];
+  if (!top.length) return "";
+  return top
+    .slice(0, 3)
+    .map((item) => `${String(item?.label || "").trim()} ${Number(item?.confidence || 0).toFixed(2)}`)
+    .filter(Boolean)
+    .join(" • ");
+}
+
+function formatWorkzoneSummaryLine(workzone) {
+  const classSummary = formatWorkzoneClassSummary(workzone);
+  if (classSummary) return classSummary;
+  const message = String(workzone?.message || "").trim();
+  if (message) return message;
+  return "No WorkZone evidence yet.";
+}
+
+function formatWorkzoneDetailLine(workzone) {
+  const parts = [];
+  const maxConfidence = Number(workzone?.max_confidence);
+  if (Number.isFinite(maxConfidence) && maxConfidence > 0) parts.push(`conf ${maxConfidence.toFixed(2)}`);
+  const detectionCount = Number(workzone?.detection_count);
+  if (Number.isFinite(detectionCount) && detectionCount > 0) parts.push(`${detectionCount} det`);
+  const inferenceMs = Number(workzone?.inference_ms);
+  if (Number.isFinite(inferenceMs) && inferenceMs > 0) parts.push(`${Math.round(inferenceMs)} ms`);
+  const ageLabel = formatRelativeAgeMs(workzone?.last_result_age_ms, "");
+  if (ageLabel) parts.push(ageLabel);
+  return parts.join(" • ");
+}
+
+function isWorkzoneDetected(workzone) {
+  const status = String(workzone?.status || "").toLowerCase();
+  return !!workzone?.found || status === "detected";
+}
+
+function isWorkzoneTracking(workzone) {
+  const status = String(workzone?.status || "").toLowerCase();
+  return !isWorkzoneDetected(workzone) && (
+    !!workzone?.tracking
+    || !!workzone?.active
+    || status === "tracking"
+  );
+}
+
+function isWorkzoneIssue(workzone) {
+  return ["stale", "offline", "stalled", "error"].includes(String(workzone?.status || "").toLowerCase());
+}
+
+function shouldShowWorkzoneInsights(workzone) {
+  return isWorkzoneDetected(workzone) || isWorkzoneTracking(workzone) || isWorkzoneIssue(workzone);
+}
+
+function resolveWorkzoneDisplayTone(workzone) {
+  if (isWorkzoneDetected(workzone)) return "detected";
+  if (isWorkzoneTracking(workzone)) return "tracking";
+  if (isWorkzoneIssue(workzone)) return "error";
+  return workzoneToneClass(workzone?.status);
+}
+
+function resolveWorkzoneDisplayLabel(workzone) {
+  if (isWorkzoneDetected(workzone)) return "Detected";
+  if (isWorkzoneTracking(workzone)) return "Tracking";
+  return humanizeWorkzoneStatus(workzone?.status);
+}
+
+function formatWorkzoneMemoryCompact(memoryMb) {
+  const mb = Number(memoryMb);
+  if (!Number.isFinite(mb) || mb < 0) return "";
+  if (mb >= 1024) {
+    const gb = mb / 1024;
+    return gb >= 10 ? `${Math.round(gb)}G` : `${gb.toFixed(1)}G`;
+  }
+  return `${Math.round(mb)}M`;
+}
+
+function formatWorkzoneWorkerSummary(runtime) {
+  if (!runtime || typeof runtime !== "object") return "Unavailable";
+  const status = humanizeWorkzoneStatus(runtime.status || (runtime.configured ? "idle" : "disabled"));
+  const ageLabel = formatRelativeAgeMs(runtime.last_result_age_ms, "");
+  if (ageLabel && runtime.status !== "disabled") return `${status} • ${ageLabel}`;
+  return status;
+}
+
+function shortenWorkzoneAcceleratorName(name) {
+  let value = String(name || "").trim();
+  if (!value) return "";
+  value = value
+    .replace(/^NVIDIA\s+/i, "")
+    .replace(/^GeForce\s+/i, "")
+    .replace(/^AMD\s+Radeon\s+/i, "Radeon ")
+    .replace(/\s+Laptop GPU$/i, " Laptop")
+    .replace(/\s+Graphics$/i, "")
+    .replace(/\s+GPU$/i, "");
+  return value.trim();
+}
+
+function formatWorkzoneAcceleratorLabel(runtime, { full = false } = {}) {
+  if (!runtime || typeof runtime !== "object") return "";
+  const kind = String(runtime?.accelerator_kind || "").trim().toLowerCase();
+  const index = Number.isFinite(Number(runtime?.accelerator_index)) ? Number(runtime.accelerator_index) : null;
+  const name = String(runtime?.accelerator_name || "").trim();
+  if (kind === "gpu") {
+    const prefix = index !== null ? `GPU ${index}` : "GPU";
+    const displayName = full ? name : shortenWorkzoneAcceleratorName(name);
+    return displayName ? `${prefix} • ${displayName}` : prefix;
+  }
+  if (kind === "cpu") return "CPU";
+  const requested = String(runtime?.worker_device || runtime?.device || "").trim();
+  return requested || "";
+}
+
+function formatWorkzoneGpuUsage(runtime) {
+  if (!runtime || typeof runtime !== "object") return "--";
+  const kind = String(runtime?.accelerator_kind || "").trim().toLowerCase();
+  if (kind !== "gpu") return "";
+  const parts = [];
+  const utilization = Number(runtime?.gpu_utilization_pct);
+  if (Number.isFinite(utilization) && utilization >= 0) parts.push(`${Math.round(utilization)}%`);
+  const usedMb = Number(runtime?.gpu_memory_used_mb);
+  const totalMb = Number(runtime?.gpu_memory_total_mb);
+  const usedLabel = formatWorkzoneMemoryCompact(usedMb);
+  const totalLabel = formatWorkzoneMemoryCompact(totalMb);
+  if (usedLabel && totalLabel) parts.push(`${usedLabel}/${totalLabel}`);
+  else if (usedLabel) parts.push(usedLabel);
+  return parts.join(" • ") || "--";
+}
+
+function createMonitorPanel({ className, title, copy, meta, label: eyebrow = "Viewpoint" }) {
+  const panel = document.createElement("section");
+  panel.className = `monitor-panel ${className}`;
+
+  const head = document.createElement("div");
+  head.className = "monitor-panel-head";
+
+  const headline = document.createElement("div");
+  headline.className = "monitor-panel-headline";
+
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "monitor-panel-title-wrap";
+
+  const side = document.createElement("div");
+  side.className = "monitor-panel-side";
+
+  const label = document.createElement("span");
+  label.className = "monitor-panel-label";
+  label.textContent = eyebrow;
+
+  const heading = document.createElement("strong");
+  heading.className = "monitor-panel-title";
+  heading.textContent = title;
+
+  titleWrap.append(label, heading);
+  headline.append(titleWrap, side);
+
+  let metaEl = null;
+  if (meta) {
+    metaEl = document.createElement("span");
+    metaEl.className = "monitor-panel-meta";
+    metaEl.textContent = meta;
+    side.appendChild(metaEl);
+  }
+
+  const desc = document.createElement("p");
+  desc.className = "monitor-panel-copy";
+  desc.textContent = copy;
+
+  const body = document.createElement("div");
+  body.className = "monitor-panel-body";
+
+  head.append(headline, desc);
+  panel.append(head, body);
+
+  return { panel, body, headEl: head, headlineEl: headline, titleEl: heading, copyEl: desc, metaEl, sideEl: side };
+}
+
+function createWorkzoneMetricChip(label) {
+  const root = document.createElement("div");
+  root.className = "workzone-metric-chip";
+  const key = document.createElement("span");
+  key.className = "workzone-metric-key";
+  key.textContent = label;
+  const value = document.createElement("span");
+  value.className = "workzone-metric-value";
+  value.textContent = "--";
+  root.append(key, value);
+  return { root, key, value };
+}
+
+function mountWorkzoneLiveWidget(content, { store, getDeviceId }) {
+  const panel = createMonitorPanel({
+    className: "monitor-workzone-panel",
+    label: "Overview",
+    title: "Runtime & Detections",
+    copy: "Live worker status, queue depth, inference latency, and active detections.",
+    meta: null
+  });
+  panel.body.classList.add("monitor-workzone-body");
+  content.appendChild(panel.panel);
+
+  const workzoneToolbarLabel = document.createElement("div");
+  workzoneToolbarLabel.className = "workzone-toolbar-label is-idle";
+  const workzoneToolbarDot = document.createElement("span");
+  workzoneToolbarDot.className = "workzone-toolbar-dot";
+  const workzoneToolbarText = document.createElement("span");
+  workzoneToolbarText.textContent = "WorkZone";
+  workzoneToolbarLabel.append(workzoneToolbarDot, workzoneToolbarText);
+
+  const workzoneAccelerator = document.createElement("div");
+  workzoneAccelerator.className = "workzone-accelerator-pill is-idle";
+
+  const workzoneHeader = document.createElement("div");
+  workzoneHeader.className = "monitor-panel-workzone";
+  workzoneHeader.append(workzoneToolbarLabel, workzoneAccelerator);
+  panel.sideEl.appendChild(workzoneHeader);
+
+  const workzoneMetricStrip = document.createElement("div");
+  workzoneMetricStrip.className = "workzone-toolbar-metrics";
+  const stateMetric = createWorkzoneMetricChip("State");
+  const queueMetric = createWorkzoneMetricChip("Queue");
+  const inferMetric = createWorkzoneMetricChip("Infer");
+  const lastMetric = createWorkzoneMetricChip("Last");
+  const gpuMetric = createWorkzoneMetricChip("GPU");
+  workzoneMetricStrip.append(stateMetric.root, queueMetric.root, inferMetric.root, lastMetric.root, gpuMetric.root);
+
+  const workzoneBanner = document.createElement("div");
+  workzoneBanner.className = "workzone-dashboard-banner";
+  workzoneBanner.hidden = true;
+  panel.body.append(workzoneMetricStrip, workzoneBanner);
+
+  function renderState() {
+    const st = store.getState();
+    const selectedDeviceId = getDeviceId();
+    const visibleDevices = selectedDeviceId
+      ? (st.deviceList || []).filter((summary) => String(summary?.device_id || "") === selectedDeviceId)
+      : (st.deviceList || []);
+
+    panel.copyEl.textContent = selectedDeviceId
+      ? "Live worker status and detections for the selected phone."
+      : "Live worker status, queue depth, inference latency, and active detections.";
+
+    const runtimeWorkzone = st.runtime?.workzone_live || {};
+    const runtimeTone = workzoneToneClass(runtimeWorkzone?.status);
+    workzoneToolbarLabel.className = `workzone-toolbar-label is-${runtimeTone}`;
+
+    const queueValue = String(Math.max(0, Number(runtimeWorkzone?.pending_frames || 0)));
+    const inferValue = Number.isFinite(Number(runtimeWorkzone?.avg_inference_ms))
+      ? `${Math.round(Number(runtimeWorkzone.avg_inference_ms))}ms`
+      : "--";
+    const runtimeStatusLabel = humanizeWorkzoneStatus(runtimeWorkzone?.status || (runtimeWorkzone?.configured ? "idle" : "disabled"));
+    const lastValue = Number.isFinite(Number(runtimeWorkzone?.last_result_age_ms))
+      ? formatDurationCompactMs(runtimeWorkzone.last_result_age_ms, "--")
+      : "--";
+    const healthDetailParts = [runtimeStatusLabel, `queue ${queueValue}`, `infer ${inferValue}`, `last ${lastValue}`]
+      .filter(Boolean);
+    if (runtimeWorkzone?.last_error) healthDetailParts.push(String(runtimeWorkzone.last_error));
+    workzoneToolbarLabel.title = healthDetailParts.join(" • ");
+
+    const acceleratorKind = String(runtimeWorkzone?.accelerator_kind || "").trim().toLowerCase();
+    const acceleratorLabel = formatWorkzoneAcceleratorLabel(runtimeWorkzone);
+    const acceleratorFullLabel = formatWorkzoneAcceleratorLabel(runtimeWorkzone, { full: true });
+    workzoneAccelerator.hidden = !acceleratorLabel;
+    workzoneAccelerator.className = `workzone-accelerator-pill is-${acceleratorKind || (runtimeWorkzone?.configured ? "pending" : "idle")}`;
+    workzoneAccelerator.textContent = acceleratorLabel || "Accelerator";
+    workzoneAccelerator.title = acceleratorFullLabel || acceleratorLabel || "";
+
+    const gpuUsageLabel = formatWorkzoneGpuUsage(runtimeWorkzone);
+    stateMetric.value.textContent = runtimeStatusLabel;
+    stateMetric.root.title = `WorkZone live worker state${runtimeStatusLabel ? ` • ${runtimeStatusLabel}` : ""}`;
+    queueMetric.value.textContent = queueValue;
+    queueMetric.root.title = `Pending live WorkZone frames${queueValue !== "--" ? ` • ${queueValue}` : ""}`;
+    inferMetric.value.textContent = inferValue;
+    inferMetric.root.title = `Average live inference time${inferValue !== "--" ? ` • ${inferValue}` : ""}`;
+    lastMetric.value.textContent = lastValue;
+    lastMetric.root.title = `Age of the latest WorkZone result${lastValue !== "--" ? ` • ${lastValue}` : ""}`;
+    gpuMetric.root.hidden = !gpuUsageLabel;
+    gpuMetric.value.textContent = gpuUsageLabel || "--";
+    gpuMetric.root.title = [acceleratorFullLabel || acceleratorLabel, gpuUsageLabel].filter(Boolean).join(" • ");
+
+    const activeWorkzones = [];
+    for (const summary of visibleDevices) {
+      const deviceId = String(summary?.device_id || "");
+      if (!deviceId) continue;
+      const workzone = st.statesByDevice?.[deviceId]?.workzone_live || {};
+      if (!isWorkzoneDetected(workzone)) continue;
+      activeWorkzones.push({
+        displayName: String(summary?.deviceName || deviceId),
+        workzone
+      });
+    }
+
+    if (activeWorkzones.length) {
+      workzoneBanner.hidden = false;
+      workzoneBanner.className = "workzone-dashboard-banner is-detected";
+      workzoneBanner.innerHTML = activeWorkzones
+        .map(({ displayName, workzone }) => `
+          <div class="workzone-dashboard-banner-item">
+            <span class="workzone-dashboard-banner-label">WorkZone</span>
+            <div class="workzone-dashboard-banner-main">
+              <strong>${escapeHtml(displayName)}</strong>
+              <span>${escapeHtml(formatWorkzoneSummaryLine(workzone))}</span>
+            </div>
+          </div>
+        `)
+        .join("");
+    } else if (["starting", "restarting", "offline", "stalled", "error"].includes(String(runtimeWorkzone?.status || "").toLowerCase())) {
+      workzoneBanner.hidden = false;
+      workzoneBanner.className = `workzone-dashboard-banner is-${runtimeTone}`;
+      workzoneBanner.innerHTML = `
+        <div class="workzone-dashboard-banner-item">
+          <span class="workzone-dashboard-banner-label">Worker</span>
+          <div class="workzone-dashboard-banner-main">
+            <strong>${escapeHtml(runtimeStatusLabel)}</strong>
+            <span>${escapeHtml(String(runtimeWorkzone?.last_error || "Waiting for the worker to become ready."))}</span>
+          </div>
+        </div>
+      `;
+    } else {
+      workzoneBanner.hidden = true;
+      workzoneBanner.innerHTML = "";
+    }
+  }
+
+  const unsub = store.subscribe(
+    (s) => ({
+      deviceList: s.deviceList,
+      statesByDevice: s.statesByDevice,
+      runtime: s.runtime
+    }),
+    renderState
+  );
+  renderState();
+  return () => unsub();
+}
+
 const GPS_LIVE_TILE_SIZE = 256;
 const GPS_LIVE_TILE_TEMPLATE = "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png";
 const GPS_LIVE_STALE_MS = 15000;
@@ -48,7 +466,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const box = document.createElement("div");
         box.className = "kv-grid";
         content.appendChild(box);
-        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, rec: s.recording }), () => render(box, ctx));
+        const unsub = store.subscribe((s) => ({ list: s.deviceList, states: s.statesByDevice, rec: s.recording, runtime: s.runtime }), () => render(box, ctx));
         render(box, ctx);
         return () => unsub();
       }
@@ -127,6 +545,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             const secondaryId = escapeHtml(String(d.device_id));
             const now = Date.now();
             const deviceState = st.statesByDevice?.[d.device_id] || {};
+            const workzone = deviceState.workzone_live || {};
             const gpsLatest = deviceState.gps_latest || null;
             const gpsStream = deviceState.stream_status?.gps || null;
             const gpsEnabled = !!gpsStream?.enabled;
@@ -164,8 +583,18 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               ? healthAlerts.map((a) => String(a?.message || a?.code || "alert")).join(" | ")
               : "No active alerts";
             const pendingKick = pendingKicks.has(d.device_id);
+            const workzoneVisible = shouldShowWorkzoneInsights(workzone);
+            const workzoneDetected = isWorkzoneDetected(workzone);
+            const workzoneTracking = isWorkzoneTracking(workzone);
+            const workzoneTone = resolveWorkzoneDisplayTone(workzone);
+            const workzoneTitle = resolveWorkzoneDisplayLabel(workzone);
+            const workzoneSummary = formatWorkzoneClassSummary(workzone) || String(workzone?.message || "").trim() || "No WorkZone evidence yet.";
+            const workzoneDetail = formatWorkzoneDetailLine(workzone);
+            const workzoneScore = formatWorkzoneScore(workzone);
             const card = document.createElement("article");
             card.className = `device-roster-card tone-${tone}`;
+            if (workzoneDetected) card.classList.add("workzone-hot");
+            else if (workzoneTracking) card.classList.add("workzone-tracking");
             card.innerHTML = `
               <div class="device-roster-head">
                 <div class="device-roster-title">
@@ -207,6 +636,21 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
                 </div>
               </div>
             `;
+            if (workzoneVisible) {
+              const workzoneMeta = workzoneDetail || String(workzone?.message || "").trim() || "Waiting for WorkZone data.";
+              const banner = document.createElement("div");
+              banner.className = `device-workzone-banner is-${workzoneTone}`;
+              banner.innerHTML = `
+                <div class="device-workzone-head">
+                  <span class="device-workzone-chip is-${workzoneTone}">WorkZone ${escapeHtml(workzoneTitle)}</span>
+                  <span class="device-workzone-score">${escapeHtml(workzoneScore)}</span>
+                </div>
+                <div class="device-workzone-copy">${escapeHtml(workzoneSummary)}</div>
+                <div class="device-workzone-meta">${escapeHtml(workzoneMeta)}</div>
+              `;
+              const grid = card.querySelector(".device-roster-grid");
+              card.insertBefore(banner, grid);
+            }
             if (connected) {
               const actions = document.createElement("div");
               actions.className = "device-roster-actions";
@@ -239,9 +683,11 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
     stream_controls: {
       title: "Session Control",
-      defaults: { w: 5, h: 6, pinned: true, settings: {} },
-      render(content) {
+      defaults: { w: 4, h: 6, pinned: true, settings: {} },
+      render(content, ctx) {
+        const widgetWidth = Number(ctx?.instance?.w || 0);
         content.classList.add("session-setup-panel");
+        content.classList.toggle("is-compact", Number.isFinite(widgetWidth) && widgetWidth <= 4);
 
         const estimatePanel = document.createElement("section");
         estimatePanel.className = "session-estimate-panel";
@@ -682,61 +1128,28 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
       }
     },
 
+    workzone_live: {
+      title: "WorkZone Live",
+      defaults: { w: 12, h: 2, pinned: true, settings: { device_id: "global" } },
+      settingsSchema: [deviceSettingSchema()],
+      render(content, ctx) {
+        return mountWorkzoneLiveWidget(content, {
+          store,
+          getDeviceId: () => getWidgetDevice(ctx.instance.settings)
+        });
+      }
+    },
+
     camera_preview: {
       title: "Camera Views",
-      defaults: { w: 12, h: 4, pinned: false, settings: { device_id: "global" } },
+      defaults: { w: 12, h: 6, pinned: false, settings: { device_id: "global" } },
       settingsSchema: [deviceSettingSchema()],
       render(content, ctx) {
         content.closest(".widget-card")?.classList.add("widget-cam-full");
         content.classList.add("cam-content", "monitor-widget-content");
 
-        const createMonitorPanel = ({ className, title, copy, meta }) => {
-          const panel = document.createElement("section");
-          panel.className = `monitor-panel ${className}`;
-
-          const head = document.createElement("div");
-          head.className = "monitor-panel-head";
-
-          const headline = document.createElement("div");
-          headline.className = "monitor-panel-headline";
-
-          const titleWrap = document.createElement("div");
-          titleWrap.className = "monitor-panel-title-wrap";
-
-          const label = document.createElement("span");
-          label.className = "monitor-panel-label";
-          label.textContent = "Viewpoint";
-
-          const heading = document.createElement("strong");
-          heading.className = "monitor-panel-title";
-          heading.textContent = title;
-
-          titleWrap.append(label, heading);
-          headline.appendChild(titleWrap);
-
-          let metaEl = null;
-          if (meta) {
-            metaEl = document.createElement("span");
-            metaEl.className = "monitor-panel-meta";
-            metaEl.textContent = meta;
-            headline.appendChild(metaEl);
-          }
-
-          const desc = document.createElement("p");
-          desc.className = "monitor-panel-copy";
-          desc.textContent = copy;
-
-          const body = document.createElement("div");
-          body.className = "monitor-panel-body";
-
-          head.append(headline, desc);
-          panel.append(head, body);
-
-          return { panel, body, titleEl: heading, copyEl: desc, metaEl };
-        };
-
         const tabs = document.createElement("div");
-        tabs.className = "monitor-tabs";
+        tabs.className = "monitor-tabs monitor-tabs-inline";
         tabs.setAttribute("role", "tablist");
         const stage = document.createElement("div");
         stage.className = "monitor-stage is-cameras";
@@ -753,14 +1166,22 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           className: "monitor-camera-panel",
           title: "Camera Wall",
           copy: "Live previews from connected phones.",
-          meta: "0 feeds"
+          meta: null
         });
+        cameraPanel.panel.classList.add("monitor-camera-focus-panel");
+        cameraPanel.copyEl.hidden = true;
 
         stage.append(mapPanel.panel, cameraPanel.panel);
-        content.append(tabs, stage);
+        content.append(stage);
+
+        const widgetActions = content.closest(".widget-card")?.querySelector(".widget-actions");
+        if (widgetActions) widgetActions.appendChild(tabs);
+        else cameraPanel.sideEl.appendChild(tabs);
 
         let activeMode = "cameras";
         const tabButtons = new Map();
+        const pendingKicks = new Set();
+        let confirmingKickId = "";
         const mapView = mountGpsLivePanel(mapPanel.body, {
           store,
           getDeviceId: () => getWidgetDevice(ctx.instance.settings)
@@ -794,7 +1215,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const empty = document.createElement("div");
         empty.className = "camview-empty";
         empty.textContent = "No devices connected";
-        cameraPanel.body.appendChild(grid);
+        cameraPanel.body.append(grid);
         grid.appendChild(empty);
 
         function destroyCard(deviceId) {
@@ -803,6 +1224,7 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           try { card.detachPreview?.(); } catch {}
           card.root.remove();
           cards.delete(deviceId);
+          pendingKicks.delete(deviceId);
         }
 
         function ensureCard(deviceId) {
@@ -814,14 +1236,44 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
 
           const header = document.createElement("div");
           header.className = "camview-header";
+          const titleBlock = document.createElement("div");
+          titleBlock.className = "camview-titleblock";
           const title = document.createElement("span");
           title.className = "camview-title";
           const fps = document.createElement("span");
           fps.className = "camview-fps";
+          titleBlock.append(title, fps);
+          const statuses = document.createElement("div");
+          statuses.className = "camview-statuses";
           const badge = document.createElement("span");
           badge.className = "camview-badge offline";
           badge.textContent = "OFFLINE";
-          header.append(title, fps, badge);
+          const kickBtn = document.createElement("button");
+          kickBtn.type = "button";
+          kickBtn.className = "camview-kick";
+          kickBtn.textContent = "X";
+          kickBtn.title = "Kick device";
+          kickBtn.setAttribute("aria-label", `Kick ${deviceId}`);
+          statuses.append(badge, kickBtn);
+          header.append(titleBlock, statuses);
+
+          const confirm = document.createElement("div");
+          confirm.className = "camview-confirm";
+          confirm.hidden = true;
+          const confirmCopy = document.createElement("span");
+          confirmCopy.className = "camview-confirm-copy";
+          const confirmActions = document.createElement("div");
+          confirmActions.className = "camview-confirm-actions";
+          const cancelBtn = document.createElement("button");
+          cancelBtn.type = "button";
+          cancelBtn.className = "btn btn-alt btn-small";
+          cancelBtn.textContent = "Cancel";
+          const confirmKickBtn = document.createElement("button");
+          confirmKickBtn.type = "button";
+          confirmKickBtn.className = "btn btn-danger btn-small";
+          confirmKickBtn.textContent = "Kick out";
+          confirmActions.append(cancelBtn, confirmKickBtn);
+          confirm.append(confirmCopy, confirmActions);
 
           const frame = document.createElement("div");
           frame.className = "camview-frame";
@@ -843,18 +1295,44 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           const placeholderText = placeholder.querySelector("p");
           frame.append(video, img, placeholder);
 
-          root.append(header, frame);
+          root.append(header, confirm, frame);
           grid.appendChild(root);
+
+          kickBtn.addEventListener("click", () => {
+            if (!card || pendingKicks.has(deviceId)) return;
+            confirmingKickId = confirmingKickId === deviceId ? "" : deviceId;
+            renderCards();
+          });
+
+          cancelBtn.addEventListener("click", () => {
+            if (confirmingKickId !== deviceId) return;
+            confirmingKickId = "";
+            renderCards();
+          });
+
+          confirmKickBtn.addEventListener("click", () => {
+            if (!card || pendingKicks.has(deviceId)) return;
+            pendingKicks.add(deviceId);
+            confirmingKickId = "";
+            sendJson({ type: "device_kick", device_id: deviceId });
+            renderCards();
+          });
 
           card = {
             root,
             title,
             fps,
             badge,
+            kickBtn,
+            confirm,
+            confirmCopy,
+            cancelBtn,
+            confirmKickBtn,
             video,
             img,
             placeholder,
             placeholderText,
+            displayName: deviceId,
             lastCamTs: 0,
             detachPreview: previewRtc?.registerSink(deviceId, video) || null
           };
@@ -872,13 +1350,6 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
           cameraPanel.titleEl.textContent = selectedDeviceId
             ? String(selectedSummary?.deviceName || selectedDeviceId)
             : "Camera Wall";
-          cameraPanel.copyEl.textContent = selectedDeviceId
-            ? "Focused live preview for the selected phone."
-            : "Live previews from connected phones.";
-          if (cameraPanel.metaEl) {
-            const count = visibleDevices.length;
-            cameraPanel.metaEl.textContent = `${count} ${count === 1 ? "feed" : "feeds"}`;
-          }
           mapPanel.copyEl.textContent = selectedDeviceId
             ? "Latest GPS path for the selected phone."
             : "Latest GPS positions from connected phones.";
@@ -891,6 +1362,9 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             activeIds.add(deviceId);
             const card = ensureCard(deviceId);
             const state = st.statesByDevice?.[deviceId] || {};
+            const workzone = state.workzone_live || {};
+            const workzoneDetected = isWorkzoneDetected(workzone);
+            const workzoneTracking = isWorkzoneTracking(workzone);
             const camTs = Number(state?.camera_latest_ts || 0);
             const fresh = camTs > 0 && (now - camTs) < 4000;
             const fpsVal = Number(summary?.camFps ?? summary?.camera_fps ?? state?.net?.camera_fps ?? 0);
@@ -932,11 +1406,23 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
               placeholderText = "Waiting for camera";
             }
             const displayName = String(summary.deviceName || deviceId);
+            const pendingKick = pendingKicks.has(deviceId);
+            const showKickConfirm = confirmingKickId === deviceId && !pendingKick && isOnline;
 
+            card.displayName = displayName;
             card.title.textContent = displayName;
             card.badge.className = `camview-badge ${statusClass}`;
             card.badge.textContent = statusLabel;
             card.fps.textContent = showVideo ? "RTC" : (fresh && fpsVal > 0 ? `${fpsVal.toFixed(1)} fps` : "");
+            card.kickBtn.textContent = pendingKick ? "..." : "X";
+            card.kickBtn.disabled = pendingKick || !isOnline;
+            card.kickBtn.title = pendingKick ? `Removing ${displayName}` : `Kick ${displayName}`;
+            card.kickBtn.setAttribute("aria-label", pendingKick ? `Removing ${displayName}` : `Kick ${displayName}`);
+            card.confirm.hidden = !showKickConfirm;
+            card.confirmCopy.textContent = `Disconnect ${displayName} from this session?`;
+            card.cancelBtn.disabled = pendingKick;
+            card.confirmKickBtn.disabled = pendingKick;
+            card.confirmKickBtn.textContent = pendingKick ? "Removing..." : "Kick out";
             if (card.placeholderText) card.placeholderText.textContent = placeholderText;
 
             if (showImage) {
@@ -948,6 +1434,9 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             card.video.style.display = showVideo ? "" : "none";
             card.img.style.display = showImage ? "" : "none";
             card.placeholder.style.display = showVideo || showImage ? "none" : "flex";
+            card.root.classList.toggle("is-kick-confirm", showKickConfirm);
+            card.root.classList.toggle("workzone-hot", workzoneDetected);
+            card.root.classList.toggle("workzone-tracking", !workzoneDetected && workzoneTracking);
           }
 
           for (const deviceId of [...cards.keys()]) {
@@ -955,6 +1444,10 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
             previewRtc?.updateAvailability(deviceId, { connected: false, previewEnabled: false });
             destroyCard(deviceId);
           }
+          for (const deviceId of [...pendingKicks]) {
+            if (!activeIds.has(deviceId)) pendingKicks.delete(deviceId);
+          }
+          if (confirmingKickId && !activeIds.has(confirmingKickId)) confirmingKickId = "";
 
           empty.style.display = activeIds.size ? "none" : "";
         }
@@ -963,12 +1456,28 @@ export function createWidgetRegistry({ store, bus, previewRtc, sendJson, mergeRu
         const unsubPreview = bus.on("preview_rtc_update", ({ deviceId } = {}) => {
           if (!deviceId || cards.has(deviceId)) renderCards();
         });
+        const onDocumentPointerDown = (event) => {
+          if (!confirmingKickId) return;
+          const activeCard = cards.get(confirmingKickId);
+          if (!activeCard || activeCard.root.contains(event.target)) return;
+          confirmingKickId = "";
+          renderCards();
+        };
+        const onDocumentKeyDown = (event) => {
+          if (event.key !== "Escape" || !confirmingKickId) return;
+          confirmingKickId = "";
+          renderCards();
+        };
+        document.addEventListener("pointerdown", onDocumentPointerDown, true);
+        document.addEventListener("keydown", onDocumentKeyDown);
         setMode("cameras");
         renderCards();
 
         return () => {
           unsubStore();
           unsubPreview();
+          document.removeEventListener("pointerdown", onDocumentPointerDown, true);
+          document.removeEventListener("keydown", onDocumentKeyDown);
           mapView.destroy();
           for (const deviceId of [...cards.keys()]) destroyCard(deviceId);
         };
@@ -1163,6 +1672,8 @@ function render(box, ctx) {
   const st = ctx.store.getState();
   const deviceId = getWidgetDevice(ctx.instance.settings);
   const d = st.statesByDevice[deviceId] || {};
+  const workzone = d.workzone_live || null;
+  const runtimeWorkzone = st.runtime?.workzone_live || null;
   const rtt = d.net?.rtt_ms == null ? "-" : `${Number(d.net.rtt_ms).toFixed(0)} ms`;
   box.innerHTML = "";
   kv(box, "WS", st.wsConnected ? "connected" : "disconnected");
@@ -1172,6 +1683,14 @@ function render(box, ctx) {
   kv(box, "Camera FPS", Number(d.net?.camera_fps || 0).toFixed(1));
   kv(box, "Dropped", String(d.net?.dropped_packets || 0));
   kv(box, "RTT", rtt);
+  kv(box, "WorkZone", formatWorkzoneWorkerSummary(runtimeWorkzone));
+  kv(box, "WZ Queue", runtimeWorkzone ? String(runtimeWorkzone.pending_frames || 0) : "-");
+  kv(box, "WZ Infer", Number.isFinite(Number(runtimeWorkzone?.last_inference_ms)) ? `${Math.round(Number(runtimeWorkzone.last_inference_ms))} ms` : "-");
+  if (workzone && workzone.status !== "disabled") {
+    kv(box, "WZ State", humanizeWorkzoneStatus(workzone.status));
+    kv(box, "WZ Score", formatWorkzoneScore(workzone));
+    kv(box, "WZ Smooth", formatWorkzoneSmoothedScore(workzone));
+  }
 }
 
 function drawImu(canvas, points) {
