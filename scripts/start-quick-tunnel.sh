@@ -55,6 +55,8 @@ SERVER_PID=""
 TUNNEL_PID=""
 WORKZONE_PID=""
 QUICK_TUNNEL_RETRIES="${QUICK_TUNNEL_RETRIES:-4}"
+QUICK_TUNNEL_PUBLIC_READY_TIMEOUT="${QUICK_TUNNEL_PUBLIC_READY_TIMEOUT:-60}"
+QUICK_TUNNEL_PUBLIC_READY_PATH="${QUICK_TUNNEL_PUBLIC_READY_PATH:-/health}"
 WORKZONE_ALERT_COOLDOWN_MS="${WORKZONE_ALERT_COOLDOWN_MS:-0}"
 
 cleanup() {
@@ -91,6 +93,24 @@ require_cmd() {
 
 require_cmd node
 require_cmd curl
+
+wait_for_public_tunnel() {
+  local public_url="$1"
+  local timeout_s="${2:-60}"
+  local ready_path="${3:-/health}"
+  local deadline=$((SECONDS + timeout_s))
+  local health_url="${public_url}${ready_path}"
+  while (( SECONDS < deadline )); do
+    if curl -fsS --max-time 5 "${health_url}" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ -n "${TUNNEL_PID}" ]] && ! kill -0 "${TUNNEL_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 if [[ ! -x "${CLOUDFLARED_BIN}" ]]; then
   echo "cloudflared not found at ${CLOUDFLARED_BIN}" >&2
@@ -249,6 +269,20 @@ for attempt in $(seq 1 "${QUICK_TUNNEL_RETRIES}"); do
     fi
     sleep 1
   done
+
+  if [[ -n "${PUBLIC_URL}" ]]; then
+    echo "Waiting for public tunnel route to become ready (${PUBLIC_URL}${QUICK_TUNNEL_PUBLIC_READY_PATH}) ..."
+    if wait_for_public_tunnel "${PUBLIC_URL}" "${QUICK_TUNNEL_PUBLIC_READY_TIMEOUT}" "${QUICK_TUNNEL_PUBLIC_READY_PATH}"; then
+      break
+    fi
+    echo "Public tunnel URL was announced but did not become ready in ${QUICK_TUNNEL_PUBLIC_READY_TIMEOUT}s." >&2
+    if [[ -n "${TUNNEL_PID}" ]] && kill -0 "${TUNNEL_PID}" 2>/dev/null; then
+      kill "${TUNNEL_PID}" 2>/dev/null || true
+      wait "${TUNNEL_PID}" 2>/dev/null || true
+    fi
+    TUNNEL_PID=""
+    PUBLIC_URL=""
+  fi
 
   if [[ -n "${PUBLIC_URL}" ]]; then
     break
