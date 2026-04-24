@@ -156,7 +156,6 @@
   let permissionRefreshStatusText = "";
   let alertCooldownTimer = null;
   let lastGenericAlertSentAtMs = 0;
-  let lastWorkzoneAlertSentAtMs = 0;
   let lastAlertPlayedAtMs = 0;
   let lastWorkzoneAlertPlayedAtMs = 0;
   let pendingAlertReplay = null;
@@ -166,7 +165,6 @@
   let workzoneVoiceWaitInFlight = null;
   let activeSpeechUtterance = null;
   let activeSpeechResumeTimer = null;
-  let suppressSelfWorkzonePlaybackUntilMs = 0;
   let suppressSelfGenericAlertUntilMs = 0;
   let latestWorkzoneVisual = null;
   const recentFleetAlertIds = new Map();
@@ -818,21 +816,17 @@
     if (!wakeLock) await requestWakeLock();
   }
 
-  function alertCooldownRemainingMs(kind = "generic") {
-    const lastSentAtMs = kind === "workzone" ? lastWorkzoneAlertSentAtMs : lastGenericAlertSentAtMs;
-    return Math.max(0, 1500 - (Date.now() - lastSentAtMs));
+  function alertCooldownRemainingMs() {
+    return Math.max(0, 1500 - (Date.now() - lastGenericAlertSentAtMs));
   }
 
-  function isAlertCoolingDown(kind = "generic") {
-    return alertCooldownRemainingMs(kind) > 0;
+  function isAlertCoolingDown() {
+    return alertCooldownRemainingMs() > 0;
   }
 
   function scheduleAlertCooldownRefresh() {
     if (alertCooldownTimer) clearTimeout(alertCooldownTimer);
-    const nextDelay = Math.max(
-      alertCooldownRemainingMs("generic"),
-      alertCooldownRemainingMs("workzone")
-    );
+    const nextDelay = alertCooldownRemainingMs();
     if (nextDelay <= 0) return;
     alertCooldownTimer = setTimeout(() => {
       alertCooldownTimer = null;
@@ -1950,7 +1944,7 @@
       setAlertFeedback("Reconnect to send alerts.", "warning");
       return;
     }
-    if (isAlertCoolingDown("generic")) return;
+    if (isAlertCoolingDown()) return;
     lastGenericAlertSentAtMs = Date.now();
     suppressSelfGenericAlertUntilMs = lastGenericAlertSentAtMs + 4000;
     scheduleAlertCooldownRefresh();
@@ -1972,37 +1966,6 @@
     if (title) payload.title = String(title).trim();
     if (message) payload.message = String(message).trim();
     queueJson(payload);
-  }
-
-  async function triggerWorkzoneAlert() {
-    if (!started || !authState?.joinToken || !ws || ws.readyState !== WebSocket.OPEN) {
-      setAlertFeedback("Reconnect to send alerts.", "warning");
-      return;
-    }
-    if (isAlertCoolingDown("workzone")) return;
-    lastWorkzoneAlertSentAtMs = Date.now();
-    suppressSelfGenericAlertUntilMs = lastWorkzoneAlertSentAtMs + 4000;
-    suppressSelfWorkzonePlaybackUntilMs = lastWorkzoneAlertSentAtMs + 4000;
-    scheduleAlertCooldownRefresh();
-    const announcementText = buildWorkzoneAnnouncementText(authState?.deviceName || runConfig.device_id, { isSelf: true });
-    setAlertFeedback("Sending workzone alert...", "muted", 1400);
-    playAlertHaptics();
-    void playWorkzoneAnnouncementFromGesture(announcementText).then((result) => {
-      if (result.played) {
-        suppressSelfWorkzonePlaybackUntilMs = Date.now() + 4000;
-        return;
-      }
-      suppressSelfWorkzonePlaybackUntilMs = 0;
-      queuePendingAlertReplay(authState?.deviceName || runConfig.device_id, "workzone_detected", announcementText);
-      setAlertFeedback("Workzone alert sent. Sound may be blocked on this phone; tap once anywhere to unlock audio.", "warning", 5600);
-    });
-    queueJson({
-      type: "fleet_alert",
-      device_id: runConfig.device_id,
-      kind: "workzone_detected",
-      title: "Workzone detected",
-      message: "Workzone detected."
-    });
   }
 
   async function handleFleetAlert(msg) {
@@ -2040,9 +2003,7 @@
       ? buildPermissionRefreshAnnouncementText(msg.modalities)
       : "";
     const alertPlayback = kind === "workzone_detected"
-      ? ((fromSelf && Date.now() < suppressSelfWorkzonePlaybackUntilMs)
-        ? { played: true, mode: "suppressed", deduped: false }
-        : await playDedupedWorkzoneAnnouncement(workzoneAnnouncementEvent || { sourceDeviceId, sourceDeviceName }))
+      ? await playDedupedWorkzoneAnnouncement(workzoneAnnouncementEvent || { sourceDeviceId, sourceDeviceName })
       : kind === "permission_refresh"
         ? await playPermissionRefreshAnnouncement({
             announcementText: permissionRefreshAnnouncementText,
@@ -2828,17 +2789,10 @@
     const alertBtn = document.createElement("button");
     alertBtn.type = "button";
     alertBtn.className = "btn btn-alt btn-small phone-alert-btn";
-    const genericAlertCoolingDown = isAlertCoolingDown("generic");
-    const workzoneAlertCoolingDown = isAlertCoolingDown("workzone");
+    const genericAlertCoolingDown = isAlertCoolingDown();
     alertBtn.textContent = genericAlertCoolingDown ? "Alerting..." : "Alert";
     alertBtn.disabled = !connected || genericAlertCoolingDown;
     alertBtn.addEventListener("click", () => { void triggerFleetAlert(); });
-    const workzoneAlertBtn = document.createElement("button");
-    workzoneAlertBtn.type = "button";
-    workzoneAlertBtn.className = "btn btn-alt btn-small phone-alert-btn";
-    workzoneAlertBtn.textContent = workzoneAlertCoolingDown ? "Alerting..." : "Workzone Alert";
-    workzoneAlertBtn.disabled = !connected || workzoneAlertCoolingDown;
-    workzoneAlertBtn.addEventListener("click", () => { void triggerWorkzoneAlert(); });
     const workzoneToggleBtn = document.createElement("button");
     workzoneToggleBtn.type = "button";
     workzoneToggleBtn.className = `btn btn-small phone-alert-btn${workzoneAlertsEnabled ? "" : " btn-muted"}`;
@@ -2860,7 +2814,7 @@
     const hint = document.createElement("div");
     hint.className = `phone-alert-feedback ${alertFeedbackTone}`;
     hint.textContent = alertFeedbackText || (connected ? "Alert plays immediately on this phone and all connected phones." : "Reconnect to send alerts.");
-    actions.append(alertBtn, workzoneAlertBtn, workzoneToggleBtn, carViewBtn, hint);
+    actions.append(alertBtn, workzoneToggleBtn, carViewBtn, hint);
     primaryActionArea.appendChild(actions);
   }
 

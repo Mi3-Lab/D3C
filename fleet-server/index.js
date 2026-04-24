@@ -782,6 +782,13 @@ function handlePhoneJson(ws, msg) {
   if (msg.type === "fleet_alert") {
     const sourceDeviceName = d.device_name || deviceId;
     const kind = typeof msg.kind === "string" ? String(msg.kind).trim() : "";
+    if (kind === "workzone_detected") {
+      console.warn("[ws] ignored phone-generated workzone alert", {
+        device_id: deviceId,
+        source_device_name: sourceDeviceName
+      });
+      return;
+    }
     const title = typeof msg.title === "string" ? String(msg.title).trim() : "";
     const message = typeof msg.message === "string" ? String(msg.message).trim() : "";
     const payload = {
