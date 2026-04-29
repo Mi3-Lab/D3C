@@ -190,13 +190,22 @@ class SyncTracker {
     const b = (sw * sxy - sx * sy) / den;
     const a = (sy - b * sx) / sw;
 
+    // sort by time to get true temporal window of kept samples
+    const keptByTime = [...kept].sort((p, q) => p.t4_server_ms - q.t4_server_ms);
+    const tMin = keptByTime[0].t4_server_ms;
+    const tMax = keptByTime[keptByTime.length - 1].t4_server_ms;
+    const windowMs = Math.max(0, Number(tMax - tMin));
+
+    // if samples don't span at least 30s, drift estimate is unreliable — fall back to 1.0
+    const MIN_WINDOW_FOR_DRIFT_MS = 30_000;
+    const bFinal = windowMs >= MIN_WINDOW_FOR_DRIFT_MS ? b : 1.0;
+    const aFinal = windowMs >= MIN_WINDOW_FOR_DRIFT_MS ? a : (sy - 1.0 * sx) / sw;
+
     let wrss = 0;
     const rtts = [];
-    const tMin = kept[0].t4_server_ms;
-    const tMax = kept[kept.length - 1].t4_server_ms;
     for (const s of kept) {
       const w = 1 / (s.rtt_ms * s.rtt_ms + 1e-6);
-      const err = s.y_server_ms - (a + b * s.x_device_mono_ms);
+      const err = s.y_server_ms - (aFinal + bFinal * s.x_device_mono_ms);
       wrss += w * err * err;
       rtts.push(s.rtt_ms);
     }
@@ -206,15 +215,16 @@ class SyncTracker {
     const residual = Math.sqrt(Math.max(0, wrss / sw));
 
     return {
-      a_ms: Number(a.toFixed(6)),
-      b: Number(b.toFixed(12)),
+      a_ms: Number(aFinal.toFixed(6)),
+      b: Number(bFinal.toFixed(12)),
       n: kept.length,
       rtt_mean: Number(rttMean.toFixed(3)),
       rtt_p95: Number(rtts[p95Idx].toFixed(3)),
       rtt_min: Number(rtts[0].toFixed(3)),
       rtt_max: Number(rtts[rtts.length - 1].toFixed(3)),
       residual_ms: Number(residual.toFixed(3)),
-      window_ms: Math.max(0, Number(tMax - tMin))
+      window_ms: windowMs,
+      drift_reliable: windowMs >= MIN_WINDOW_FOR_DRIFT_MS
     };
   }
 

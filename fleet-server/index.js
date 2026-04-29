@@ -577,6 +577,21 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+// event loop lag tracking — measures how late each 1s tick fires
+let _lastHealthTickMs = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const lag = Math.max(0, now - _lastHealthTickMs - 1000);
+  _lastHealthTickMs = now;
+  const mem = process.memoryUsage();
+  sessionManager.writeServerHealth({
+    t_server_ms: now,
+    event_loop_lag_ms: Math.round(lag),
+    heap_used_mb: Number((mem.heapUsed / 1048576).toFixed(2)),
+    heap_total_mb: Number((mem.heapTotal / 1048576).toFixed(2)),
+  });
+}, 1000);
+
 setInterval(() => {
   pruneAuthRateLimit();
   prunePhoneAuthTokens();
