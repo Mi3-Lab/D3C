@@ -10,6 +10,7 @@ const { AudioWavRecorder } = require("./recorders/audio_wav_recorder");
 const { GpsRecorder } = require("./recorders/gps_recorder");
 const { DeviceRecorder } = require("./recorders/device_recorder");
 const { FusionRecorder } = require("./recorders/fusion_recorder");
+const { ServerHealthRecorder } = require("./recorders/server_health_recorder");
 const { convertSessionCsvToParquet } = require("./parquet/converter");
 
 class SessionManager {
@@ -22,6 +23,7 @@ class SessionManager {
     this.targetDeviceIds = new Set();
     this.deviceConfigs = new Map();
     this.recordersByDevice = new Map();
+    this._serverHealthRecorder = null;
   }
 
   start({ mode, focusedDeviceId, devicesConfigMap, extraMeta = {} }) {
@@ -213,6 +215,12 @@ class SessionManager {
     if (!cfg?.streams?.net?.record) return;
     this.getRecorders(deviceId).net ??= new NetRecorder(path.join(this.getStreamsDir(deviceId), "net.csv"));
     this.getRecorders(deviceId).net.write(sample);
+  }
+
+  writeServerHealth(sample) {
+    if (!this.active || !this.sessionDir) return;
+    this._serverHealthRecorder ??= new ServerHealthRecorder(path.join(this.sessionDir, "server_health.csv"));
+    this._serverHealthRecorder.write(sample);
   }
 
   writeGps(deviceId, sample) {
